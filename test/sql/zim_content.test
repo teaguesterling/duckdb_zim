@@ -1,0 +1,71 @@
+# name: test/sql/zim_content.test
+# description: content laziness, projection pushdown, BLOB vs VARCHAR
+# group: [zim]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# content is NULL by default even when projected (lazy: no include_content)
+query I
+SELECT content IS NULL FROM read_zim('test/oracle/test.zim', path := 'A/Calcium');
+----
+true
+
+# content loads when opted in
+query I
+SELECT content IS NOT NULL
+FROM read_zim('test/oracle/test.zim', path := 'A/Photosynthesis', include_content := true);
+----
+true
+
+# content_as_varchar yields text; exact stored bytes preserved
+query I
+SELECT content LIKE '%<h1>Photosynthesis</h1>%'
+FROM read_zim('test/oracle/test.zim', path := 'A/Photosynthesis',
+              include_content := true, content_as_varchar := true);
+----
+true
+
+# default content column is BLOB
+query I
+SELECT typeof(content) FROM read_zim('test/oracle/test.zim', path := 'A/Calcium');
+----
+BLOB
+
+# content_as_varchar switches the column type to VARCHAR
+query I
+SELECT typeof(content)
+FROM read_zim('test/oracle/test.zim', path := 'A/Calcium', content_as_varchar := true);
+----
+VARCHAR
+
+# a binary entry loads fine as BLOB (bytes preserved)
+query I
+SELECT content IS NOT NULL
+FROM read_zim('test/oracle/test.zim', path := 'I/logo.png', include_content := true);
+----
+true
+
+# but content_as_varchar on that binary entry yields NULL, never invalid UTF-8 in a
+# VARCHAR column (with enable_verification on, mangling would error instead)
+query I
+SELECT content IS NULL
+FROM read_zim('test/oracle/test.zim', path := 'I/logo.png',
+              include_content := true, content_as_varchar := true);
+----
+true
+
+# redirects never carry content even with include_content
+query I
+SELECT content IS NULL
+FROM read_zim('test/oracle/test.zim', path := 'A/Photosynth', include_content := true);
+----
+true
+
+# projection that omits content must still scan all rows (count unaffected)
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', include_content := true);
+----
+6

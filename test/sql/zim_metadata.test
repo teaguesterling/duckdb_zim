@@ -1,0 +1,65 @@
+# name: test/sql/zim_metadata.test
+# description: metadata door - read_zim_metadata + zim_metadata/keys/counter/info
+# group: [zim]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# full metadata table
+query II
+SELECT key, value FROM read_zim_metadata('test/oracle/test.zim') ORDER BY key;
+----
+Counter	image/png=1;text/css=1;text/html=3
+Creator	oracle
+Date	2026-06-06
+Description	tiny test archive
+Language	eng
+Title	Test Botany ZIM
+
+# single-key lookup
+query I
+SELECT zim_metadata('test/oracle/test.zim', 'Title');
+----
+Test Botany ZIM
+
+query I
+SELECT zim_metadata('test/oracle/test.zim', 'Language');
+----
+eng
+
+# absent key -> NULL
+query I
+SELECT zim_metadata('test/oracle/test.zim', 'NoSuchKey') IS NULL;
+----
+true
+
+# key listing
+query I
+SELECT unnest(zim_metadata_keys('test/oracle/test.zim')) ORDER BY 1;
+----
+Counter
+Creator
+Date
+Description
+Language
+Title
+
+# Counter parsed into a MAP(mimetype -> count)
+query II
+SELECT e.key, e.value
+FROM (SELECT unnest(map_entries(zim_counter('test/oracle/test.zim'))) AS e)
+ORDER BY e.key;
+----
+image/png	1
+text/css	1
+text/html	3
+
+# archive-level info (stable fields only; uuid/filesize are not asserted)
+query IIIIII
+SELECT info.entry_count, info.all_entry_count, info.article_count, info.media_count,
+       info.has_fulltext_index, info.has_new_namespace_scheme
+FROM (SELECT zim_info('test/oracle/test.zim') AS info);
+----
+6	16	3	1	true	true

@@ -1,0 +1,113 @@
+# name: test/sql/read_zim.test
+# description: read_zim content scan, ordering, prefix listing, exact lookup
+# group: [zim]
+#
+# Fixture: test/oracle/test.zim (regenerate with test/oracle/make_fixture.py).
+# Expected values are the verified oracle outputs (docs/libzim-semantics.md).
+# Assertions that depend on libzim C++ signatures marked // VERIFY in the source
+# (findByPath/findByTitle prefix scoping) should be confirmed on first run.
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# 6 content entries: 5 items + 1 redirect
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim');
+----
+6
+
+# paths are namespace-free; A//I/ are path text, not namespaces
+query I
+SELECT path FROM read_zim('test/oracle/test.zim') ORDER BY path;
+----
+A/Calcium
+A/Chlorophyll
+A/Photosynth
+A/Photosynthesis
+I/logo.png
+style.css
+
+# listing := 'title' selects libzim's title listing (iterByTitle), which yields only
+# FRONT_ARTICLE entries (here the 3 HTML articles = getArticleCount()), NOT every
+# entry. It chooses a listing, not just an order: the redirect, logo.png and style.css
+# are not front articles. (For all entries in title order, scan the default path
+# listing and ORDER BY title in SQL.)
+query I
+SELECT title FROM read_zim('test/oracle/test.zim', listing := 'title') ORDER BY title;
+----
+Calcium
+Chlorophyll
+Photosynthesis
+
+# redirect: flagged, target resolved, no mimetype, no size
+query II
+SELECT path, redirect_path FROM read_zim('test/oracle/test.zim') WHERE is_redirect;
+----
+A/Photosynth	A/Photosynthesis
+
+query I
+SELECT mimetype IS NULL AND size IS NULL
+FROM read_zim('test/oracle/test.zim', path := 'A/Photosynth');
+----
+true
+
+# non-redirects carry mimetype and size (verified: 107 bytes)
+query II
+SELECT mimetype, size FROM read_zim('test/oracle/test.zim', path := 'A/Photosynthesis');
+----
+text/html	107
+
+# mimetype post-filter (excludes redirects, which have no mimetype)
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/html');
+----
+3
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css');
+----
+1
+
+# prefix listing via findByPath  // VERIFY prefix scoping on pinned libzim
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', path_prefix := 'A/');
+----
+4
+
+# prefix listing via findByTitle  // VERIFY prefix scoping on pinned libzim
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', title_prefix := 'C');
+----
+2
+
+# exact path lookup
+query I
+SELECT title FROM read_zim('test/oracle/test.zim', path := 'A/Photosynthesis');
+----
+Photosynthesis
+
+# exact path lookup tolerates a leading C/ and normalizes it away
+query I
+SELECT path FROM read_zim('test/oracle/test.zim', path := 'C/A/Chlorophyll');
+----
+A/Chlorophyll
+
+# exact title lookup
+query I
+SELECT path FROM read_zim('test/oracle/test.zim', title := 'Calcium');
+----
+A/Calcium
+
+# missing entry -> zero rows (not an error)
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', path := 'A/DoesNotExist');
+----
+0
+
+# file_path column appears only when requested
+query I
+SELECT file_path FROM read_zim('test/oracle/test.zim', path := 'A/Calcium', include_filepath := true);
+----
+test/oracle/test.zim

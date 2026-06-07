@@ -1,0 +1,72 @@
+# name: test/sql/zim_scalars.test
+# description: single-entry lookup scalars
+# group: [zim]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# has_entry: content resolves; namespaced metadata path does not (verified Q5)
+query I
+SELECT zim_has_entry('test/oracle/test.zim', 'A/Photosynthesis');
+----
+true
+
+query I
+SELECT zim_has_entry('test/oracle/test.zim', 'M/Title');
+----
+false
+
+# C/ prefix is tolerated and normalized
+query I
+SELECT zim_has_entry('test/oracle/test.zim', 'C/A/Calcium');
+----
+true
+
+# mimetype
+query I
+SELECT zim_mimetype('test/oracle/test.zim', 'style.css');
+----
+text/css
+
+# redirect target; NULL for non-redirects
+query I
+SELECT zim_redirect_target('test/oracle/test.zim', 'A/Photosynth');
+----
+A/Photosynthesis
+
+query I
+SELECT zim_redirect_target('test/oracle/test.zim', 'A/Calcium') IS NULL;
+----
+true
+
+# main entry is redirect-resolved to the landing path (verified Q6)
+query I
+SELECT zim_main_entry('test/oracle/test.zim');
+----
+A/Photosynthesis
+
+# get_content returns bytes
+query I
+SELECT octet_length(zim_get_content('test/oracle/test.zim', 'A/Photosynthesis'));
+----
+107
+
+# get_text returns text for text mimetypes
+query I
+SELECT zim_get_text('test/oracle/test.zim', 'style.css');
+----
+body{color:green}
+
+# get_text refuses binary mimetypes (NULL, never mangled bytes)
+query I
+SELECT zim_get_text('test/oracle/test.zim', 'I/logo.png') IS NULL;
+----
+true
+
+# get_content on a missing path -> NULL
+query I
+SELECT zim_get_content('test/oracle/test.zim', 'A/Nope') IS NULL;
+----
+true

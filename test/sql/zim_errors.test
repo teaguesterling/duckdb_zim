@@ -1,0 +1,40 @@
+# name: test/sql/zim_errors.test
+# description: error handling and binder validation
+# group: [zim]
+#
+# statement error matches a SUBSTRING of the error message. The exact wording
+# may need adjustment on first compile; the substrings below are chosen to be
+# stable parts of the messages emitted in src/.
+
+require zim
+
+# unknown named parameter is rejected at bind time (DuckDB's binder rejects it
+# before read_zim's own bind runs, hence "Invalid named parameter").
+statement error
+SELECT * FROM read_zim('test/oracle/test.zim', bogus := true);
+----
+Invalid named parameter
+
+# listing must be 'path' or 'title'
+statement error
+SELECT * FROM read_zim('test/oracle/test.zim', listing := 'sideways');
+----
+listing must be 'path' or 'title'
+
+# opening a non-existent archive fails (surfaced from ArchivePool::Get)
+statement error
+SELECT * FROM read_zim('/no/such/archive.zim');
+----
+failed to open ZIM
+
+# unknown parameter on the metadata function too
+statement error
+SELECT * FROM read_zim_metadata('test/oracle/test.zim', bogus := true);
+----
+Invalid named parameter
+
+# scalar over a bad archive path also errors
+statement error
+SELECT zim_info('/no/such/archive.zim');
+----
+failed to open ZIM
