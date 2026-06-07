@@ -18,8 +18,12 @@
 #include <zim/item.h>
 #include <zim/blob.h>
 #include <zim/error.h>
-#include <zim/search.h>
 #include <zim/uuid.h>
+// zim/search.h (and the Searcher API) only exist when libzim is built with xapian.
+// LIBZIM_WITH_XAPIAN comes from zim/zim_config.h, pulled in transitively via zim/archive.h.
+#ifdef LIBZIM_WITH_XAPIAN
+#include <zim/search.h>
+#endif
 
 namespace duckdb {
 namespace zim_ext {
@@ -337,6 +341,7 @@ bool ZimArchive::HasFulltextIndex() const {
 
 std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t offset, uint32_t limit) const {
 	std::vector<ZimSearchHit> hits;
+#ifdef LIBZIM_WITH_XAPIAN
 	if (!archive_->hasFulltextIndex()) {
 		return hits; // caller decides whether to fall back to title search
 	}
@@ -357,6 +362,12 @@ std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t 
 		// hit.snippet = it.getSnippet();      // enable once confirmed on pinned libzim
 		hits.push_back(std::move(hit));
 	}
+#else
+	// libzim built without xapian: no full-text search available. (void the args.)
+	(void)query;
+	(void)offset;
+	(void)limit;
+#endif
 	return hits;
 }
 
