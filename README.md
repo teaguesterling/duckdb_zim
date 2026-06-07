@@ -113,6 +113,21 @@ prefix/`listing`; and `listing` must not contradict a prefix's order (`title_pre
 
 Columns: `path, title, mimetype, is_redirect, redirect_path, size, content[, file_path]`.
 
+### Multiple archives, globs, and `FROM 'x.zim'`
+
+`read_zim` accepts one path, a glob, or a list — rows from each archive are concatenated,
+and `include_filepath := true` tells them apart. A bare `.zim` filename in `FROM` is
+rewritten to `read_zim` automatically.
+
+```sql
+SELECT count(*) FROM read_zim('wikis/*.zim');                       -- glob
+SELECT * FROM read_zim(['a.zim', 'b.zim'], include_filepath := true); -- explicit list
+SELECT * FROM 'wikipedia.zim';                                      -- replacement scan
+```
+
+Exact lookups and prefixes apply **per archive**: `read_zim('*.zim', path := 'A/Foo')`
+emits one row for each archive that contains `A/Foo`.
+
 ### Metadata
 
 Metadata is a separate key space from content (two different libzim doors). Both a table

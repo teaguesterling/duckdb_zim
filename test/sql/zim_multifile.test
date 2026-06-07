@@ -1,0 +1,49 @@
+# name: test/sql/zim_multifile.test
+# description: glob / multi-file (LIST) inputs and the FROM 'x.zim' replacement scan
+# group: [zim]
+
+require zim
+
+# a glob expands to the one fixture
+query I
+SELECT count(*) FROM read_zim('test/oracle/*.zim');
+----
+6
+
+# LIST input scans each file; the same archive twice yields 2x the rows. This is the
+# guard that a finished cursor advances to the NEXT file instead of ending the scan.
+query I
+SELECT count(*) FROM read_zim(['test/oracle/test.zim', 'test/oracle/test.zim']);
+----
+12
+
+# per-file exact lookup: an entry present in both listed archives emits one row each
+query I
+SELECT count(*) FROM read_zim(['test/oracle/test.zim', 'test/oracle/test.zim'], path := 'A/Calcium');
+----
+2
+
+# include_filepath reports the archive each row came from
+query I
+SELECT DISTINCT file_path LIKE '%test.zim'
+FROM read_zim('test/oracle/*.zim', include_filepath := true);
+----
+true
+
+# replacement scan: FROM 'x.zim' rewrites to read_zim('x.zim')
+query I
+SELECT count(*) FROM 'test/oracle/test.zim';
+----
+6
+
+# a glob that matches nothing is an error
+statement error
+SELECT * FROM read_zim('test/oracle/does_not_exist_*.zim');
+----
+no files matched
+
+# the replacement scan must NOT hijack ordinary unresolved table names
+statement error
+SELECT * FROM not_a_zim_table;
+----
+does not exist

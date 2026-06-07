@@ -17,12 +17,19 @@
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/function/replacement_scan.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "utf8proc_wrapper.hpp"
 
 #include "zim_access.hpp"
 #include "zim_archive_pool.hpp"
 
 #include <memory>
+#include <vector>
 
 namespace duckdb {
 
@@ -56,7 +63,7 @@ enum ZimColumn : idx_t {
 };
 
 struct ReadZimBindData : public TableFunctionData {
-	std::string file_path;
+	std::vector<std::string> file_paths; // one or more archives (glob/list expanded)
 	// resolved options
 	bool include_content = false;
 	bool content_as_varchar = false;
@@ -70,12 +77,16 @@ struct ReadZimBindData : public TableFunctionData {
 };
 
 struct ReadZimGlobalState : public GlobalTableFunctionState {
-	std::shared_ptr<ZimArchive> archive;
-	std::unique_ptr<ZimScanCursor> cursor; // null in single_lookup mode
-	bool single_done = false;              // single_lookup: have we emitted?
+	std::vector<std::string> files;        // archives to scan, in order
+	idx_t file_idx = 0;                    // index of the archive currently being read
+	std::shared_ptr<ZimArchive> archive;   // current archive (reassigned per file)
+	std::unique_ptr<ZimScanCursor> cursor; // current cursor (scan mode); null otherwise
+	bool lookup_emitted = false;           // single_lookup: emitted for the current file?
 	std::vector<column_t> column_ids;      // projection
 	bool want_content = false;             // content projected AND include_content
-	idx_t MaxThreads() const override { return 1; } // single-archive sequential scan
+	// MaxThreads()==1: the file_idx/cursor state machine is sequential and not
+	// thread-safe. Parallel scan (phase: partition index ranges) is deferred.
+	idx_t MaxThreads() const override { return 1; }
 };
 
 LogicalType ContentType(const ReadZimBindData &bind) {
@@ -85,7 +96,32 @@ LogicalType ContentType(const ReadZimBindData &bind) {
 unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindInput &input,
                                      vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind = make_uniq<ReadZimBindData>();
-	bind->file_path = input.inputs[0].GetValue<string>();
+
+	// Input is a single VARCHAR pattern or a LIST(VARCHAR) of patterns. Glob patterns
+	// expand via the FileSystem; literal paths pass through untouched so a missing file
+	// still surfaces the clean "failed to open ZIM" error at scan time.
+	vector<string> patterns;
+	auto &arg = input.inputs[0];
+	if (arg.type().id() == LogicalTypeId::LIST) {
+		for (auto &child : ListValue::GetChildren(arg)) {
+			patterns.push_back(child.GetValue<string>());
+		}
+	} else {
+		patterns.push_back(arg.GetValue<string>());
+	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	for (auto &pat : patterns) {
+		if (FileSystem::HasGlob(pat)) {
+			for (auto &info : fs.Glob(pat)) {
+				bind->file_paths.push_back(info.path);
+			}
+		} else {
+			bind->file_paths.push_back(pat);
+		}
+	}
+	if (bind->file_paths.empty()) {
+		throw BinderException("read_zim: no files matched the given pattern(s)");
+	}
 
 	// Track which mode-selecting params were given so conflicting combinations can be
 	// rejected instead of silently resolving last-wins.
@@ -182,17 +218,39 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 	return std::move(bind);
 }
 
+// Opens files[file_idx] as the current archive; in scan mode also builds the cursor.
+// May throw (missing/corrupt archive) — surfaced as the query's error.
+static void OpenCurrentFile(ReadZimGlobalState &g, const ReadZimBindData &bind) {
+	g.archive = ArchivePool::Instance().Get(g.files[g.file_idx]); // may throw
+	g.lookup_emitted = false;
+	if (!bind.single_lookup) {
+		ScanSpec spec = bind.spec;
+		spec.want_content = g.want_content;
+		g.cursor = make_uniq<ZimScanCursor>(g.archive->Scan(spec));
+	}
+}
+
+// Advance to the next archive (opening it), or release state once exhausted.
+static void AdvanceFile(ReadZimGlobalState &g, const ReadZimBindData &bind) {
+	g.file_idx++;
+	if (g.file_idx < g.files.size()) {
+		OpenCurrentFile(g, bind);
+	} else {
+		g.archive.reset();
+		g.cursor.reset();
+	}
+}
+
 unique_ptr<GlobalTableFunctionState> ReadZimInitGlobal(ClientContext &context,
                                                        TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<ReadZimBindData>();
 	auto state = make_uniq<ReadZimGlobalState>();
-
-	state->archive = ArchivePool::Instance().Get(bind.file_path);
+	state->files = bind.file_paths;
 	state->column_ids = input.column_ids;
 
-	// Projection pushdown: only load blobs if the content column is actually
-	// projected AND the caller opted in via include_content. SELECT * without
-	// include_content therefore does NOT decompress the archive.
+	// Projection pushdown: only load blobs if the content column is actually projected
+	// AND the caller opted in via include_content. SELECT * without include_content
+	// therefore does NOT decompress the archive.
 	bool content_projected = false;
 	for (auto cid : input.column_ids) {
 		if (cid == COL_CONTENT) {
@@ -201,11 +259,7 @@ unique_ptr<GlobalTableFunctionState> ReadZimInitGlobal(ClientContext &context,
 	}
 	state->want_content = content_projected && bind.include_content;
 
-	if (!bind.single_lookup) {
-		ScanSpec spec = bind.spec;
-		spec.want_content = state->want_content;
-		state->cursor = make_uniq<ZimScanCursor>(state->archive->Scan(spec));
-	}
+	OpenCurrentFile(*state, bind); // open the first archive (file_paths is non-empty)
 	return std::move(state);
 }
 
@@ -249,7 +303,8 @@ void EmitRow(const ReadZimBindData &bind, const ReadZimGlobalState &gstate, cons
 			break;
 		}
 		case COL_FILE_PATH:
-			vec.SetValue(out_idx, Value(bind.file_path));
+			// The archive this row came from (file_idx is unchanged until after emit).
+			vec.SetValue(out_idx, Value(gstate.files[gstate.file_idx]));
 			break;
 		default:
 			break;
@@ -261,57 +316,81 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 	auto &bind = data.bind_data->Cast<ReadZimBindData>();
 	auto &gstate = data.global_state->Cast<ReadZimGlobalState>();
 
-	if (bind.single_lookup) {
-		if (gstate.single_done) {
-			output.SetCardinality(0);
-			return;
-		}
-		gstate.single_done = true;
-		std::optional<ZimEntry> row =
-		    bind.lookup_by_title ? gstate.archive->GetByTitle(bind.lookup_key, gstate.want_content)
-		                         : gstate.archive->GetByPath(bind.lookup_key, gstate.want_content);
-		if (!row.has_value()) {
-			output.SetCardinality(0);
-			return;
-		}
-		if (bind.spec.mimetype.has_value() && row->mimetype != *bind.spec.mimetype) {
-			output.SetCardinality(0);
-			return;
-		}
-		EmitRow(bind, gstate, *row, output, 0);
-		output.SetCardinality(1);
-		return;
-	}
-
 	idx_t count = 0;
-	ZimEntry row;
-	while (count < STANDARD_VECTOR_SIZE && gstate.cursor->Next(row)) {
-		EmitRow(bind, gstate, row, output, count);
-		count++;
+	while (count < STANDARD_VECTOR_SIZE && gstate.file_idx < gstate.files.size()) {
+		if (bind.single_lookup) {
+			// Per-file exact lookup: emit at most one row for the current archive, then
+			// move on. An exact path present in N archives therefore emits N rows.
+			if (!gstate.lookup_emitted) {
+				gstate.lookup_emitted = true;
+				auto row = bind.lookup_by_title
+				               ? gstate.archive->GetByTitle(bind.lookup_key, gstate.want_content)
+				               : gstate.archive->GetByPath(bind.lookup_key, gstate.want_content);
+				if (row.has_value() &&
+				    (!bind.spec.mimetype.has_value() || row->mimetype == *bind.spec.mimetype)) {
+					EmitRow(bind, gstate, *row, output, count);
+					count++;
+				}
+			}
+			AdvanceFile(gstate, bind);
+		} else {
+			// Scan mode: drain the current cursor, then advance to the next archive.
+			// Critically, a finished cursor advances files rather than ending the scan,
+			// so later files in a glob/list are not silently dropped.
+			ZimEntry row;
+			if (gstate.cursor->Next(row)) {
+				EmitRow(bind, gstate, row, output, count);
+				count++;
+			} else {
+				AdvanceFile(gstate, bind);
+			}
+		}
 	}
 	output.SetCardinality(count);
+}
+
+// Rewrites `FROM 'archive.zim'` into read_zim('archive.zim').
+static unique_ptr<TableRef> ReadZimReplacementScan(ClientContext &context, ReplacementScanInput &input,
+                                                   optional_ptr<ReplacementScanData> data) {
+	auto table_name = ReplacementScan::GetFullPath(input);
+	if (!ReplacementScan::CanReplace(table_name, {"zim"})) {
+		return nullptr; // not a .zim name: let normal name resolution / errors proceed
+	}
+	auto table_function = make_uniq<TableFunctionRef>();
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(make_uniq<ConstantExpression>(Value(table_name)));
+	table_function->function = make_uniq<FunctionExpression>("read_zim", std::move(children));
+	return std::move(table_function);
 }
 
 } // namespace
 
 void RegisterReadZim(ExtensionLoader &loader) {
-	TableFunction read_zim("read_zim", {LogicalType::VARCHAR}, ReadZimFunction, ReadZimBind,
-	                       ReadZimInitGlobal);
-	read_zim.named_parameters["include_content"] = LogicalType::BOOLEAN;
-	read_zim.named_parameters["content_as_varchar"] = LogicalType::BOOLEAN;
-	read_zim.named_parameters["include_filepath"] = LogicalType::BOOLEAN;
-	read_zim.named_parameters["filename"] = LogicalType::BOOLEAN;
-	read_zim.named_parameters["mimetype"] = LogicalType::VARCHAR;
-	read_zim.named_parameters["path"] = LogicalType::VARCHAR;
-	read_zim.named_parameters["title"] = LogicalType::VARCHAR;
-	read_zim.named_parameters["path_prefix"] = LogicalType::VARCHAR;
-	read_zim.named_parameters["title_prefix"] = LogicalType::VARCHAR;
-	read_zim.named_parameters["listing"] = LogicalType::VARCHAR;
-	read_zim.projection_pushdown = true;
-	loader.RegisterFunction(read_zim);
+	auto make_fn = [](const LogicalType &arg_type) {
+		TableFunction f("read_zim", {arg_type}, ReadZimFunction, ReadZimBind, ReadZimInitGlobal);
+		f.named_parameters["include_content"] = LogicalType::BOOLEAN;
+		f.named_parameters["content_as_varchar"] = LogicalType::BOOLEAN;
+		f.named_parameters["include_filepath"] = LogicalType::BOOLEAN;
+		f.named_parameters["filename"] = LogicalType::BOOLEAN;
+		f.named_parameters["mimetype"] = LogicalType::VARCHAR;
+		f.named_parameters["path"] = LogicalType::VARCHAR;
+		f.named_parameters["title"] = LogicalType::VARCHAR;
+		f.named_parameters["path_prefix"] = LogicalType::VARCHAR;
+		f.named_parameters["title_prefix"] = LogicalType::VARCHAR;
+		f.named_parameters["listing"] = LogicalType::VARCHAR;
+		f.projection_pushdown = true;
+		return f;
+	};
 
-	// TODO(phase1+): replacement scan for `FROM 'x.zim'` and multi-file/glob
-	// inputs (LogicalType::LIST(VARCHAR)) to match read_markdown ergonomics.
+	// Two arities: a single VARCHAR (path or glob) and a LIST(VARCHAR) of them.
+	TableFunctionSet set("read_zim");
+	set.AddFunction(make_fn(LogicalType::VARCHAR));
+	set.AddFunction(make_fn(LogicalType::LIST(LogicalType::VARCHAR)));
+	loader.RegisterFunction(set);
+
+	// `FROM 'x.zim'` replacement scan (only fires for names ending in .zim).
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	config.replacement_scans.emplace_back(ReadZimReplacementScan);
 }
 
 } // namespace duckdb
