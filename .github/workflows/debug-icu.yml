@@ -24,18 +24,20 @@ jobs:
             --build-arg vcpkg_url=https://github.com/microsoft/vcpkg.git \
             --build-arg vcpkg_commit=84bab45d415d22042bd0b9081aea57f362da3f35 \
             -t ci_img extension-ci-tools/docker/linux_amd64
-      - name: vcpkg install icu on the release-only triplet + dump error log
+      - name: Build the FULL libzim[xapian] dep set + watch disk
         run: |
+          echo "===== runner disk BEFORE ====="; df -h / /mnt 2>/dev/null
           docker run --rm ci_img bash -lc '
             set -x
             cd /vcpkg
-            ./vcpkg version | head -1
-            /opt/rh/gcc-toolset-14/root/usr/bin/cc --version | head -1 || cc --version | head -1 || true
-            ./vcpkg install icu:x64-linux-release > /tmp/icu_install.log 2>&1 || true
+            echo "===== container disk BEFORE ====="; df -h /
+            ./vcpkg install "libzim[core,xapian]:x64-linux-release" > /tmp/inst.log 2>&1 || true
+            echo "===== container disk AFTER ====="; df -h /
             echo "========== INSTALL LOG (tail) =========="
-            tail -40 /tmp/icu_install.log
-            echo "========== make-all RELEASE-ONLY err (tail) =========="
-            tail -150 buildtrees/icu/make-all-x64-linux-release-rel-err.log 2>/dev/null || echo "(no release-only err log)"
-            echo "========== make-all RELEASE-ONLY out (tail) =========="
-            tail -60 buildtrees/icu/make-all-x64-linux-release-rel-out.log 2>/dev/null || echo "(no release-only out log)"
+            tail -60 /tmp/inst.log
+            echo "========== icu make-all err (No space?) =========="
+            tail -80 buildtrees/icu/make-all-x64-linux-release-rel-err.log 2>/dev/null || echo "(no icu err log)"
+            echo "========== xapian err (tail) =========="
+            tail -40 buildtrees/xapian/*err*.log 2>/dev/null | tail -40 || echo "(no xapian err log)"
           '
+          echo "===== runner disk AFTER ====="; df -h / /mnt 2>/dev/null
