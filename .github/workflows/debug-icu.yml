@@ -1,0 +1,50 @@
+#
+# TEMPORARY debug: run the REAL extension build (`make release`) inside the exact CI
+# image, with the binary cache cleared so icu must build from source and fail the same
+# way the pipeline does -- then dump the buildtree error logs that vcpkg hides. Remove
+# once the icu/Linux build is fixed.
+#
+name: Debug icu build
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/phase-1-zim-reader
+
+jobs:
+  icu:
+    name: Reproduce real build + dump icu error
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+      - name: Build the CI docker image (manylinux + gcc-toolset-14 + vcpkg)
+        run: |
+          docker build \
+            --build-arg vcpkg_url=https://github.com/microsoft/vcpkg.git \
+            --build-arg vcpkg_commit=84bab45d415d22042bd0b9081aea57f362da3f35 \
+            -t ci_img extension-ci-tools/docker/linux_amd64
+      - name: make release (forces icu build, no cache) + dump error logs
+        run: |
+          docker run --rm \
+            -e VCPKG_TARGET_TRIPLET=x64-linux-release \
+            -e VCPKG_HOST_TRIPLET=x64-linux-release \
+            -e VCPKG_OVERLAY_PORTS=/duckdb_build_dir/extension-ci-tools/vcpkg_ports \
+            -e VCPKG_OVERLAY_TRIPLETS=/duckdb_build_dir/extension-ci-tools/toolchains \
+            -e VCPKG_BINARY_SOURCES=clear \
+            -e BUILD_SHELL=0 \
+            -v "$PWD:/duckdb_build_dir" \
+            ci_img bash -lc '
+              set +e
+              cd /duckdb_build_dir
+              git config --global --add safe.directory "*"
+              make release > /tmp/build.log 2>&1
+              echo "===== BUILD LOG TAIL ====="; tail -25 /tmp/build.log
+              echo "===== vcpkg issue_body.md ====="
+              find / -name issue_body.md 2>/dev/null -exec cat {} \;
+              echo "===== icu make-all ERR (tail 150) ====="
+              find / -name "make-all-*-rel-err.log" 2>/dev/null -exec sh -c "echo \"--- \$1 ---\"; tail -150 \$1" _ {} \;
+              echo "===== icu make-all OUT (tail 150) ====="
+              find / -name "make-all-*-rel-out.log" 2>/dev/null -exec sh -c "echo \"--- \$1 ---\"; tail -150 \$1" _ {} \;
+            '
