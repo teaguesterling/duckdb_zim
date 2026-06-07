@@ -1,6 +1,7 @@
 # name: test/sql/read_zim.test
 # description: read_zim content scan, ordering, prefix listing, exact lookup
-# group: [zim]
+# group: [sql]
+
 #
 # Fixture: test/oracle/test.zim (regenerate with test/oracle/make_fixture.py).
 # Expected values are the verified oracle outputs (docs/libzim-semantics.md).

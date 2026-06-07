@@ -1,6 +1,7 @@
 # name: test/sql/zim_errors.test
 # description: error handling and binder validation
-# group: [zim]
+# group: [sql]
+
 #
 # statement error matches a SUBSTRING of the error message. The exact wording
 # may need adjustment on first compile; the substrings below are chosen to be

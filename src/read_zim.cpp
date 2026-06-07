@@ -86,7 +86,9 @@ struct ReadZimGlobalState : public GlobalTableFunctionState {
 	bool want_content = false;             // content projected AND include_content
 	// MaxThreads()==1: the file_idx/cursor state machine is sequential and not
 	// thread-safe. Parallel scan (phase: partition index ranges) is deferred.
-	idx_t MaxThreads() const override { return 1; }
+	idx_t MaxThreads() const override {
+		return 1;
+	}
 };
 
 LogicalType ContentType(const ReadZimBindData &bind) {
@@ -205,9 +207,8 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 	}
 
 	names = {"path", "title", "mimetype", "is_redirect", "redirect_path", "size", "content"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::UBIGINT,
-	                ContentType(*bind)};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
+	                LogicalType::VARCHAR, LogicalType::UBIGINT, ContentType(*bind)};
 	if (bind->include_filepath) {
 		names.emplace_back("file_path");
 		return_types.emplace_back(LogicalType::VARCHAR);
@@ -241,8 +242,7 @@ static void AdvanceFile(ReadZimGlobalState &g, const ReadZimBindData &bind) {
 	}
 }
 
-unique_ptr<GlobalTableFunctionState> ReadZimInitGlobal(ClientContext &context,
-                                                       TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> ReadZimInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<ReadZimBindData>();
 	auto state = make_uniq<ReadZimGlobalState>();
 	state->files = bind.file_paths;
@@ -263,8 +263,8 @@ unique_ptr<GlobalTableFunctionState> ReadZimInitGlobal(ClientContext &context,
 	return std::move(state);
 }
 
-void EmitRow(const ReadZimBindData &bind, const ReadZimGlobalState &gstate, const ZimEntry &row,
-             DataChunk &output, idx_t out_idx) {
+void EmitRow(const ReadZimBindData &bind, const ReadZimGlobalState &gstate, const ZimEntry &row, DataChunk &output,
+             idx_t out_idx) {
 	for (idx_t col = 0; col < gstate.column_ids.size(); col++) {
 		auto cid = gstate.column_ids[col];
 		auto &vec = output.data[col];
@@ -276,27 +276,23 @@ void EmitRow(const ReadZimBindData &bind, const ReadZimGlobalState &gstate, cons
 			vec.SetValue(out_idx, Value(row.title));
 			break;
 		case COL_MIMETYPE:
-			vec.SetValue(out_idx, row.is_redirect ? Value(LogicalType::VARCHAR)
-			                                      : Value(row.mimetype));
+			vec.SetValue(out_idx, row.is_redirect ? Value(LogicalType::VARCHAR) : Value(row.mimetype));
 			break;
 		case COL_IS_REDIRECT:
 			vec.SetValue(out_idx, Value::BOOLEAN(row.is_redirect));
 			break;
 		case COL_REDIRECT_PATH:
-			vec.SetValue(out_idx, row.is_redirect ? Value(row.redirect_path)
-			                                      : Value(LogicalType::VARCHAR));
+			vec.SetValue(out_idx, row.is_redirect ? Value(row.redirect_path) : Value(LogicalType::VARCHAR));
 			break;
 		case COL_SIZE:
-			vec.SetValue(out_idx, row.is_redirect ? Value(LogicalType::UBIGINT)
-			                                      : Value::UBIGINT(row.size));
+			vec.SetValue(out_idx, row.is_redirect ? Value(LogicalType::UBIGINT) : Value::UBIGINT(row.size));
 			break;
 		case COL_CONTENT: {
 			if (!gstate.want_content || row.is_redirect) {
 				vec.SetValue(out_idx, Value(ContentType(bind)));
 			} else if (bind.content_as_varchar) {
 				// Binary content -> NULL rather than invalid UTF-8 in a VARCHAR column.
-				vec.SetValue(out_idx, IsValidUtf8(row.content) ? Value(row.content)
-				                                               : Value(LogicalType::VARCHAR));
+				vec.SetValue(out_idx, IsValidUtf8(row.content) ? Value(row.content) : Value(LogicalType::VARCHAR));
 			} else {
 				vec.SetValue(out_idx, Value::BLOB_RAW(row.content));
 			}
@@ -323,11 +319,9 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 			// move on. An exact path present in N archives therefore emits N rows.
 			if (!gstate.lookup_emitted) {
 				gstate.lookup_emitted = true;
-				auto row = bind.lookup_by_title
-				               ? gstate.archive->GetByTitle(bind.lookup_key, gstate.want_content)
-				               : gstate.archive->GetByPath(bind.lookup_key, gstate.want_content);
-				if (row.has_value() &&
-				    (!bind.spec.mimetype.has_value() || row->mimetype == *bind.spec.mimetype)) {
+				auto row = bind.lookup_by_title ? gstate.archive->GetByTitle(bind.lookup_key, gstate.want_content)
+				                                : gstate.archive->GetByPath(bind.lookup_key, gstate.want_content);
+				if (row.has_value() && (!bind.spec.mimetype.has_value() || row->mimetype == *bind.spec.mimetype)) {
 					EmitRow(bind, gstate, *row, output, count);
 					count++;
 				}

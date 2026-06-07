@@ -1,6 +1,6 @@
 # name: test/sql/zim_content.test
 # description: content laziness, projection pushdown, BLOB vs VARCHAR
-# group: [zim]
+# group: [sql]
 
 require zim
 

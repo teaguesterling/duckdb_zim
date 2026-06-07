@@ -36,8 +36,7 @@ static bool LooksLikeText(const std::string &mimetype) {
 		return true;
 	}
 	// common textual application/* types found in ZIMs
-	return mimetype.find("javascript") != std::string::npos ||
-	       mimetype.find("json") != std::string::npos ||
+	return mimetype.find("javascript") != std::string::npos || mimetype.find("json") != std::string::npos ||
 	       mimetype.find("xml") != std::string::npos; // includes image/svg+xml
 }
 
@@ -141,13 +140,10 @@ void MainEntry(DataChunk &args, ExpressionState &, Vector &result) {
 
 void RegisterZimScalars(ExtensionLoader &loader) {
 	const auto V = LogicalType::VARCHAR;
-	loader.RegisterFunction(
-	    ScalarFunction("zim_get_content", {V, V}, LogicalType::BLOB, GetContent));
+	loader.RegisterFunction(ScalarFunction("zim_get_content", {V, V}, LogicalType::BLOB, GetContent));
 	loader.RegisterFunction(ScalarFunction("zim_get_text", {V, V}, V, GetText));
-	loader.RegisterFunction(
-	    ScalarFunction("zim_has_entry", {V, V}, LogicalType::BOOLEAN, HasEntry));
-	loader.RegisterFunction(
-	    ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget));
+	loader.RegisterFunction(ScalarFunction("zim_has_entry", {V, V}, LogicalType::BOOLEAN, HasEntry));
+	loader.RegisterFunction(ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget));
 	loader.RegisterFunction(ScalarFunction("zim_mimetype", {V, V}, V, Mimetype));
 	loader.RegisterFunction(ScalarFunction("zim_main_entry", {V}, V, MainEntry));
 }

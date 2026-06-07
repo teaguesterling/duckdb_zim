@@ -1,6 +1,6 @@
 # name: test/sql/zim_scalars.test
 # description: single-entry lookup scalars
-# group: [zim]
+# group: [sql]
 
 require zim
 

@@ -19,6 +19,10 @@ jobs:
       duckdb_version: v1.5.2
       ci_tools_version: v1.5-variegata
       extension_name: zim
+      # The default vcpkg pin (84bab45) resolves icu 78.1, which fails to build on the
+      # release-only community triplet here. Pin to a newer vcpkg with icu 78.3 (verified
+      # building locally); CI fetches the commit explicitly, so a newer pin is fine.
+      vcpkg_commit: 10ceb139a610ebf3c6aa49cdc4a4b7f3db5d3f2b
 
   code-quality-check:
     name: Code Quality Check
@@ -27,4 +31,6 @@ jobs:
       duckdb_version: v1.5.2
       ci_tools_version: v1.5-variegata
       extension_name: zim
-      format_checks: 'format;tidy'
+      # format only: the tidy check configures CMake without vcpkg, so this extension's
+      # required libzim (pkg-config) isn't found and tidy can't even configure.
+      format_checks: 'format'

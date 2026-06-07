@@ -93,10 +93,17 @@ struct RangeStepper : CursorStepper {
 	RangeT range;
 	IterT it;
 	IterT end;
-	explicit RangeStepper(RangeT r) : range(std::move(r)), it(range.begin()), end(range.end()) {}
-	bool AtEnd() const override { return it == end; }
-	zim::Entry Current() const override { return *it; }
-	void Advance() override { ++it; }
+	explicit RangeStepper(RangeT r) : range(std::move(r)), it(range.begin()), end(range.end()) {
+	}
+	bool AtEnd() const override {
+		return it == end;
+	}
+	zim::Entry Current() const override {
+		return *it;
+	}
+	void Advance() override {
+		++it;
+	}
 };
 
 struct ZimScanCursor::Impl {
@@ -104,7 +111,8 @@ struct ZimScanCursor::Impl {
 	ScanSpec spec;
 };
 
-ZimScanCursor::ZimScanCursor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+ZimScanCursor::ZimScanCursor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
+}
 ZimScanCursor::~ZimScanCursor() = default;
 ZimScanCursor::ZimScanCursor(ZimScanCursor &&) noexcept = default;
 ZimScanCursor &ZimScanCursor::operator=(ZimScanCursor &&) noexcept = default;
@@ -327,8 +335,7 @@ bool ZimArchive::HasFulltextIndex() const {
 	return archive_->hasFulltextIndex();
 }
 
-std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t offset,
-                                             uint32_t limit) const {
+std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t offset, uint32_t limit) const {
 	std::vector<ZimSearchHit> hits;
 	if (!archive_->hasFulltextIndex()) {
 		return hits; // caller decides whether to fall back to title search

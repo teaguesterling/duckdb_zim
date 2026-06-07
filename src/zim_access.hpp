@@ -35,9 +35,9 @@ namespace zim_ext {
 // caller asks for it (projection pushdown): a listing scan must never pay the
 // decompression cost for blobs it won't emit.
 struct ZimEntry {
-	std::string path;          // namespace-free content path, e.g. "A/Photosynthesis"
+	std::string path; // namespace-free content path, e.g. "A/Photosynthesis"
 	std::string title;
-	std::string mimetype;      // empty for redirects
+	std::string mimetype; // empty for redirects
 	bool is_redirect = false;
 	std::string redirect_path; // target content path; empty unless is_redirect
 	uint64_t size = 0;         // item size in bytes; 0 for redirects
@@ -48,11 +48,11 @@ struct ZimEntry {
 // Archive-level structural facts (distinct from M-namespace metadata).
 struct ZimInfo {
 	std::string uuid;
-	uint64_t entry_count = 0;      // content/user entries
-	uint64_t all_entry_count = 0;  // + metadata + well-known + index
+	uint64_t entry_count = 0;     // content/user entries
+	uint64_t all_entry_count = 0; // + metadata + well-known + index
 	uint64_t article_count = 0;
 	uint64_t media_count = 0;
-	std::string main_entry_path;   // redirect-resolved landing path
+	std::string main_entry_path; // redirect-resolved landing path
 	bool has_fulltext_index = false;
 	bool has_title_index = false;
 	bool has_checksum = false;
@@ -64,7 +64,7 @@ struct ZimInfo {
 struct ZimSearchHit {
 	std::string path;
 	std::string title;
-	std::optional<double> score;   // NULL when libzim build doesn't expose it
+	std::optional<double> score; // NULL when libzim build doesn't expose it
 	std::optional<std::string> snippet;
 };
 
@@ -74,10 +74,10 @@ enum class ScanOrder { ByPath, ByTitle };
 
 struct ScanSpec {
 	ScanOrder order = ScanOrder::ByPath;
-	std::optional<std::string> path_prefix;   // -> findByPath
-	std::optional<std::string> title_prefix;  // -> findByTitle
-	std::optional<std::string> mimetype;      // post-filter (libzim has no mimetype index)
-	bool want_content = false;                // fetch blobs during the scan
+	std::optional<std::string> path_prefix;  // -> findByPath
+	std::optional<std::string> title_prefix; // -> findByTitle
+	std::optional<std::string> mimetype;     // post-filter (libzim has no mimetype index)
+	bool want_content = false;               // fetch blobs during the scan
 };
 
 // Forward-only cursor over content entries. Wraps a libzim EntryRange iterator
@@ -110,7 +110,9 @@ public:
 	static std::shared_ptr<ZimArchive> Open(const std::string &file_path);
 	~ZimArchive();
 
-	const std::string &FilePath() const { return file_path_; }
+	const std::string &FilePath() const {
+		return file_path_;
+	}
 
 	// --- archive-level info -------------------------------------------------
 	ZimInfo Info() const;
@@ -132,7 +134,7 @@ public:
 
 	// --- metadata (M namespace) --------------------------------------------
 	std::vector<std::string> MetadataKeys() const;
-	std::optional<std::string> Metadata(const std::string &key) const;     // value bytes
+	std::optional<std::string> Metadata(const std::string &key) const; // value bytes
 	std::optional<std::string> MetadataMimetype(const std::string &key) const;
 	// Parsed `Counter` metadata: mimetype -> count. Empty if no Counter key.
 	std::map<std::string, int64_t> Counter() const;
@@ -140,8 +142,7 @@ public:
 	// --- full-text search (optional libzim feature) ------------------------
 	bool HasFulltextIndex() const;
 	// Returns hits [offset, offset+limit). Empty when no fulltext index.
-	std::vector<ZimSearchHit> Search(const std::string &query, uint32_t offset,
-	                                 uint32_t limit) const;
+	std::vector<ZimSearchHit> Search(const std::string &query, uint32_t offset, uint32_t limit) const;
 
 private:
 	explicit ZimArchive(const std::string &file_path);

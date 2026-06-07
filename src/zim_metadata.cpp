@@ -44,11 +44,13 @@ struct MetadataGlobalState : public GlobalTableFunctionState {
 	std::shared_ptr<ZimArchive> archive;
 	std::vector<std::string> keys;
 	idx_t pos = 0;
-	idx_t MaxThreads() const override { return 1; }
+	idx_t MaxThreads() const override {
+		return 1;
+	}
 };
 
-unique_ptr<FunctionData> MetadataBind(ClientContext &, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
+unique_ptr<FunctionData> MetadataBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
+                                      vector<string> &names) {
 	auto bind = make_uniq<MetadataBindData>();
 	bind->file_path = input.inputs[0].GetValue<string>();
 	for (auto &kv : input.named_parameters) {
@@ -155,8 +157,7 @@ void ZimCounterScalar(DataChunk &args, ExpressionState &, Vector &result) {
 			keys.emplace_back(Value(kv.first));
 			vals.emplace_back(Value::BIGINT(kv.second));
 		}
-		result.SetValue(i, Value::MAP(LogicalType::VARCHAR, LogicalType::BIGINT,
-		                              std::move(keys), std::move(vals)));
+		result.SetValue(i, Value::MAP(LogicalType::VARCHAR, LogicalType::BIGINT, std::move(keys), std::move(vals)));
 	}
 }
 
@@ -179,8 +180,7 @@ void ZimInfoScalar(DataChunk &args, ExpressionState &, Vector &result) {
 		fields.emplace_back("has_title_index", Value::BOOLEAN(info.has_title_index));
 		fields.emplace_back("has_checksum", Value::BOOLEAN(info.has_checksum));
 		fields.emplace_back("is_multipart", Value::BOOLEAN(info.is_multipart));
-		fields.emplace_back("has_new_namespace_scheme",
-		                    Value::BOOLEAN(info.has_new_namespace_scheme));
+		fields.emplace_back("has_new_namespace_scheme", Value::BOOLEAN(info.has_new_namespace_scheme));
 		fields.emplace_back("filesize", Value::UBIGINT(info.filesize));
 		result.SetValue(i, Value::STRUCT(std::move(fields)));
 	}
@@ -206,24 +206,19 @@ LogicalType ZimInfoType() {
 } // namespace
 
 void RegisterZimMetadata(ExtensionLoader &loader) {
-	TableFunction meta("read_zim_metadata", {LogicalType::VARCHAR}, MetadataFunction, MetadataBind,
-	                   MetadataInit);
+	TableFunction meta("read_zim_metadata", {LogicalType::VARCHAR}, MetadataFunction, MetadataBind, MetadataInit);
 	meta.named_parameters["include_filepath"] = LogicalType::BOOLEAN;
 	meta.named_parameters["filename"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(meta);
 
-	loader.RegisterFunction(
-	    ScalarFunction("zim_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                   LogicalType::VARCHAR, ZimMetadataScalar));
-	loader.RegisterFunction(
-	    ScalarFunction("zim_metadata_keys", {LogicalType::VARCHAR},
-	                   LogicalType::LIST(LogicalType::VARCHAR), ZimMetadataKeysScalar));
-	loader.RegisterFunction(
-	    ScalarFunction("zim_counter", {LogicalType::VARCHAR},
-	                   LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT),
-	                   ZimCounterScalar));
-	loader.RegisterFunction(
-	    ScalarFunction("zim_info", {LogicalType::VARCHAR}, ZimInfoType(), ZimInfoScalar));
+	loader.RegisterFunction(ScalarFunction("zim_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                       LogicalType::VARCHAR, ZimMetadataScalar));
+	loader.RegisterFunction(ScalarFunction("zim_metadata_keys", {LogicalType::VARCHAR},
+	                                       LogicalType::LIST(LogicalType::VARCHAR), ZimMetadataKeysScalar));
+	loader.RegisterFunction(ScalarFunction("zim_counter", {LogicalType::VARCHAR},
+	                                       LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT),
+	                                       ZimCounterScalar));
+	loader.RegisterFunction(ScalarFunction("zim_info", {LogicalType::VARCHAR}, ZimInfoType(), ZimInfoScalar));
 }
 
 } // namespace duckdb

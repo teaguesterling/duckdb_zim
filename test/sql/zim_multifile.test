@@ -1,6 +1,6 @@
 # name: test/sql/zim_multifile.test
 # description: glob / multi-file (LIST) inputs and the FROM 'x.zim' replacement scan
-# group: [zim]
+# group: [sql]
 
 require zim
 
