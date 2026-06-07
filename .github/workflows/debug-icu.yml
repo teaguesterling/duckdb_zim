@@ -1,7 +1,7 @@
 #
-# TEMPORARY debug workflow: reproduce the icu vcpkg build inside the exact duckdb CI
-# image (gcc-toolset-14) and dump the buildtree error log, which the normal pipeline
-# does not surface. Manually triggered only. Remove once the icu/Linux build is fixed.
+# TEMPORARY debug workflow: build the exact duckdb CI image (manylinux/gcc-toolset-14),
+# reproduce the icu vcpkg build on the release-only triplet, and dump the buildtree error
+# log that the normal pipeline does not surface. Remove once the icu/Linux build is fixed.
 #
 name: Debug icu build
 on:
@@ -15,20 +15,27 @@ jobs:
     name: Reproduce icu build in CI image
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+      - name: Build the CI docker image (manylinux + gcc-toolset-14 + vcpkg)
+        run: |
+          docker build \
+            --build-arg vcpkg_url=https://github.com/microsoft/vcpkg.git \
+            --build-arg vcpkg_commit=84bab45d415d22042bd0b9081aea57f362da3f35 \
+            -t ci_img extension-ci-tools/docker/linux_amd64
       - name: vcpkg install icu on the release-only triplet + dump error log
         run: |
-          docker run --rm duckdb/linux_amd64 bash -lc '
+          docker run --rm ci_img bash -lc '
             set -x
             cd /vcpkg
-            git log -1 --oneline || true
-            cc --version || /opt/rh/gcc-toolset-14/root/usr/bin/cc --version || true
+            ./vcpkg version | head -1
+            /opt/rh/gcc-toolset-14/root/usr/bin/cc --version | head -1 || cc --version | head -1 || true
             ./vcpkg install icu:x64-linux-release > /tmp/icu_install.log 2>&1 || true
             echo "========== INSTALL LOG (tail) =========="
             tail -40 /tmp/icu_install.log
             echo "========== make-all RELEASE-ONLY err (tail) =========="
-            tail -120 buildtrees/icu/make-all-x64-linux-release-rel-err.log 2>/dev/null || echo "(no release-only err log)"
+            tail -150 buildtrees/icu/make-all-x64-linux-release-rel-err.log 2>/dev/null || echo "(no release-only err log)"
             echo "========== make-all RELEASE-ONLY out (tail) =========="
             tail -60 buildtrees/icu/make-all-x64-linux-release-rel-out.log 2>/dev/null || echo "(no release-only out log)"
-            echo "========== config.log (tail) =========="
-            tail -60 buildtrees/icu/x64-linux-release-rel/config.log 2>/dev/null || true
           '
