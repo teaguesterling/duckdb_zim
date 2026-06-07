@@ -1,0 +1,31 @@
+#
+# TEMPORARY debug workflow: reproduce the icu vcpkg build inside the exact duckdb CI
+# image (gcc-toolset-14) and dump the buildtree error log, which the normal pipeline
+# does not surface. Manually triggered only. Remove once the icu/Linux build is fixed.
+#
+name: Debug icu build
+on:
+  workflow_dispatch:
+
+jobs:
+  icu:
+    name: Reproduce icu build in CI image
+    runs-on: ubuntu-24.04
+    steps:
+      - name: vcpkg install icu on the release-only triplet + dump error log
+        run: |
+          docker run --rm duckdb/linux_amd64 bash -lc '
+            set -x
+            cd /vcpkg
+            git log -1 --oneline || true
+            cc --version || /opt/rh/gcc-toolset-14/root/usr/bin/cc --version || true
+            ./vcpkg install icu:x64-linux-release > /tmp/icu_install.log 2>&1 || true
+            echo "========== INSTALL LOG (tail) =========="
+            tail -40 /tmp/icu_install.log
+            echo "========== make-all RELEASE-ONLY err (tail) =========="
+            tail -120 buildtrees/icu/make-all-x64-linux-release-rel-err.log 2>/dev/null || echo "(no release-only err log)"
+            echo "========== make-all RELEASE-ONLY out (tail) =========="
+            tail -60 buildtrees/icu/make-all-x64-linux-release-rel-out.log 2>/dev/null || echo "(no release-only out log)"
+            echo "========== config.log (tail) =========="
+            tail -60 buildtrees/icu/x64-linux-release-rel/config.log 2>/dev/null || true
+          '

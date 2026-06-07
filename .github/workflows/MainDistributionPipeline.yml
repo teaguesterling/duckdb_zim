@@ -19,11 +19,6 @@ jobs:
       duckdb_version: v1.5.2
       ci_tools_version: v1.5-variegata
       extension_name: zim
-      # Pin vcpkg to just before icu 78.1 landed, so it resolves icu 74.2. The icu v78.x
-      # vcpkg port fails to build on the release-only community triplets under gcc-14
-      # (upstream vcpkg#49736); 78.1 and 78.3 both fail in CI, while 74.2's older port
-      # builds. This commit is recent enough that the other deps stay gcc-14-aware.
-      vcpkg_commit: 256d546c3388778d8fc06ae9ddc4f00fd36857c1
 
   code-quality-check:
     name: Code Quality Check
