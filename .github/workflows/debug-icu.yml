@@ -6,6 +6,9 @@
 name: Debug icu build
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feat/phase-1-zim-reader
 
 jobs:
   icu:
