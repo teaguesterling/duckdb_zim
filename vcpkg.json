@@ -1,11 +1,6 @@
 {
         "dependencies": [
-                {
-                        "name": "libzim",
-                        "features": [
-                                "xapian"
-                        ]
-                }
+                "libzim"
         ],
         "vcpkg-configuration": {
                 "overlay-ports": [
