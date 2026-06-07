@@ -87,6 +87,12 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 	auto bind = make_uniq<ReadZimBindData>();
 	bind->file_path = input.inputs[0].GetValue<string>();
 
+	// Track which mode-selecting params were given so conflicting combinations can be
+	// rejected instead of silently resolving last-wins.
+	bool has_path = false;
+	bool has_title = false;
+	bool has_listing = false;
+
 	for (auto &kv : input.named_parameters) {
 		auto &key = kv.first;
 		auto &val = kv.second;
@@ -103,10 +109,12 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 		} else if (key == "title_prefix") {
 			bind->spec.title_prefix = val.GetValue<string>();
 		} else if (key == "path") {
+			has_path = true;
 			bind->single_lookup = true;
 			bind->lookup_by_title = false;
 			bind->lookup_key = val.GetValue<string>();
 		} else if (key == "title") {
+			has_title = true;
 			bind->single_lookup = true;
 			bind->lookup_by_title = true;
 			bind->lookup_key = val.GetValue<string>();
@@ -114,6 +122,7 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 			// Picks which libzim listing to traverse, not merely an ordering:
 			// 'path' = all user entries (path order); 'title' = the front-article
 			// title listing (iterByTitle yields only FRONT_ARTICLE entries).
+			has_listing = true;
 			auto o = StringUtil::Lower(val.GetValue<string>());
 			if (o == "title") {
 				bind->spec.order = ScanOrder::ByTitle;
@@ -127,10 +136,35 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 		}
 	}
 
-	// A title_prefix implies title order; a path_prefix implies path order.
-	if (bind->spec.title_prefix.has_value()) {
+	// Mode validation. Exact lookup (path/title) and listing/prefix scanning are
+	// mutually exclusive, and the two exact keys / two prefixes can't be mixed. These
+	// combinations used to silently resolve last-wins; reject them instead.
+	const bool has_path_prefix = bind->spec.path_prefix.has_value();
+	const bool has_title_prefix = bind->spec.title_prefix.has_value();
+	if (has_path && has_title) {
+		throw BinderException("read_zim: specify only one of path or title");
+	}
+	if (has_path_prefix && has_title_prefix) {
+		throw BinderException("read_zim: specify only one of path_prefix or title_prefix");
+	}
+	if ((has_path || has_title) && (has_path_prefix || has_title_prefix || has_listing)) {
+		throw BinderException("read_zim: exact lookup (path/title) cannot be combined with "
+		                      "path_prefix/title_prefix/listing");
+	}
+	// At this point spec.order still holds the explicit listing (if any); a prefix that
+	// contradicts it is an error rather than a silent override.
+	if (has_listing && has_path_prefix && bind->spec.order == ScanOrder::ByTitle) {
+		throw BinderException("read_zim: listing := 'title' conflicts with path_prefix");
+	}
+	if (has_listing && has_title_prefix && bind->spec.order == ScanOrder::ByPath) {
+		throw BinderException("read_zim: listing := 'path' conflicts with title_prefix");
+	}
+
+	// A title_prefix implies title order; a path_prefix implies path order (validated
+	// above to agree with any explicit listing).
+	if (has_title_prefix) {
 		bind->spec.order = ScanOrder::ByTitle;
-	} else if (bind->spec.path_prefix.has_value()) {
+	} else if (has_path_prefix) {
 		bind->spec.order = ScanOrder::ByPath;
 	}
 

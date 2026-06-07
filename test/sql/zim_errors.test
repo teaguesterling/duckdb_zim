@@ -38,3 +38,35 @@ statement error
 SELECT zim_info('/no/such/archive.zim');
 ----
 failed to open ZIM
+
+# --- conflicting parameter modes are rejected, not silently last-wins -------------
+
+# two exact keys
+statement error
+SELECT * FROM read_zim('test/oracle/test.zim', path := 'A/Calcium', title := 'Calcium');
+----
+specify only one of path or title
+
+# two prefixes
+statement error
+SELECT * FROM read_zim('test/oracle/test.zim', path_prefix := 'A/', title_prefix := 'C');
+----
+specify only one of path_prefix or title_prefix
+
+# exact lookup mixed with a listing/prefix
+statement error
+SELECT * FROM read_zim('test/oracle/test.zim', path := 'A/Calcium', path_prefix := 'A/');
+----
+exact lookup (path/title) cannot be combined
+
+# listing that contradicts the prefix's order
+statement error
+SELECT * FROM read_zim('test/oracle/test.zim', path_prefix := 'A/', listing := 'title');
+----
+listing := 'title' conflicts with path_prefix
+
+# consistent prefix + listing is allowed (title_prefix is itself the title listing)
+query I
+SELECT count(*) >= 0 FROM read_zim('test/oracle/test.zim', title_prefix := 'C', listing := 'title');
+----
+true

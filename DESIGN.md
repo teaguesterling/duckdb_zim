@@ -262,7 +262,7 @@ Params on `read_zim`:
 ```sql
 -- cheap listing: names only, no content fetched (projection pushdown)
 SELECT path, title, mimetype
-FROM read_zim('wikipedia.zim', path_prefix := 'A/Cal', listing := 'title');
+FROM read_zim('wikipedia.zim', path_prefix := 'A/Cal');
 
 -- all CSS assets in the archive
 SELECT path, size FROM read_zim('wiki.zim', mimetype := 'text/css');

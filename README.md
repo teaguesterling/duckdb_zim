@@ -97,6 +97,13 @@ FROM read_zim('wikipedia.zim', path := 'A/Photosynthesis',
 (alias `filename`), `mimetype`, `path`, `title`, `path_prefix`, `title_prefix`,
 `listing` (`'path'` | `'title'`).
 
+These select mutually exclusive modes and conflicting combinations are rejected (rather
+than silently resolved): pick at most one exact key (`path` *or* `title`) **or** one
+prefix (`path_prefix` *or* `title_prefix`); an exact key can't be combined with a
+prefix/`listing`; and `listing` must not contradict a prefix's order (`title_prefix` +
+`listing := 'title'` is fine, `path_prefix` + `listing := 'title'` is an error).
+`mimetype` composes with any of them.
+
 > **`listing` (and `title_prefix`) are articles-only.** `listing := 'title'` selects
 > libzim's *title listing* — its `iterByTitle`, which contains only entries marked
 > `FRONT_ARTICLE` (the articles), not every entry. So it is a different row set, not
