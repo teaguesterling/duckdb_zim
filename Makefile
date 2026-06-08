@@ -12,11 +12,19 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # configure here and in CI (the reusable workflow runs this Makefile's `make` target).
 EXT_FLAGS=-DCMAKE_CXX_STANDARD=17
 
-# Serialize vcpkg dependency builds. The icu build is flaky under vcpkg's default
-# parallelism (`make -j5`) on the CI runners + gcc-toolset-14 -- it fails intermittently
-# (OOM / parallel-build race), which is why it sometimes succeeds and sometimes doesn't.
-# Building deps serially makes it deterministic. DuckDB's own compile stays parallel
-# (it uses ninja), so this only slows the dependency builds. (env is read by vcpkg.)
+# Build icu's host tools with the SAME triplet as the target. The reusable CI workflow
+# leaves VCPKG_HOST_TRIPLET unset inside the build container, so vcpkg defaults the host
+# to x64-linux (full) while the target is x64-linux-release. Building icu for two
+# different triplets corrupts its shared buildtree and fails the target build -- this was
+# the lone difference between a failing pipeline run and a known-good build with
+# host == target. Only applies in CI (VCPKG_TARGET_TRIPLET is unset for local builds).
+ifneq ($(VCPKG_TARGET_TRIPLET),)
+VCPKG_HOST_TRIPLET ?= $(VCPKG_TARGET_TRIPLET)
+export VCPKG_HOST_TRIPLET
+endif
+
+# Build vcpkg dependencies serially -- kept as belt-and-suspenders for icu determinism
+# while stabilizing CI. DuckDB's own compile stays parallel (ninja).
 export VCPKG_MAX_CONCURRENCY=1
 
 # Include the Makefile from extension-ci-tools
