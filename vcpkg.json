@@ -1,6 +1,6 @@
 {
         "dependencies": [
-                "openssl"
+                "libzim"
         ],
         "vcpkg-configuration": {
                 "overlay-ports": [

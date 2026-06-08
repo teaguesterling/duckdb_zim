@@ -18,7 +18,16 @@ jobs:
     with:
       duckdb_version: v1.5.2
       ci_tools_version: v1.5-variegata
-      extension_name: waddle
+      extension_name: zim
+      # Disable the shared DuckDB binary cache: it hands back an icu (or host-tool)
+      # artifact built with an incompatible toolchain, which poisons the icu build under
+      # gcc-toolset-14 (the build fails only when the cache is consulted; a fresh build
+      # of every dep succeeds). 'clear' forces building all deps from source.
+      vcpkg_binary_sources: 'clear'
+      # Windows isn't supported yet: libzim + icu under MSVC/mingw need their own porting
+      # work (mingw in particular fails to build the deps). Phase-1 ships Linux + macOS;
+      # revisit Windows later. (Wasm is likewise a documented open question -- see README.)
+      exclude_archs: 'windows_amd64;windows_arm64;windows_amd64_mingw'
 
   code-quality-check:
     name: Code Quality Check
@@ -26,5 +35,7 @@ jobs:
     with:
       duckdb_version: v1.5.2
       ci_tools_version: v1.5-variegata
-      extension_name: waddle
-      format_checks: 'format;tidy'
+      extension_name: zim
+      # format only: the tidy check configures CMake without vcpkg, so this extension's
+      # required libzim (pkg-config) isn't found and tidy can't even configure.
+      format_checks: 'format'
