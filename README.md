@@ -56,11 +56,12 @@ SELECT zim_counter('wikipedia.zim');     -- MAP('text/html' -> 11604, 'image/web
 SELECT zim_get_text('wikipedia.zim', 'A/Photosynthesis');
 ```
 
-A note on **paths**: under the current ZIM namespace scheme, content paths are
-namespace-free (`A/Photosynthesis`, not `C/A/Photosynthesis`). The `A/`, `I/` prefixes
-you see are path text from the scraper, not libzim namespaces. A leading `C/` is
-tolerated on lookup and normalized away. See `docs/libzim-semantics.md` for the verified
-model.
+A note on **paths**: content paths are namespace-free (`A/Photosynthesis`, not
+`C/A/Photosynthesis`) and their shape is **scraper-dependent** — the prefixes are path
+text, not libzim namespaces. mwoffliner emits `A/Photosynthesis`, `I/logo.png`; zimit /
+browsertrix emits full URLs with a trailing slash, e.g. `www.nhs.uk/medicines/insulin/`.
+The extension treats them as opaque content paths either way; a leading `C/` is tolerated
+on lookup and normalized away. See `docs/libzim-semantics.md` for the verified model.
 
 ---
 
@@ -154,6 +155,33 @@ zim_mimetype(file, path)        -- VARCHAR
 zim_main_entry(file)            -- VARCHAR, redirect-resolved landing path
 ```
 
+### Reading a real archive, end to end
+
+Walking a real zimit archive — `nhs.uk_en_medicines_2025-12.zim` (~2k entries):
+
+```sql
+-- what is this? counts/flags, the human title, and the self-describing mimetype histogram
+SELECT zim_info('nhs.uk_en_medicines_2025-12.zim');               -- entry_count 2064, uuid, …
+SELECT zim_metadata('nhs.uk_en_medicines_2025-12.zim', 'Title');  -- NHS' Medicines A to Z
+SELECT zim_counter('nhs.uk_en_medicines_2025-12.zim');            -- text/html→1996, image/jpeg→9, …
+
+-- the landing page (redirect-resolved)
+SELECT zim_main_entry('nhs.uk_en_medicines_2025-12.zim');         -- www.nhs.uk/medicines/
+
+-- browse the biggest articles — no content fetched, so it's fast
+SELECT path, title, size
+FROM read_zim('nhs.uk_en_medicines_2025-12.zim', mimetype := 'text/html')
+ORDER BY size DESC LIMIT 10;                                      -- Insulin, HRT, Propranolol, …
+
+-- read one article's HTML as text
+SELECT zim_get_text('nhs.uk_en_medicines_2025-12.zim', 'www.nhs.uk/medicines/insulin/');
+```
+
+> **Heads up on identifiers:** the archive's `Name` metadata (`nhs.uk_en_medicines`) is
+> *not* the on-disk filename stem (`nhs.uk_en_medicines_2025-12`) — the date lives only in
+> the filename, and kiwix serves content by the filename stem. Don't build content URLs
+> from `Name`.
+
 ---
 
 ## Integration with other extensions
@@ -176,10 +204,11 @@ FROM read_zim('wikipedia.zim', include_content := true, content_as_varchar := tr
 WHERE mimetype = 'text/html';
 ```
 
-> **mwoffliner chrome:** raw article HTML is wrapped in nav / infobox / footer markup.
-> Extract the article body with an XPath onto the content container (commonly
-> `//div[contains(@class,"mw-parser-output")]`), not `//body` — the exact selector
-> varies by scraper version and skin.
+> **Article-body selectors are scraper-specific:** raw article HTML is wrapped in
+> nav / header / footer chrome, so extract the body with an XPath onto the content
+> container, not `//body`. mwoffliner wikis use `//div[contains(@class,"mw-parser-output")]`;
+> zimit / browsertrix captures (like the NHS archive above) keep the site's own markup,
+> often `//main` or `//article`. The exact selector varies by scraper version and skin.
 
 ### Filesystem seam (planned — phase 2)
 
