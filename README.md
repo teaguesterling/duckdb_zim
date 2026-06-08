@@ -15,8 +15,8 @@ for the HTML that ZIM articles are made of).
 > intentional and separate from the MIT-licensed `markdown`/`yaml`/`webbed` family;
 > see [License](#license).
 
-> **Platforms: native (Linux / macOS / Windows).** A WebAssembly build is an open
-> question gated on libzim's search dependency; see [Platforms](#platforms).
+> **Platforms: Linux, macOS, and WebAssembly** all build and test green in CI (the
+> search-less stack). Windows isn't supported yet; see [Platforms](#platforms).
 
 ---
 
@@ -247,11 +247,14 @@ context for an offline model.
 
 ## Platforms
 
-Native Linux / macOS / Windows. libzim brings `zstd`, `liblzma`, `icu`, and optionally
-`xapian` (search). Those individually compile to WebAssembly (DuckDB-WASM already ships
-`zstd` and `icu`), so a search-less WASM build is a plausible spike — gated on (a) whether
-libzim drops `icu` when built without `xapian`, and (b) whether libzim's own build works
-under emscripten. Search is a compile-time option for exactly this reason.
+**Linux** (x64 + arm64) and **macOS** (x64 + arm64) build and test green in CI. The
+search-less **WebAssembly** build works too — all three emscripten variants
+(mvp / eh / threads) compile green, settling the earlier open question: libzim + `icu` +
+`zstd` + `liblzma` *do* build under emscripten once `xapian` is dropped. `xapian` (search)
+stays a compile-time option, so `zim_search` (phase 3) will be a native/desktop feature.
+
+**Windows** is not yet supported — libzim + icu under MSVC/mingw need their own porting
+work, so it's excluded from CI for now.
 
 ---
 
