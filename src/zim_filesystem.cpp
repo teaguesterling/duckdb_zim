@@ -122,8 +122,7 @@ public:
 		return "ZimFileSystem";
 	}
 
-	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
-	                                optional_ptr<FileOpener> opener) override {
+	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags, optional_ptr<FileOpener> opener) override {
 		if (flags.OpenForWriting() || flags.OpenForAppending() || flags.CreateFileIfNotExists() ||
 		    flags.OverwriteExistingFile()) {
 			throw NotImplementedException("zim:// filesystem is read-only (cannot open '%s' for writing)", path);

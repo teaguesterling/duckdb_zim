@@ -78,6 +78,12 @@ struct ScanSpec {
 	std::optional<std::string> title_prefix; // -> findByTitle
 	std::optional<std::string> mimetype;     // post-filter (libzim has no mimetype index)
 	bool want_content = false;               // fetch blobs during the scan
+	// When want_content and this is non-empty, the blob is loaded ONLY for
+	// entries whose mimetype is listed here; others come back content_loaded =
+	// false (NULL content). Empty = load every scanned entry. This is what lets
+	// a bulk scan materialize, say, just text/html without paying to decompress
+	// the images alongside them.
+	std::vector<std::string> content_mimetypes;
 };
 
 // Forward-only cursor over content entries. Wraps a libzim EntryRange iterator

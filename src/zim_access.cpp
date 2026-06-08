@@ -62,6 +62,22 @@ static ZimEntry EntryMeta(const zim::Entry &entry) {
 	return row;
 }
 
+// Whether the content gate admits this entry's mimetype. An empty gate admits
+// everything; a non-empty gate admits only listed mimetypes (so a redirect,
+// whose mimetype is "", is excluded by any non-empty gate — it has no body
+// anyway).
+static bool ContentMimetypeAllowed(const ScanSpec &spec, const std::string &mimetype) {
+	if (spec.content_mimetypes.empty()) {
+		return true;
+	}
+	for (const auto &m : spec.content_mimetypes) {
+		if (m == mimetype) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void LoadContent(const zim::Entry &entry, ZimEntry &row) {
 	if (row.is_redirect) {
 		row.content_loaded = true; // redirects have no body
@@ -135,7 +151,7 @@ bool ZimScanCursor::Next(ZimEntry &out) {
 		if (spec.mimetype.has_value() && row.mimetype != *spec.mimetype) {
 			continue;
 		}
-		if (spec.want_content) {
+		if (spec.want_content && ContentMimetypeAllowed(spec, row.mimetype)) {
 			LoadContent(entry, row);
 		}
 		out = std::move(row);
