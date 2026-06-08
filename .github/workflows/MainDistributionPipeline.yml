@@ -19,6 +19,11 @@ jobs:
       duckdb_version: v1.5.2
       ci_tools_version: v1.5-variegata
       extension_name: zim
+      # Disable the shared DuckDB binary cache: it hands back an icu (or host-tool)
+      # artifact built with an incompatible toolchain, which poisons the icu build under
+      # gcc-toolset-14 (the build fails only when the cache is consulted; a fresh build
+      # of every dep succeeds). 'clear' forces building all deps from source.
+      vcpkg_binary_sources: 'clear'
 
   code-quality-check:
     name: Code Quality Check
