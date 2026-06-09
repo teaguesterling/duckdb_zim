@@ -1,8 +1,9 @@
 # name: test/sql/zim_zimit.test
-# description: zimit / browsertrix-style archives — full-URL content paths, trailing
-#              slashes, and a no-fulltext-index archive. Fixture: test/oracle/test_zimit.zim
-#              (regenerate with test/oracle/make_zimit_fixture.py).
+# description: zimit/browsertrix archives — full-URL paths, trailing slashes, no-index search
 # group: [sql]
+
+#
+# Fixture: test/oracle/test_zimit.zim (regenerate with test/oracle/make_zimit_fixture.py).
 
 require zim
 
