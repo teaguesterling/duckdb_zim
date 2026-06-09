@@ -65,7 +65,12 @@ def main(out="test/oracle/test_zimit.zim"):
             )
         )
         c.add_item(
-            HtmlItem("example.com/static/style.css", "style", "body{color:blue}", mime="text/css")
+            HtmlItem(
+                "example.com/static/style.css",
+                "style",
+                "body{color:blue}",
+                mime="text/css",
+            )
         )
         c.set_mainpath("example.com/")
         c.add_metadata("Title", "Test Zimit ZIM")
