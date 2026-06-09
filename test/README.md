@@ -18,12 +18,12 @@ python3 test/oracle/make_fixture.py
 
 ## Files
 
-- `read_zim.test`     — content scan, ordering, prefix listing, exact lookup, redirects
-- `zim_content.test`  — content laziness, projection, BLOB vs VARCHAR
-- `zim_metadata.test` — read_zim_metadata, zim_metadata/_keys/zim_counter/zim_info
-- `zim_scalars.test`  — single-entry lookup scalars
-- `zim_errors.test`   — binder validation + bad-archive handling
-
-Two assertion groups may need adjustment on first compile (flagged inline): the
-`statement error` substrings in `zim_errors.test`, and the `title_prefix` count in
-`read_zim.test` (depends on libzim `findByTitle` prefix scoping).
+- `read_zim.test`            — content scan, ordering, prefix listing, exact lookup, redirects
+- `zim_content.test`         — content laziness, projection, BLOB vs VARCHAR
+- `zim_include_content.test` — `include_content := mimetype | [mimetypes]` gated loading
+- `zim_multifile.test`       — globs, `LIST(VARCHAR)`, replacement scan across archives
+- `zim_metadata.test`        — read_zim_metadata, zim_metadata/_keys/zim_counter/zim_info
+- `zim_scalars.test`         — single-entry lookup scalars
+- `zim_filesystem.test`      — the `zim://` virtual filesystem (read_text/read_blob, glob)
+- `zim_search.test`          — `zim_search` Xapian full-text search (native builds)
+- `zim_errors.test`          — binder validation + bad-archive handling

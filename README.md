@@ -16,25 +16,33 @@ for the HTML that ZIM articles are made of).
 > intentional and separate from the MIT-licensed `markdown`/`yaml`/`webbed` family;
 > see [License](#license).
 
-> **Platforms: Linux, macOS, and WebAssembly** all build and test green in CI (the
-> search-less stack). Windows isn't supported yet; see [Platforms](#platforms).
+> **Platforms: Linux and macOS** (x64 + arm64, with full-text search) **and WebAssembly**
+> (search-less) all build and test green in CI. Windows isn't supported yet; see
+> [Platforms](#platforms).
 
 ---
 
 ## Install
 
-Not yet published to community-extensions. Build from source (see `HANDOFF.md` /
-`DESIGN.md` for the toolchain), then:
-
-```sql
-LOAD zim;
-```
-
-Once published, the usual:
+A community-extensions submission is in progress. Once it lands, the usual:
 
 ```sql
 INSTALL zim FROM community;
 LOAD zim;
+```
+
+Until then, build from source (DuckDB + extension are pulled as submodules):
+
+```sh
+git clone --recurse-submodules https://github.com/teaguesterling/duckdb_zim.git
+cd duckdb_zim
+make            # needs a vcpkg toolchain for libzim; see DESIGN.md for details
+```
+
+then load the built extension:
+
+```sql
+LOAD 'build/release/extension/zim/zim.duckdb_extension';
 ```
 
 ---
