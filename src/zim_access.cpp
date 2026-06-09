@@ -366,16 +366,19 @@ std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t 
 	q.setQuery(query);
 	auto search = searcher.search(q);
 	auto results = search.getResults(offset, limit);
-	// VERIFY: SearchResultSet iterator. On recent libzim the iterator exposes
-	// getPath()/getTitle()/getScore()/getSnippet(); on older builds it yields a
-	// zim::Entry (path/title only). We read path/title always; score/snippet are
-	// optional and left empty if the build doesn't provide them.
+	// The pinned libzim (9.7.0) SearchIterator exposes getScore() (an int rank)
+	// and getSnippet(). Snippet generation is best-effort: it can come back empty
+	// (e.g. the query produced no highlightable span), in which case we leave it
+	// NULL rather than emit an empty string.
 	for (auto it = results.begin(); it != results.end(); ++it) {
 		ZimSearchHit hit;
 		hit.path = it.getPath();
 		hit.title = it.getTitle();
-		// hit.score = it.getScore();         // enable once confirmed on pinned libzim
-		// hit.snippet = it.getSnippet();      // enable once confirmed on pinned libzim
+		hit.score = static_cast<double>(it.getScore());
+		auto snippet = it.getSnippet();
+		if (!snippet.empty()) {
+			hit.snippet = std::move(snippet);
+		}
 		hits.push_back(std::move(hit));
 	}
 #else

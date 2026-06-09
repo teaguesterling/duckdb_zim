@@ -1,0 +1,64 @@
+# name: test/sql/zim_search.test
+# description: zim_search — Xapian full-text search (phase 3)
+# group: [sql]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# The fixture was built with config_indexing(True), so it carries a fulltext index.
+query I
+SELECT zim_info('test/oracle/test.zim').has_fulltext_index;
+----
+true
+
+# 'plants' matches both botany articles (each mentions plants in its body).
+query II
+SELECT path, title FROM zim_search('test/oracle/test.zim', 'plants') ORDER BY path;
+----
+A/Chlorophyll	Chlorophyll
+A/Photosynthesis	Photosynthesis
+
+# a more specific query narrows to a single article.
+query I
+SELECT path FROM zim_search('test/oracle/test.zim', 'photosynthesis');
+----
+A/Photosynthesis
+
+# every hit carries a populated score (Xapian rank) and a context snippet.
+query I
+SELECT bool_and(score IS NOT NULL AND score > 0 AND snippet IS NOT NULL)
+FROM zim_search('test/oracle/test.zim', 'plants');
+----
+true
+
+# max_results caps the number of hits.
+query I
+SELECT count(*) FROM zim_search('test/oracle/test.zim', 'plants', max_results := 1);
+----
+1
+
+# result_offset skips leading hits.
+query I
+SELECT count(*) FROM zim_search('test/oracle/test.zim', 'plants', result_offset := 1);
+----
+1
+
+# a query that matches nothing returns no rows (clean, not an error).
+query I
+SELECT count(*) FROM zim_search('test/oracle/test.zim', 'zzzznotaword');
+----
+0
+
+# unknown parameter is rejected (DuckDB validates the named-parameter map first).
+statement error
+SELECT * FROM zim_search('test/oracle/test.zim', 'x', bogus := 1);
+----
+Invalid named parameter
+
+# a negative bound is rejected.
+statement error
+SELECT * FROM zim_search('test/oracle/test.zim', 'x', max_results := -1);
+----
+must be >= 0
