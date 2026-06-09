@@ -1,19 +1,28 @@
 //===----------------------------------------------------------------------===//
-// zim_search.cpp — full-text search over a ZIM's Xapian index (DESIGN §4.4).
+// zim_search.cpp — full-text search + title suggestions over ZIM archives.
 //
-//   zim_search(file, query [, max_results := 25, result_offset := 0])
-//       -> table(path, title, score DOUBLE, snippet VARCHAR)
+//   zim_search(files, query [, max_results := 25, result_offset := 0])
+//       -> table(path, title, score DOUBLE, snippet VARCHAR, file VARCHAR)
+//   zim_suggest(files, query [, max_results := 25, result_offset := 0])
+//       -> table(path, title, snippet VARCHAR, file VARCHAR)
 //
-// Backed by libzim's Searcher (Xapian). This translation unit is only useful
-// when libzim was built with xapian; the access layer's Search() is itself
-// guarded by LIBZIM_WITH_XAPIAN and returns no hits otherwise, so on a
-// search-less build (e.g. Wasm) this function binds but always yields 0 rows.
+// `files` is a single path, a glob, or a LIST(VARCHAR) — like read_zim — so a
+// query can run across many archives at once (federated search). max_results /
+// result_offset apply PER archive (each contributes up to max_results hits);
+// the trailing `file` column says which archive a hit came from, and you ORDER
+// BY / LIMIT across them in SQL. Xapian ranks are per-archive and not directly
+// comparable across files.
+//
+// Search is backed by libzim's Searcher (Xapian); the access layer's Search()
+// is guarded by LIBZIM_WITH_XAPIAN and yields nothing on a search-less build
+// (e.g. Wasm). Suggest degrades to a title-prefix listing there instead.
 //
 // `limit` / `offset` are SQL reserved words and won't parse as bare named
 // parameters (same reason phase 1 used `listing`, not `order`), hence
 // `max_results` / `result_offset`.
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "zim_access.hpp"
@@ -28,14 +37,20 @@ using zim_ext::ZimSearchHit;
 namespace {
 
 struct SearchBindData : public TableFunctionData {
-	std::string file_path;
+	std::vector<std::string> file_paths; // one or more archives (glob/list expanded)
 	std::string query;
 	uint32_t max_results = 25;
 	uint32_t result_offset = 0;
 };
 
+// A hit plus the archive it came from.
+struct TaggedHit {
+	std::string file;
+	ZimSearchHit hit;
+};
+
 struct SearchGlobalState : public GlobalTableFunctionState {
-	std::vector<ZimSearchHit> hits;
+	std::vector<TaggedHit> hits;
 	idx_t pos = 0;
 	idx_t MaxThreads() const override {
 		return 1;
@@ -45,36 +60,72 @@ struct SearchGlobalState : public GlobalTableFunctionState {
 static uint32_t NonNegativeParam(const Value &val, const char *name) {
 	auto v = val.GetValue<int64_t>();
 	if (v < 0) {
-		throw BinderException("zim_search: %s must be >= 0", name);
+		throw BinderException("%s must be >= 0", name);
 	}
 	return static_cast<uint32_t>(v);
 }
 
-unique_ptr<FunctionData> SearchBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                                    vector<string> &names) {
-	auto bind = make_uniq<SearchBindData>();
-	bind->file_path = input.inputs[0].GetValue<string>();
-	bind->query = input.inputs[1].GetValue<string>();
-	for (auto &kv : input.named_parameters) {
-		if (kv.first == "max_results") {
-			bind->max_results = NonNegativeParam(kv.second, "max_results");
-		} else if (kv.first == "result_offset") {
-			bind->result_offset = NonNegativeParam(kv.second, "result_offset");
+// Expand a VARCHAR / glob / LIST(VARCHAR) argument into a list of archive paths.
+static std::vector<std::string> ExpandFiles(ClientContext &context, const Value &arg, const char *fn) {
+	std::vector<std::string> patterns;
+	if (arg.type().id() == LogicalTypeId::LIST) {
+		for (auto &child : ListValue::GetChildren(arg)) {
+			patterns.push_back(child.GetValue<std::string>());
+		}
+	} else {
+		patterns.push_back(arg.GetValue<std::string>());
+	}
+	auto &fs = FileSystem::GetFileSystem(context);
+	std::vector<std::string> files;
+	for (auto &pat : patterns) {
+		if (FileSystem::HasGlob(pat)) {
+			for (auto &info : fs.Glob(pat)) {
+				files.push_back(info.path);
+			}
 		} else {
-			throw BinderException("zim_search: unknown parameter '%s'", kv.first);
+			files.push_back(pat);
 		}
 	}
-	names = {"path", "title", "score", "snippet"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE, LogicalType::VARCHAR};
+	if (files.empty()) {
+		throw BinderException("%s: no files matched the given pattern(s)", fn);
+	}
+	return files;
+}
+
+static void ParseSearchParams(SearchBindData &bind, TableFunctionBindInput &input, const char *fn) {
+	for (auto &kv : input.named_parameters) {
+		if (kv.first == "max_results") {
+			bind.max_results = NonNegativeParam(kv.second, "max_results");
+		} else if (kv.first == "result_offset") {
+			bind.result_offset = NonNegativeParam(kv.second, "result_offset");
+		} else {
+			throw BinderException("%s: unknown parameter '%s'", fn, kv.first);
+		}
+	}
+}
+
+unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunctionBindInput &input,
+                                    vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind = make_uniq<SearchBindData>();
+	bind->file_paths = ExpandFiles(context, input.inputs[0], "zim_search");
+	bind->query = input.inputs[1].GetValue<string>();
+	ParseSearchParams(*bind, input, "zim_search");
+	names = {"path", "title", "score", "snippet", "file"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::DOUBLE, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR};
 	return std::move(bind);
 }
 
 unique_ptr<GlobalTableFunctionState> SearchInit(ClientContext &, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<SearchBindData>();
 	auto state = make_uniq<SearchGlobalState>();
-	auto archive = ArchivePool::Instance().Get(bind.file_path);
-	// No fulltext index (or a search-less libzim build) -> empty result set.
-	state->hits = archive->Search(bind.query, bind.result_offset, bind.max_results);
+	// Per archive: up to max_results hits, each tagged with its source file.
+	for (auto &fp : bind.file_paths) {
+		auto archive = ArchivePool::Instance().Get(fp);
+		for (auto &hit : archive->Search(bind.query, bind.result_offset, bind.max_results)) {
+			state->hits.push_back(TaggedHit {fp, std::move(hit)});
+		}
+	}
 	return std::move(state);
 }
 
@@ -82,13 +133,15 @@ void SearchFunction(ClientContext &, TableFunctionInput &data, DataChunk &output
 	auto &gstate = data.global_state->Cast<SearchGlobalState>();
 	idx_t count = 0;
 	while (count < STANDARD_VECTOR_SIZE && gstate.pos < gstate.hits.size()) {
-		const auto &hit = gstate.hits[gstate.pos++];
+		const auto &tagged = gstate.hits[gstate.pos++];
+		const auto &hit = tagged.hit;
 		output.data[0].SetValue(count, Value(hit.path));
 		output.data[1].SetValue(count, Value(hit.title));
-		// score / snippet are optional: NULL when the pinned libzim's search
-		// iterator doesn't expose them.
+		// score / snippet are optional: NULL when the pinned libzim's iterator
+		// doesn't expose them.
 		output.data[2].SetValue(count, hit.score.has_value() ? Value::DOUBLE(*hit.score) : Value(LogicalType::DOUBLE));
 		output.data[3].SetValue(count, hit.snippet.has_value() ? Value(*hit.snippet) : Value(LogicalType::VARCHAR));
+		output.data[4].SetValue(count, Value(tagged.file));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -96,31 +149,27 @@ void SearchFunction(ClientContext &, TableFunctionInput &data, DataChunk &output
 
 // --- zim_suggest: title autocomplete (reuses SearchBindData / SearchGlobalState) ---
 
-unique_ptr<FunctionData> SuggestBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                                     vector<string> &names) {
+unique_ptr<FunctionData> SuggestBind(ClientContext &context, TableFunctionBindInput &input,
+                                     vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind = make_uniq<SearchBindData>();
-	bind->file_path = input.inputs[0].GetValue<string>();
+	bind->file_paths = ExpandFiles(context, input.inputs[0], "zim_suggest");
 	bind->query = input.inputs[1].GetValue<string>();
-	for (auto &kv : input.named_parameters) {
-		if (kv.first == "max_results") {
-			bind->max_results = NonNegativeParam(kv.second, "max_results");
-		} else if (kv.first == "result_offset") {
-			bind->result_offset = NonNegativeParam(kv.second, "result_offset");
-		} else {
-			throw BinderException("zim_suggest: unknown parameter '%s'", kv.first);
-		}
-	}
-	// Suggestions have no fulltext score; just path/title/snippet.
-	names = {"path", "title", "snippet"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	ParseSearchParams(*bind, input, "zim_suggest");
+	// Suggestions have no fulltext score; just path/title/snippet (+ source file).
+	names = {"path", "title", "snippet", "file"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
 	return std::move(bind);
 }
 
 unique_ptr<GlobalTableFunctionState> SuggestInit(ClientContext &, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<SearchBindData>();
 	auto state = make_uniq<SearchGlobalState>();
-	auto archive = ArchivePool::Instance().Get(bind.file_path);
-	state->hits = archive->Suggest(bind.query, bind.result_offset, bind.max_results);
+	for (auto &fp : bind.file_paths) {
+		auto archive = ArchivePool::Instance().Get(fp);
+		for (auto &hit : archive->Suggest(bind.query, bind.result_offset, bind.max_results)) {
+			state->hits.push_back(TaggedHit {fp, std::move(hit)});
+		}
+	}
 	return std::move(state);
 }
 
@@ -128,28 +177,38 @@ void SuggestFunction(ClientContext &, TableFunctionInput &data, DataChunk &outpu
 	auto &gstate = data.global_state->Cast<SearchGlobalState>();
 	idx_t count = 0;
 	while (count < STANDARD_VECTOR_SIZE && gstate.pos < gstate.hits.size()) {
-		const auto &hit = gstate.hits[gstate.pos++];
+		const auto &tagged = gstate.hits[gstate.pos++];
+		const auto &hit = tagged.hit;
 		output.data[0].SetValue(count, Value(hit.path));
 		output.data[1].SetValue(count, Value(hit.title));
 		output.data[2].SetValue(count, hit.snippet.has_value() ? Value(*hit.snippet) : Value(LogicalType::VARCHAR));
+		output.data[3].SetValue(count, Value(tagged.file));
 		count++;
 	}
 	output.SetCardinality(count);
 }
 
+TableFunction MakeFn(const string &name, const LogicalType &files_type, table_function_t fn, table_function_bind_t bind,
+                     table_function_init_global_t init) {
+	TableFunction f(name, {files_type, LogicalType::VARCHAR}, fn, bind, init);
+	f.named_parameters["max_results"] = LogicalType::BIGINT;
+	f.named_parameters["result_offset"] = LogicalType::BIGINT;
+	return f;
+}
+
 } // namespace
 
 void RegisterZimSearch(ExtensionLoader &loader) {
-	TableFunction search("zim_search", {LogicalType::VARCHAR, LogicalType::VARCHAR}, SearchFunction, SearchBind,
-	                     SearchInit);
-	search.named_parameters["max_results"] = LogicalType::BIGINT;
-	search.named_parameters["result_offset"] = LogicalType::BIGINT;
+	const auto LIST_V = LogicalType::LIST(LogicalType::VARCHAR);
+
+	TableFunctionSet search("zim_search");
+	search.AddFunction(MakeFn("zim_search", LogicalType::VARCHAR, SearchFunction, SearchBind, SearchInit));
+	search.AddFunction(MakeFn("zim_search", LIST_V, SearchFunction, SearchBind, SearchInit));
 	loader.RegisterFunction(search);
 
-	TableFunction suggest("zim_suggest", {LogicalType::VARCHAR, LogicalType::VARCHAR}, SuggestFunction, SuggestBind,
-	                      SuggestInit);
-	suggest.named_parameters["max_results"] = LogicalType::BIGINT;
-	suggest.named_parameters["result_offset"] = LogicalType::BIGINT;
+	TableFunctionSet suggest("zim_suggest");
+	suggest.AddFunction(MakeFn("zim_suggest", LogicalType::VARCHAR, SuggestFunction, SuggestBind, SuggestInit));
+	suggest.AddFunction(MakeFn("zim_suggest", LIST_V, SuggestFunction, SuggestBind, SuggestInit));
 	loader.RegisterFunction(suggest);
 }
 

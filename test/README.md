@@ -32,6 +32,7 @@ python3 test/oracle/make_zimit_fixture.py
 - `zim_scalars.test`         — single-entry lookup scalars
 - `zim_filesystem.test`      — the `zim://` virtual filesystem (read_text/read_blob, glob)
 - `zim_search.test`          — `zim_search` Xapian full-text search (native builds)
+- `zim_federated.test`       — multi-archive `zim_search` / `zim_suggest` (glob/LIST, `file` column)
 - `zim_utilities.test`       — `zim_suggest` / `zim_illustration` / `zim_random` / `zim_check`
 - `zim_zimit.test`           — zimit-style full-URL paths, trailing slashes, no-index search
 - `zim_errors.test`          — binder validation + bad-archive handling

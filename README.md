@@ -198,18 +198,31 @@ SELECT path FROM zim_search('wikipedia.zim', 'photosynthesis',
                             max_results := 10, result_offset := 10);
 ```
 
-Returns `(path, title, score DOUBLE, snippet VARCHAR)` ranked by relevance. `score` is the
-Xapian rank; `snippet` is a best-effort highlighted excerpt (`NULL` when none is produced).
-An archive without a full-text index — or the search-less **WebAssembly** build — returns
-no rows rather than erroring. (`max_results` / `result_offset`, not `limit` / `offset`,
-because the latter are SQL reserved words.)
+Returns `(path, title, score DOUBLE, snippet VARCHAR, file VARCHAR)` ranked by relevance.
+`score` is the Xapian rank; `snippet` is a best-effort highlighted excerpt (`NULL` when
+none is produced). An archive without a full-text index — or the search-less **WebAssembly**
+build — returns no rows rather than erroring. (`max_results` / `result_offset`, not
+`limit` / `offset`, because the latter are SQL reserved words.)
+
+**Federated search** — like `read_zim`, the first argument can be a single path, a **glob**,
+or a `LIST(VARCHAR)`, so a query runs across many archives at once. `max_results` applies
+**per archive**, the `file` column says which one each hit came from, and you rank/trim
+across them in SQL (Xapian scores are per-archive, so not directly comparable):
+
+```sql
+SELECT file, path, title, score
+FROM zim_search('library/*.zim', 'insulin', max_results := 5)
+ORDER BY score DESC LIMIT 20;
+```
 
 `zim_suggest` is title **autocomplete** over the suggestion index — returns
-`(path, title, snippet)`. Unlike `zim_search`, it works on every build (it falls back to a
-title-prefix listing where there's no Xapian index, so it's available on Wasm too):
+`(path, title, snippet, file)` and is federated the same way (glob / `LIST`). Unlike
+`zim_search`, it works on every build (it falls back to a title-prefix listing where
+there's no Xapian index, so it's available on Wasm too):
 
 ```sql
 SELECT path, title FROM zim_suggest('wikipedia.zim', 'Photosyn', max_results := 10);
+SELECT file, title FROM zim_suggest('library/*.zim', 'Photosyn');   -- across a shelf
 ```
 
 ### Reading a real archive, end to end
