@@ -5,15 +5,21 @@ sqllogictest files under `test/sql/`, run by the DuckDB extension test harness
 
 ## Fixture
 
-`test/oracle/test.zim` is a tiny generated archive (5 items + 1 redirect + metadata +
-fulltext index). Expected values in the `.test` files are the verified outputs of this
-fixture (see `../docs/libzim-semantics.md`).
+Two generated archives:
 
-Regenerate it in-tree before running tests:
+- `test/oracle/test.zim` — mwoffliner-style (`A/Foo` paths), 5 items + 1 redirect +
+  metadata + **fulltext index**. The primary fixture.
+- `test/oracle/test_zimit.zim` — zimit / browsertrix-style (full-URL paths like
+  `example.com/products/widget/`, trailing slashes) and **no fulltext index**, for the
+  edge cases the primary fixture doesn't cover.
+
+Expected values in the `.test` files are the verified outputs of these fixtures
+(see `../docs/libzim-semantics.md`). Regenerate in-tree before running tests:
 
 ```sh
 pip install libzim          # same C++ core the extension links
 python3 test/oracle/make_fixture.py
+python3 test/oracle/make_zimit_fixture.py
 ```
 
 ## Files
@@ -26,4 +32,5 @@ python3 test/oracle/make_fixture.py
 - `zim_scalars.test`         — single-entry lookup scalars
 - `zim_filesystem.test`      — the `zim://` virtual filesystem (read_text/read_blob, glob)
 - `zim_search.test`          — `zim_search` Xapian full-text search (native builds)
+- `zim_zimit.test`           — zimit-style full-URL paths, trailing slashes, no-index search
 - `zim_errors.test`          — binder validation + bad-archive handling

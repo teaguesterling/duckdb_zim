@@ -5,8 +5,6 @@
 #
 # Fixture: test/oracle/test.zim (regenerate with test/oracle/make_fixture.py).
 # Expected values are the verified oracle outputs (docs/libzim-semantics.md).
-# Assertions that depend on libzim C++ signatures marked // VERIFY in the source
-# (findByPath/findByTitle prefix scoping) should be confirmed on first run.
 
 require zim
 
@@ -71,13 +69,13 @@ SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css');
 ----
 1
 
-# prefix listing via findByPath  // VERIFY prefix scoping on pinned libzim
+# prefix listing via findByPath
 query I
 SELECT count(*) FROM read_zim('test/oracle/test.zim', path_prefix := 'A/');
 ----
 4
 
-# prefix listing via findByTitle  // VERIFY prefix scoping on pinned libzim
+# prefix listing via findByTitle
 query I
 SELECT count(*) FROM read_zim('test/oracle/test.zim', title_prefix := 'C');
 ----

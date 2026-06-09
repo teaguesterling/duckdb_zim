@@ -3,9 +3,8 @@
 # group: [sql]
 
 #
-# statement error matches a SUBSTRING of the error message. The exact wording
-# may need adjustment on first compile; the substrings below are chosen to be
-# stable parts of the messages emitted in src/.
+# statement error matches a SUBSTRING of the error message; the substrings below
+# are chosen to be stable parts of the messages emitted in src/.
 
 require zim
 

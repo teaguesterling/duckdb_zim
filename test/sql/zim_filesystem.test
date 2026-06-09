@@ -61,6 +61,13 @@ ORDER BY filename;
 zim://test/oracle/test.zim/A/Calcium	true
 zim://test/oracle/test.zim/A/Chlorophyll	true
 
+# a C/ prefix combined with a wildcard: the C/ is normalized away before matching,
+# so C/A/C* matches the same A/Calcium + A/Chlorophyll (emitted without the C/).
+query I
+SELECT count(*) FROM read_text('zim://test/oracle/test.zim/C/A/C*');
+----
+2
+
 # --- a missing entry yields no rows (empty glob), not a crash ---------------
 query I
 SELECT count(*) FROM read_text('zim://test/oracle/test.zim/A/DoesNotExist');
