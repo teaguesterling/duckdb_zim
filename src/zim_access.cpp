@@ -23,6 +23,7 @@
 // LIBZIM_WITH_XAPIAN comes from zim/zim_config.h, pulled in transitively via zim/archive.h.
 #ifdef LIBZIM_WITH_XAPIAN
 #include <zim/search.h>
+#include <zim/suggestion.h>
 #endif
 
 namespace duckdb {
@@ -62,16 +63,32 @@ static ZimEntry EntryMeta(const zim::Entry &entry) {
 	return row;
 }
 
-// Whether the content gate admits this entry's mimetype. An empty gate admits
-// everything; a non-empty gate admits only listed mimetypes (so a redirect,
-// whose mimetype is "", is excluded by any non-empty gate — it has no body
-// anyway).
-static bool ContentMimetypeAllowed(const ScanSpec &spec, const std::string &mimetype) {
-	if (spec.content_mimetypes.empty()) {
+// One Accept-style pattern vs a concrete mimetype. Redirects (empty mimetype)
+// never match a pattern.
+static bool MimetypePatternMatch(const std::string &pattern, const std::string &mimetype) {
+	if (mimetype.empty()) {
+		return false;
+	}
+	if (pattern == "*" || pattern == "*/*") {
 		return true;
 	}
-	for (const auto &m : spec.content_mimetypes) {
-		if (m == mimetype) {
+	if (pattern == mimetype) {
+		return true;
+	}
+	// "type/*": match on the major type prefix.
+	if (pattern.size() >= 2 && pattern.compare(pattern.size() - 2, 2, "/*") == 0) {
+		const std::string prefix = pattern.substr(0, pattern.size() - 1); // keep the slash, e.g. "image/"
+		return mimetype.rfind(prefix, 0) == 0;
+	}
+	return false;
+}
+
+bool MimetypeAccepted(const std::vector<std::string> &patterns, const std::string &mimetype) {
+	if (patterns.empty()) {
+		return true;
+	}
+	for (const auto &p : patterns) {
+		if (MimetypePatternMatch(p, mimetype)) {
 			return true;
 		}
 	}
@@ -146,12 +163,12 @@ bool ZimScanCursor::Next(ZimEntry &out) {
 
 		ZimEntry row = EntryMeta(entry);
 
-		// mimetype post-filter (libzim has no mimetype index). Redirects have no
-		// mimetype, so a mimetype filter excludes them by construction.
-		if (spec.mimetype.has_value() && row.mimetype != *spec.mimetype) {
+		// Accept-style mimetype post-filter (libzim has no mimetype index).
+		// Redirects have no mimetype, so a non-empty filter excludes them.
+		if (!spec.mimetype_filter.empty() && !MimetypeAccepted(spec.mimetype_filter, row.mimetype)) {
 			continue;
 		}
-		if (spec.want_content && ContentMimetypeAllowed(spec, row.mimetype)) {
+		if (spec.want_content && MimetypeAccepted(spec.content_mimetypes, row.mimetype)) {
 			LoadContent(entry, row);
 		}
 		out = std::move(row);
@@ -388,6 +405,61 @@ std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t 
 	(void)limit;
 #endif
 	return hits;
+}
+
+std::vector<ZimSearchHit> ZimArchive::Suggest(const std::string &query, uint32_t offset, uint32_t limit) const {
+	std::vector<ZimSearchHit> hits;
+#ifdef LIBZIM_WITH_XAPIAN
+	zim::SuggestionSearcher searcher(*archive_);
+	auto search = searcher.suggest(query);
+	auto results = search.getResults(static_cast<int>(offset), static_cast<int>(limit));
+	for (auto it = results.begin(); it != results.end(); ++it) {
+		ZimSearchHit hit;
+		hit.path = it->getPath();
+		hit.title = it->getTitle();
+		if (it->hasSnippet()) {
+			hit.snippet = it->getSnippet();
+		}
+		hits.push_back(std::move(hit));
+	}
+#else
+	// No xapian: fall back to a title-prefix listing (no ranking/snippet).
+	uint32_t skipped = 0;
+	for (auto entry : archive_->findByTitle(query)) {
+		if (skipped < offset) {
+			skipped++;
+			continue;
+		}
+		if (hits.size() >= limit) {
+			break;
+		}
+		ZimSearchHit hit;
+		hit.path = entry.getPath();
+		hit.title = entry.getTitle();
+		hits.push_back(std::move(hit));
+	}
+#endif
+	return hits;
+}
+
+std::optional<std::string> ZimArchive::Illustration(unsigned int size) const {
+	if (!archive_->hasIllustration(size)) {
+		return std::nullopt;
+	}
+	auto item = archive_->getIllustrationItem(size);
+	return BlobToString(item.getData());
+}
+
+std::string ZimArchive::RandomPath() const {
+	try {
+		return archive_->getRandomEntry().getPath();
+	} catch (...) {
+		return ""; // no content entries to choose from
+	}
+}
+
+bool ZimArchive::CheckIntegrity() const {
+	return archive_->check();
 }
 
 } // namespace zim_ext

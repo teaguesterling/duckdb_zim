@@ -112,9 +112,17 @@ FROM read_zim('wikipedia.zim', include_content := ['text/html', 'text/css']);
 ```
 
 `read_zim` parameters: `include_content` (`true`/`false`, or a mimetype / list of
-mimetypes to load content for only those entries), `content_as_varchar`,
-`include_filepath` (alias `filename`), `mimetype`, `path`, `title`, `path_prefix`,
-`title_prefix`, `listing` (`'path'` | `'title'`).
+mimetypes — with `image/*` / `*/*` wildcards — to load content for only those entries),
+`content_as_varchar`, `include_filepath` (alias `filename`), `mimetype` (a single pattern
+or a LIST, **Accept-style** with `image/*` / `*/*` wildcards), `path`, `title`,
+`path_prefix`, `title_prefix`, `listing` (`'path'` | `'title'`).
+
+```sql
+-- Accept-style content typing: all images, then narrow with SQL if you want a preference
+SELECT path, mimetype FROM read_zim('wikipedia.zim', mimetype := 'image/*');
+SELECT path FROM read_zim('wikipedia.zim', mimetype := ['image/webp', 'image/png'])
+ORDER BY array_position(['image/webp', 'image/png'], mimetype);   -- webp first
+```
 
 These select mutually exclusive modes and conflicting combinations are rejected (rather
 than silently resolved): pick at most one exact key (`path` *or* `title`) **or** one
@@ -171,9 +179,12 @@ zim_has_entry(file, path)       -- BOOLEAN
 zim_redirect_target(file, path) -- VARCHAR, NULL if not a redirect
 zim_mimetype(file, path)        -- VARCHAR
 zim_main_entry(file)            -- VARCHAR, redirect-resolved landing path
+zim_random(file)                -- VARCHAR, a random entry's path
+zim_check(file)                 -- BOOLEAN, libzim archive integrity check
+zim_illustration(file[, size])  -- BLOB, the cover image / favicon (default 48px), NULL if none
 ```
 
-### Full-text search
+### Full-text search and title suggestions
 
 If the archive carries a Xapian full-text index (`zim_info(file).has_fulltext_index`),
 `zim_search` queries it:
@@ -192,6 +203,14 @@ Xapian rank; `snippet` is a best-effort highlighted excerpt (`NULL` when none is
 An archive without a full-text index — or the search-less **WebAssembly** build — returns
 no rows rather than erroring. (`max_results` / `result_offset`, not `limit` / `offset`,
 because the latter are SQL reserved words.)
+
+`zim_suggest` is title **autocomplete** over the suggestion index — returns
+`(path, title, snippet)`. Unlike `zim_search`, it works on every build (it falls back to a
+title-prefix listing where there's no Xapian index, so it's available on Wasm too):
+
+```sql
+SELECT path, title FROM zim_suggest('wikipedia.zim', 'Photosyn', max_results := 10);
+```
 
 ### Reading a real archive, end to end
 
@@ -302,6 +321,25 @@ paths, so normalize and join back to the entries table to build an edge list.
 `duck_block_utils`) yields a structured block tree you can render to markdown as retrieval
 context for an offline model.
 
+**Web-capture (zimit) archives** — zimit / browsertrix ZIMs use full-URL content paths
+(`www.nhs.uk/medicines/insulin/`) instead of mwoffliner's `A/Foo`. The extension stays
+scraper-agnostic — paths are opaque strings — so everything is plain SQL on the `path`
+column, no special functions:
+
+```sql
+-- which scraper produced this archive?
+SELECT zim_metadata('archive.zim', 'Scraper');          -- 'zimit …' vs 'mwoffliner …'
+
+-- hosts captured, and entries under one host with their reconstructed source URLs
+SELECT DISTINCT split_part(path, '/', 1) AS host FROM read_zim('archive.zim');
+SELECT path, 'https://' || path AS source_url
+FROM read_zim('archive.zim')
+WHERE path LIKE 'www.nhs.uk/%' AND mimetype = 'text/html';
+
+-- read a captured page straight through the filesystem (trailing slashes resolve)
+SELECT * FROM read_html('zim://archive.zim/www.nhs.uk/medicines/insulin/');   -- LOAD webbed;
+```
+
 ---
 
 ## Platforms
@@ -324,7 +362,7 @@ work, so it's excluded from CI for now.
 |---|---|---|
 | 1 | `read_zim`, listing/prefix, `read_zim_metadata`, `zim_metadata`/`_keys`/`zim_counter`/`zim_info`, lookup scalars | **implemented** |
 | 2 | `zim://` filesystem (path + glob) — composition with `webbed`/`markdown`/`read_blob` | **implemented** |
-| 3 | `zim_search` (Xapian full-text, native builds) — `zim_suggest` (suggestion index) still to come | **implemented** |
+| 3 | `zim_search` (Xapian full-text) + `zim_suggest` (title autocomplete); utilities `zim_illustration` / `zim_random` / `zim_check`; Accept-style `mimetype` matching | **implemented** |
 | 4 | `ATTACH 'x.zim' AS … (TYPE zim)` — read-only catalog ergonomics | planned |
 
 ---

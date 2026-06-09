@@ -94,6 +94,49 @@ void SearchFunction(ClientContext &, TableFunctionInput &data, DataChunk &output
 	output.SetCardinality(count);
 }
 
+// --- zim_suggest: title autocomplete (reuses SearchBindData / SearchGlobalState) ---
+
+unique_ptr<FunctionData> SuggestBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
+                                     vector<string> &names) {
+	auto bind = make_uniq<SearchBindData>();
+	bind->file_path = input.inputs[0].GetValue<string>();
+	bind->query = input.inputs[1].GetValue<string>();
+	for (auto &kv : input.named_parameters) {
+		if (kv.first == "max_results") {
+			bind->max_results = NonNegativeParam(kv.second, "max_results");
+		} else if (kv.first == "result_offset") {
+			bind->result_offset = NonNegativeParam(kv.second, "result_offset");
+		} else {
+			throw BinderException("zim_suggest: unknown parameter '%s'", kv.first);
+		}
+	}
+	// Suggestions have no fulltext score; just path/title/snippet.
+	names = {"path", "title", "snippet"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	return std::move(bind);
+}
+
+unique_ptr<GlobalTableFunctionState> SuggestInit(ClientContext &, TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<SearchBindData>();
+	auto state = make_uniq<SearchGlobalState>();
+	auto archive = ArchivePool::Instance().Get(bind.file_path);
+	state->hits = archive->Suggest(bind.query, bind.result_offset, bind.max_results);
+	return std::move(state);
+}
+
+void SuggestFunction(ClientContext &, TableFunctionInput &data, DataChunk &output) {
+	auto &gstate = data.global_state->Cast<SearchGlobalState>();
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && gstate.pos < gstate.hits.size()) {
+		const auto &hit = gstate.hits[gstate.pos++];
+		output.data[0].SetValue(count, Value(hit.path));
+		output.data[1].SetValue(count, Value(hit.title));
+		output.data[2].SetValue(count, hit.snippet.has_value() ? Value(*hit.snippet) : Value(LogicalType::VARCHAR));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 } // namespace
 
 void RegisterZimSearch(ExtensionLoader &loader) {
@@ -102,6 +145,12 @@ void RegisterZimSearch(ExtensionLoader &loader) {
 	search.named_parameters["max_results"] = LogicalType::BIGINT;
 	search.named_parameters["result_offset"] = LogicalType::BIGINT;
 	loader.RegisterFunction(search);
+
+	TableFunction suggest("zim_suggest", {LogicalType::VARCHAR, LogicalType::VARCHAR}, SuggestFunction, SuggestBind,
+	                      SuggestInit);
+	suggest.named_parameters["max_results"] = LogicalType::BIGINT;
+	suggest.named_parameters["result_offset"] = LogicalType::BIGINT;
+	loader.RegisterFunction(suggest);
 }
 
 } // namespace duckdb

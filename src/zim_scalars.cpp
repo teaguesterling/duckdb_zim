@@ -136,6 +136,54 @@ void MainEntry(DataChunk &args, ExpressionState &, Vector &result) {
 	}
 }
 
+// zim_random(file) -> VARCHAR : a random content entry's path
+void Random(DataChunk &args, ExpressionState &, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	args.data[0].Flatten(args.size());
+	for (idx_t i = 0; i < args.size(); i++) {
+		auto archive = Open(args.data[0], i);
+		auto path = archive->RandomPath();
+		if (path.empty()) {
+			FlatVector::SetNull(result, i, true);
+		} else {
+			result.SetValue(i, Value(path));
+		}
+	}
+}
+
+// zim_check(file) -> BOOLEAN : libzim archive integrity check
+void Check(DataChunk &args, ExpressionState &, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	args.data[0].Flatten(args.size());
+	for (idx_t i = 0; i < args.size(); i++) {
+		auto archive = Open(args.data[0], i);
+		result.SetValue(i, Value::BOOLEAN(archive->CheckIntegrity()));
+	}
+}
+
+// zim_illustration(file[, size]) -> BLOB : the archive's cover/favicon PNG (default 48px)
+void Illustration(DataChunk &args, ExpressionState &, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	const bool has_size = args.ColumnCount() > 1;
+	args.data[0].Flatten(args.size());
+	if (has_size) {
+		args.data[1].Flatten(args.size());
+	}
+	for (idx_t i = 0; i < args.size(); i++) {
+		auto archive = Open(args.data[0], i);
+		unsigned int size = 48;
+		if (has_size && FlatVector::Validity(args.data[1]).RowIsValid(i)) {
+			size = static_cast<unsigned int>(FlatVector::GetData<int32_t>(args.data[1])[i]);
+		}
+		auto blob = archive->Illustration(size);
+		if (blob.has_value()) {
+			result.SetValue(i, Value::BLOB_RAW(*blob));
+		} else {
+			FlatVector::SetNull(result, i, true);
+		}
+	}
+}
+
 } // namespace
 
 void RegisterZimScalars(ExtensionLoader &loader) {
@@ -146,6 +194,14 @@ void RegisterZimScalars(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget));
 	loader.RegisterFunction(ScalarFunction("zim_mimetype", {V, V}, V, Mimetype));
 	loader.RegisterFunction(ScalarFunction("zim_main_entry", {V}, V, MainEntry));
+	loader.RegisterFunction(ScalarFunction("zim_random", {V}, V, Random));
+	loader.RegisterFunction(ScalarFunction("zim_check", {V}, LogicalType::BOOLEAN, Check));
+
+	// zim_illustration(file) defaults to 48px; zim_illustration(file, size) is explicit.
+	ScalarFunctionSet illustration("zim_illustration");
+	illustration.AddFunction(ScalarFunction({V}, LogicalType::BLOB, Illustration));
+	illustration.AddFunction(ScalarFunction({V, LogicalType::INTEGER}, LogicalType::BLOB, Illustration));
+	loader.RegisterFunction(illustration);
 }
 
 } // namespace duckdb

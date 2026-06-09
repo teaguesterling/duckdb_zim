@@ -75,6 +75,8 @@ def main(out="test/oracle/test_zimit.zim"):
         c.set_mainpath("example.com/")
         c.add_metadata("Title", "Test Zimit ZIM")
         c.add_metadata("Language", "eng")
+        # a 48px illustration (fake PNG bytes) so zim_illustration has something to return
+        c.add_illustration(48, b"\x89PNG\r\n\x1a\n fake48illustration")
     print("wrote", out)
 
 
