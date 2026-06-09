@@ -135,7 +135,27 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 		auto &key = kv.first;
 		auto &val = kv.second;
 		if (key == "include_content") {
-			bind->include_content = BooleanValue::Get(val);
+			// Accept BOOLEAN (all / none), a single VARCHAR mimetype, or a
+			// LIST(VARCHAR) of mimetypes. A mimetype form turns content loading on
+			// but gates it: only matching entries are decompressed; everything else
+			// comes back with NULL content (filter pushdown, not post-filtering).
+			auto type_id = val.type().id();
+			if (type_id == LogicalTypeId::BOOLEAN) {
+				bind->include_content = BooleanValue::Get(val);
+			} else if (type_id == LogicalTypeId::VARCHAR) {
+				bind->include_content = true;
+				bind->spec.content_mimetypes.push_back(val.GetValue<string>());
+			} else if (type_id == LogicalTypeId::LIST) {
+				for (auto &child : ListValue::GetChildren(val)) {
+					bind->spec.content_mimetypes.push_back(child.GetValue<string>());
+				}
+				// An empty list selects zero mimetypes -> load no content (an empty
+				// gate otherwise means "all", which is the BOOLEAN-true semantics).
+				bind->include_content = !bind->spec.content_mimetypes.empty();
+			} else {
+				throw BinderException("read_zim: include_content must be a BOOLEAN, a VARCHAR mimetype, "
+				                      "or a LIST of mimetypes");
+			}
 		} else if (key == "content_as_varchar") {
 			bind->content_as_varchar = BooleanValue::Get(val);
 		} else if (key == "include_filepath" || key == "filename") {
@@ -288,7 +308,10 @@ void EmitRow(const ReadZimBindData &bind, const ReadZimGlobalState &gstate, cons
 			vec.SetValue(out_idx, row.is_redirect ? Value(LogicalType::UBIGINT) : Value::UBIGINT(row.size));
 			break;
 		case COL_CONTENT: {
-			if (!gstate.want_content || row.is_redirect) {
+			// content_loaded is the single source of truth: false for redirects,
+			// for un-projected/opted-out scans, and for entries the include_content
+			// mimetype gate skipped — all of which surface as NULL.
+			if (row.is_redirect || !row.content_loaded) {
 				vec.SetValue(out_idx, Value(ContentType(bind)));
 			} else if (bind.content_as_varchar) {
 				// Binary content -> NULL rather than invalid UTF-8 in a VARCHAR column.
@@ -321,6 +344,21 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 				gstate.lookup_emitted = true;
 				auto row = bind.lookup_by_title ? gstate.archive->GetByTitle(bind.lookup_key, gstate.want_content)
 				                                : gstate.archive->GetByPath(bind.lookup_key, gstate.want_content);
+				// Apply the include_content mimetype gate to the single fetched row,
+				// matching the scan path: a non-matching entry keeps its metadata but
+				// reports NULL content.
+				if (row.has_value() && row->content_loaded && !bind.spec.content_mimetypes.empty()) {
+					bool allowed = false;
+					for (const auto &m : bind.spec.content_mimetypes) {
+						if (m == row->mimetype) {
+							allowed = true;
+						}
+					}
+					if (!allowed) {
+						row->content.clear();
+						row->content_loaded = false;
+					}
+				}
 				if (row.has_value() && (!bind.spec.mimetype.has_value() || row->mimetype == *bind.spec.mimetype)) {
 					EmitRow(bind, gstate, *row, output, count);
 					count++;
@@ -362,7 +400,8 @@ static unique_ptr<TableRef> ReadZimReplacementScan(ClientContext &context, Repla
 void RegisterReadZim(ExtensionLoader &loader) {
 	auto make_fn = [](const LogicalType &arg_type) {
 		TableFunction f("read_zim", {arg_type}, ReadZimFunction, ReadZimBind, ReadZimInitGlobal);
-		f.named_parameters["include_content"] = LogicalType::BOOLEAN;
+		// ANY so a BOOLEAN, a VARCHAR mimetype, or a LIST(VARCHAR) all bind.
+		f.named_parameters["include_content"] = LogicalType::ANY;
 		f.named_parameters["content_as_varchar"] = LogicalType::BOOLEAN;
 		f.named_parameters["include_filepath"] = LogicalType::BOOLEAN;
 		f.named_parameters["filename"] = LogicalType::BOOLEAN;

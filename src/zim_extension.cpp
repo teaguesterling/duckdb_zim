@@ -17,13 +17,14 @@ namespace duckdb {
 void RegisterReadZim(ExtensionLoader &loader);
 void RegisterZimMetadata(ExtensionLoader &loader);
 void RegisterZimScalars(ExtensionLoader &loader);
+void RegisterZimFilesystem(ExtensionLoader &loader); // phase 2 (zim://)
 // void RegisterZimSearch(ExtensionLoader &loader);     // phase 3 (xapian)
-// void RegisterZimFilesystem(ExtensionLoader &loader); // phase 2 (zim://)
 
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterReadZim(loader);
 	RegisterZimMetadata(loader);
 	RegisterZimScalars(loader);
+	RegisterZimFilesystem(loader);
 }
 
 void ZimExtension::Load(ExtensionLoader &loader) {

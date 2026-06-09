@@ -1,0 +1,88 @@
+# name: test/sql/zim_include_content.test
+# description: include_content := mimetype | [mimetypes] — gated bulk content loading
+# group: [sql]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# Fixture mimetypes: 3x text/html (A/Photosynthesis, A/Chlorophyll, A/Calcium),
+# 1x image/png (I/logo.png), 1x text/css (style.css), plus 1 redirect (A/Photosynth).
+
+# --- single mimetype: content loads only for text/html ----------------------
+# All 6 rows are still returned (gate decides content, not row inclusion).
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', include_content := 'text/html');
+----
+6
+
+# content is present for exactly the 3 html entries, NULL for the rest.
+query I
+SELECT count(*) FILTER (WHERE content IS NOT NULL)
+FROM read_zim('test/oracle/test.zim', include_content := 'text/html');
+----
+3
+
+# per-mimetype: only text/html rows carry content.
+query III
+SELECT mimetype,
+       count(*) AS rows,
+       count(*) FILTER (WHERE content IS NOT NULL) AS loaded
+FROM read_zim('test/oracle/test.zim', include_content := 'text/html')
+GROUP BY mimetype ORDER BY mimetype NULLS FIRST;
+----
+NULL	1	0
+image/png	1	0
+text/css	1	0
+text/html	3	3
+
+# --- list of mimetypes: html + css load, png does not ----------------------
+query I
+SELECT count(*) FILTER (WHERE content IS NOT NULL)
+FROM read_zim('test/oracle/test.zim', include_content := ['text/html', 'text/css']);
+----
+4
+
+# --- the gate works as VARCHAR too (content_as_varchar) ---------------------
+query I
+SELECT content LIKE '%<h1>%'
+FROM read_zim('test/oracle/test.zim', path := 'A/Calcium',
+              include_content := 'text/html', content_as_varchar := true);
+----
+true
+
+# --- exact lookup honors the gate ------------------------------------------
+# A matching entry loads content...
+query I
+SELECT content IS NOT NULL
+FROM read_zim('test/oracle/test.zim', path := 'A/Calcium', include_content := 'text/html');
+----
+true
+
+# ...a non-matching one (png) is present but content is NULL.
+query I
+SELECT content IS NULL
+FROM read_zim('test/oracle/test.zim', path := 'I/logo.png', include_content := 'text/html');
+----
+true
+
+# --- include_content := false still means no content -----------------------
+query I
+SELECT count(*) FILTER (WHERE content IS NOT NULL)
+FROM read_zim('test/oracle/test.zim', include_content := false);
+----
+0
+
+# --- an empty list selects zero mimetypes: no content loaded ---------------
+query I
+SELECT count(*) FILTER (WHERE content IS NOT NULL)
+FROM read_zim('test/oracle/test.zim', include_content := []::VARCHAR[]);
+----
+0
+
+# --- a non-string, non-bool, non-list value is rejected --------------------
+statement error
+SELECT * FROM read_zim('test/oracle/test.zim', include_content := 42);
+----
+must be a BOOLEAN

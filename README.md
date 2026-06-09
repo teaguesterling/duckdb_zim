@@ -92,11 +92,20 @@ SELECT * FROM read_zim('wikipedia.zim', path := 'A/Photosynthesis');
 SELECT path, content
 FROM read_zim('wikipedia.zim', path := 'A/Photosynthesis',
               include_content := true, content_as_varchar := true);
+
+-- bulk content, but only for the mimetypes you want: include_content also accepts a
+-- mimetype or a list. Matching entries are decompressed; everything else keeps its
+-- metadata row with NULL content — the archive's images/fonts are never materialized.
+SELECT path, content
+FROM read_zim('wikipedia.zim', include_content := 'text/html');
+SELECT path, content
+FROM read_zim('wikipedia.zim', include_content := ['text/html', 'text/css']);
 ```
 
-`read_zim` parameters: `include_content`, `content_as_varchar`, `include_filepath`
-(alias `filename`), `mimetype`, `path`, `title`, `path_prefix`, `title_prefix`,
-`listing` (`'path'` | `'title'`).
+`read_zim` parameters: `include_content` (`true`/`false`, or a mimetype / list of
+mimetypes to load content for only those entries), `content_as_varchar`,
+`include_filepath` (alias `filename`), `mimetype`, `path`, `title`, `path_prefix`,
+`title_prefix`, `listing` (`'path'` | `'title'`).
 
 These select mutually exclusive modes and conflicting combinations are rejected (rather
 than silently resolved): pick at most one exact key (`path` *or* `title`) **or** one
@@ -197,10 +206,12 @@ Pass article HTML straight into `webbed`'s extractors:
 
 ```sql
 -- requires: LOAD webbed;
+-- include_content := 'text/html' loads (and decompresses) only the article HTML —
+-- the archive's images and fonts are skipped, not just filtered out afterwards.
 SELECT path,
        html_extract_text(content, '//h1')[1] AS heading,
        html_extract_links(content)           AS links
-FROM read_zim('wikipedia.zim', include_content := true, content_as_varchar := true)
+FROM read_zim('wikipedia.zim', include_content := 'text/html', content_as_varchar := true)
 WHERE mimetype = 'text/html';
 ```
 
@@ -210,15 +221,34 @@ WHERE mimetype = 'text/html';
 > zimit / browsertrix captures (like the NHS archive above) keep the site's own markup,
 > often `//main` or `//article`. The exact selector varies by scraper version and skin.
 
-### Filesystem seam (planned — phase 2)
+### Filesystem seam (`zim://`)
 
-Once the `zim://` filesystem lands, any path-reading extension composes for free:
+The extension registers a read-only `zim://` filesystem, so **any** path-reading function
+— DuckDB's own `read_text` / `read_blob`, or `webbed`'s `read_html`, or anything else that
+goes through DuckDB's file layer — composes over ZIM contents for free, with no coupling
+and no GPL linkage back into those extensions:
 
 ```sql
--- PLANNED, not yet implemented:
-SELECT * FROM read_html('zim://wikipedia.zim/A/Photosynthesis');
-SELECT * FROM read_html('zim://wikipedia.zim/A/*');     -- via the zim:// glob
-SELECT * FROM read_blob('zim://wikipedia.zim/I/logo.webp');
+SELECT * FROM read_text('zim://wikipedia.zim/A/Photosynthesis');   -- one entry as text
+SELECT * FROM read_blob('zim://wikipedia.zim/I/logo.webp');        -- one entry as bytes
+SELECT * FROM read_html('zim://wikipedia.zim/A/Photosynthesis');   -- requires: LOAD webbed;
+SELECT * FROM read_text('zim://wikipedia.zim/A/C*');               -- glob over content paths
+```
+
+The grammar is **content-path-first**: `zim://<archive>.zim/<content-path>`. The archive
+component is a local file (libzim mmaps it directly); everything after the `.zim/` boundary
+is the entry path within the archive. A leading `C/` on the content path is tolerated and
+stripped, redirects are followed (a redirect path serves its target's bytes, like a
+symlink), and `*` / `?` / `[…]` globs are matched against entry paths. Entries are
+materialized into memory on open — fine for articles, but a single very large media item
+costs its size in RAM.
+
+```sql
+-- extract every article's <h1> by globbing the filesystem and piping to webbed:
+SELECT regexp_replace(filename, '^.*/', '') AS entry,
+       html_extract_text(content, '//h1')[1] AS heading
+FROM read_text('zim://wikipedia.zim/A/*')
+ORDER BY entry;   -- requires: LOAD webbed;
 ```
 
 ### Recipes
@@ -229,9 +259,9 @@ you want your own ranking):
 ```sql
 CREATE TABLE corpus AS
 SELECT path, title,
-       html_extract_text(content, '//div[contains(@class,"mw-parser-output")]')[1] AS body
-FROM read_zim('wikimed.zim', include_content := true, content_as_varchar := true)
-WHERE mimetype = 'text/html';
+       html_extract_text(content::HTML, '//div[contains(@class,"mw-parser-output")]')[1] AS body
+FROM read_zim('wikimed.zim', mimetype := 'text/html',
+              include_content := true, content_as_varchar := true);
 
 PRAGMA create_fts_index('corpus', 'path', 'title', 'body');
 ```
@@ -263,7 +293,7 @@ work, so it's excluded from CI for now.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | `read_zim`, listing/prefix, `read_zim_metadata`, `zim_metadata`/`_keys`/`zim_counter`/`zim_info`, lookup scalars | **implemented** |
-| 2 | `zim://` filesystem (path + glob) — composition with `webbed`/`markdown`/`read_blob` | planned |
+| 2 | `zim://` filesystem (path + glob) — composition with `webbed`/`markdown`/`read_blob` | **implemented** |
 | 3 | `zim_search` / `zim_suggest` (Xapian full-text + suggestion index) | planned |
 | 4 | `ATTACH 'x.zim' AS … (TYPE zim)` — read-only catalog ergonomics | planned |
 
@@ -272,8 +302,8 @@ work, so it's excluded from CI for now.
 ## How it works
 
 A process-wide pool keeps each opened `zim::Archive` alive across queries, so libzim's
-decompressed-cluster cache stays warm — every function (and the future filesystem and
-`ATTACH`) shares one open handle per file. All libzim contact is isolated in a small
+decompressed-cluster cache stays warm — every function, the `zim://` filesystem, and a
+future `ATTACH` all share one open handle per file. All libzim contact is isolated in a small
 access layer (`src/zim_access.*`); the rest of the code is a plain DuckDB binding over
 DuckDB-agnostic structs. See `DESIGN.md` and `docs/libzim-semantics.md`.
 

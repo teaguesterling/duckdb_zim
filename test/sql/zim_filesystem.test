@@ -1,0 +1,74 @@
+# name: test/sql/zim_filesystem.test
+# description: the zim:// virtual filesystem — read ZIM entries through DuckDB's FS layer
+# group: [sql]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# --- single-entry read through read_text -----------------------------------
+# An HTML article round-trips as text.
+query I
+SELECT content LIKE '%<h1>Photosynthesis</h1>%'
+FROM read_text('zim://test/oracle/test.zim/A/Photosynthesis');
+----
+true
+
+# --- byte-exact equality vs the scalar accessor ----------------------------
+# Reading a binary entry through the filesystem yields the same bytes as
+# zim_get_content over the same archive+path.
+query I
+SELECT content = zim_get_content('test/oracle/test.zim', 'I/logo.png')
+FROM read_blob('zim://test/oracle/test.zim/I/logo.png');
+----
+true
+
+# GetFileSize is exact (the fake PNG fixture blob is 16 bytes).
+query I
+SELECT size FROM read_blob('zim://test/oracle/test.zim/I/logo.png');
+----
+16
+
+# --- a leading C/ on the content path is tolerated -------------------------
+query I
+SELECT content LIKE '%<h1>Photosynthesis</h1>%'
+FROM read_text('zim://test/oracle/test.zim/C/A/Photosynthesis');
+----
+true
+
+# --- redirects are followed --------------------------------------------------
+# A/Photosynth is a redirect to A/Photosynthesis; opening it serves the target.
+query I
+SELECT content LIKE '%<h1>Photosynthesis</h1>%'
+FROM read_text('zim://test/oracle/test.zim/A/Photosynth');
+----
+true
+
+# --- glob over content paths -------------------------------------------------
+# A/C* matches A/Calcium and A/Chlorophyll (not the redirect, not A/Photo*).
+query I
+SELECT count(*) FROM read_text('zim://test/oracle/test.zim/A/C*');
+----
+2
+
+# Each globbed file is independently readable and carries its own content.
+query II
+SELECT filename, content LIKE '%<h1>%'
+FROM read_text('zim://test/oracle/test.zim/A/C*')
+ORDER BY filename;
+----
+zim://test/oracle/test.zim/A/Calcium	true
+zim://test/oracle/test.zim/A/Chlorophyll	true
+
+# --- a missing entry yields no rows (empty glob), not a crash ---------------
+query I
+SELECT count(*) FROM read_text('zim://test/oracle/test.zim/A/DoesNotExist');
+----
+0
+
+# --- a glob that matches nothing is empty ----------------------------------
+query I
+SELECT count(*) FROM read_text('zim://test/oracle/test.zim/Z/*');
+----
+0
