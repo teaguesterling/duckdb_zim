@@ -317,6 +317,45 @@ FROM read_text('zim://wikipedia.zim/A/*')
 ORDER BY entry;   -- requires: LOAD webbed;
 ```
 
+### Offline Wikipedia, end to end
+
+An entire offline encyclopedia becomes a structured, queryable dataset — no scraping, no
+unpacking, no internet. Glob the archive, run XPath over each article, and you have a
+table; you can even **join two different offline archives** on a shared key, reconciling
+their different HTML conventions in one query. Here the NHS site (a zimit capture,
+`//article`) and Wikipedia (mwoffliner, `//div[mw-parser-output]`) are cross-referenced on
+the drug name:
+
+```sql
+-- requires: LOAD webbed;
+WITH nhs AS (                       -- offline NHS site
+  SELECT regexp_extract(filename, 'medicines/([^/]+)/', 1)   AS medicine,
+         html_extract_text(content::HTML, '//article//p')[1] AS nhs_says
+  FROM read_text('zim://nhs.zim/www.nhs.uk/medicines/*/about-*/')
+  WHERE html_extract_text(content::HTML, '//article//p')[1] IS NOT NULL
+),
+merged AS (                         -- look the same name up in Wikipedia
+  SELECT medicine, nhs_says,
+         zim_get_text('wikipedia_en_medicine.zim', upper(medicine[1]) || medicine[2:]) AS wiki_html
+  FROM nhs
+)
+SELECT medicine, nhs_says,
+       html_extract_text(wiki_html::HTML,
+         '(//div[contains(@class,"mw-parser-output")]/p[normalize-space()])[1]')[1] AS wikipedia_says
+FROM merged WHERE wiki_html IS NOT NULL;
+```
+
+| medicine | nhs_says | wikipedia_says |
+|---|---|---|
+| amoxicillin | a type of penicillin antibiotic. | an antibiotic … of the aminopenicillin class … |
+| metformin | used to treat type 2 diabetes… | the main first-line medication for type 2 diabetes… |
+| warfarin | an anticoagulant. | used as an anticoagulant medication … deep vein thrombosis … |
+
+`zim` ships no HTML knowledge on purpose — it hands you the bytes and lets a parsing
+extension do the rest. **Anything** that reads through DuckDB's file layer composes over
+the `zim://` seam: `webbed` for HTML/XPath here, but equally `read_json`, `read_csv`,
+`read_text`, or `read_blob` for other payloads inside an archive.
+
 ### Recipes
 
 **Build your own full-text index** (useful for archives without a Xapian index, or when

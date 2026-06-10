@@ -10,6 +10,70 @@ deliberately knows nothing about HTML — it hands you bytes and lets `webbed` o
     `//div[contains(@class,"mw-parser-output")]`; zimit captures keep the site's own
     markup, often `//main` or `//article`. The exact selector varies by scraper version.
 
+## Query offline Wikipedia with SQL + XPath
+
+The headline use case: an entire offline encyclopedia becomes a queryable, structured
+dataset — no scraping, no unpacking, no internet. `zim` hands `webbed` the article HTML
+over the `zim://` seam, and XPath does the rest.
+
+**Decompose one article.** Wikipedia (mwoffliner) wraps content in `mw-parser-output`:
+
+```sql
+-- requires: LOAD webbed;
+WITH a AS (SELECT zim_get_text('wikipedia_en_medicine.zim', 'Aspirin')::HTML AS doc)
+SELECT html_extract_text(doc, '//h1')[1]                                          AS title,
+       html_extract_text(doc, '//div[contains(@class,"mw-parser-output")]//h2')   AS sections,
+       len(html_extract_links(doc))                                               AS links
+FROM a;
+-- Aspirin · [Medical uses, Adverse effects, Pharmacology, …] · 2601
+```
+
+**Full-text search the corpus, then XPath-extract each hit:**
+
+```sql
+SELECT path,
+       html_extract_text(zim_get_text('wikipedia_en_medicine.zim', path)::HTML,
+         '(//div[contains(@class,"mw-parser-output")]/p[normalize-space()])[1]')[1] AS lead
+FROM zim_search('wikipedia_en_medicine.zim', 'nonsteroidal anti-inflammatory', max_results := 5);
+```
+
+**Join two different offline encyclopedias on a shared key.** Here the NHS website (a zimit
+capture, content in `//article`) and Wikipedia (mwoffliner, content in `//div[mw-parser-output]`)
+are cross-referenced on the drug name — two different HTML conventions, reconciled by XPath
+in one query:
+
+```sql
+WITH nhs AS (                       -- offline NHS site
+  SELECT regexp_extract(filename, 'medicines/([^/]+)/', 1)  AS medicine,
+         html_extract_text(content::HTML, '//article//p')[1] AS nhs_says
+  FROM read_text('zim://nhs.zim/www.nhs.uk/medicines/*/about-*/')
+  WHERE html_extract_text(content::HTML, '//article//p')[1] IS NOT NULL   -- parse is the filter
+),
+merged AS (                         -- look the same name up in Wikipedia
+  SELECT medicine, nhs_says,
+         zim_get_text('wikipedia_en_medicine.zim', upper(medicine[1]) || medicine[2:]) AS wiki_html
+  FROM nhs
+)
+SELECT medicine, nhs_says,
+       html_extract_text(wiki_html::HTML,
+         '(//div[contains(@class,"mw-parser-output")]/p[normalize-space()])[1]')[1] AS wikipedia_says
+FROM merged WHERE wiki_html IS NOT NULL;
+```
+
+!!! tip "Filter on the parse, not the string"
+    To skip pages that aren't real articles, don't substring-match the raw HTML
+    (`content LIKE '%<article%'`). `html_extract_text` returns an **empty array** when the
+    XPath matches nothing, so the structural predicate is `… IS NOT NULL` (or
+    `len(html_extract_text(...)) > 0`) on the extracted value — computed once in a CTE.
+
+!!! note "Composing with other extensions"
+    `zim` ships no HTML knowledge on purpose — it hands you the raw bytes and lets a
+    parsing extension do the work. **Anything** that reads through DuckDB's file layer
+    composes over the `zim://` seam: `webbed` for HTML/XPath here, but equally `read_json`,
+    `read_csv`, `read_text`, or `read_blob` for other payloads inside an archive. The
+    extension stays a narrow "read the container" tool; everything rich lives in the
+    extensions you already use.
+
 ## Pipe article HTML into webbed
 
 ```sql
