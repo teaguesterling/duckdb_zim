@@ -328,13 +328,13 @@ the drug name:
 
 ```sql
 -- requires: LOAD webbed;
-WITH nhs AS (                       -- offline NHS site
+WITH nhs_raw AS (                   -- parse each NHS page once...
   SELECT regexp_extract(filename, 'medicines/([^/]+)/', 1)   AS medicine,
          html_extract_text(content::HTML, '//article//p')[1] AS nhs_says
   FROM read_text('zim://nhs.zim/www.nhs.uk/medicines/*/about-*/')
-  WHERE html_extract_text(content::HTML, '//article//p')[1] IS NOT NULL
 ),
-merged AS (                         -- look the same name up in Wikipedia
+nhs AS (SELECT * FROM nhs_raw WHERE nhs_says IS NOT NULL),  -- ...filter on the parsed value
+merged AS (                         -- one Wikipedia point lookup per row (no scan)
   SELECT medicine, nhs_says,
          zim_get_text('wikipedia_en_medicine.zim', upper(medicine[1]) || medicine[2:]) AS wiki_html
   FROM nhs
@@ -350,6 +350,24 @@ FROM merged WHERE wiki_html IS NOT NULL;
 | amoxicillin | a type of penicillin antibiotic. | an antibiotic … of the aminopenicillin class … |
 | metformin | used to treat type 2 diabetes… | the main first-line medication for type 2 diabetes… |
 | warfarin | an anticoagulant. | used as an anticoagulant medication … deep vein thrombosis … |
+
+This is a **key-lookup join** — NHS drives, each row does one `zim_get_text` point lookup into
+Wikipedia by title (the 362k-article archive is probed, never scanned). Or **search both at
+once** with federated `zim_search` and align by relevance — two independent search indexes,
+matched in ~40 ms:
+
+```sql
+WITH hits AS (
+  SELECT CASE WHEN file LIKE '%/nhs.zim' THEN 'NHS' ELSE 'Wikipedia' END AS source,
+         html_extract_text(zim_get_text(file, path)::HTML,
+           CASE WHEN file LIKE '%/nhs.zim' THEN '//article//p'
+                ELSE '(//div[contains(@class,"mw-parser-output")]/p[normalize-space()])[1]' END)[1] AS lead
+  FROM zim_search(['nhs.zim', 'wikipedia_en_medicine.zim'], 'warfarin blood clots', max_results := 1)
+)
+SELECT max(lead) FILTER (WHERE source='NHS')       AS nhs,
+       max(lead) FILTER (WHERE source='Wikipedia') AS wikipedia
+FROM hits;
+```
 
 `zim` ships no HTML knowledge on purpose — it hands you the bytes and lets a parsing
 extension do the rest. **Anything** that reads through DuckDB's file layer composes over

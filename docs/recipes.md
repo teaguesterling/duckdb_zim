@@ -43,13 +43,13 @@ are cross-referenced on the drug name — two different HTML conventions, reconc
 in one query:
 
 ```sql
-WITH nhs AS (                       -- offline NHS site
+WITH nhs_raw AS (                   -- parse each NHS page exactly once...
   SELECT regexp_extract(filename, 'medicines/([^/]+)/', 1)  AS medicine,
          html_extract_text(content::HTML, '//article//p')[1] AS nhs_says
   FROM read_text('zim://nhs.zim/www.nhs.uk/medicines/*/about-*/')
-  WHERE html_extract_text(content::HTML, '//article//p')[1] IS NOT NULL   -- parse is the filter
 ),
-merged AS (                         -- look the same name up in Wikipedia
+nhs AS (SELECT * FROM nhs_raw WHERE nhs_says IS NOT NULL),  -- ...then filter on the parsed value
+merged AS (                         -- look the same name up in Wikipedia (one point lookup per row)
   SELECT medicine, nhs_says,
          zim_get_text('wikipedia_en_medicine.zim', upper(medicine[1]) || medicine[2:]) AS wiki_html
   FROM nhs
@@ -59,6 +59,33 @@ SELECT medicine, nhs_says,
          '(//div[contains(@class,"mw-parser-output")]/p[normalize-space()])[1]')[1] AS wikipedia_says
 FROM merged WHERE wiki_html IS NOT NULL;
 ```
+
+This is a **key-lookup join**, not a scan-vs-scan join: NHS drives, and each row does a single
+`zim_get_text` point lookup into Wikipedia by title — so the 362k-article archive is *probed*
+~240 times, never scanned. ~5 s for the full table; the cost is HTML parsing, not libzim.
+
+**Search both archives, then align the results side by side.** Federated `zim_search` queries
+both in one call (the `file` column says which), and a `CASE` picks each archive's content
+selector — so two independent search indexes are queried and matched in ~40 ms:
+
+```sql
+WITH hits AS (
+  SELECT CASE WHEN file LIKE '%/nhs.zim' THEN 'NHS' ELSE 'Wikipedia' END AS source,
+         html_extract_text(
+           zim_get_text(file, path)::HTML,
+           CASE WHEN file LIKE '%/nhs.zim'
+                THEN '//article//p'
+                ELSE '(//div[contains(@class,"mw-parser-output")]/p[normalize-space()])[1]' END
+         )[1] AS lead
+  FROM zim_search(['nhs.zim', 'wikipedia_en_medicine.zim'], 'warfarin blood clots', max_results := 1)
+)
+SELECT max(lead) FILTER (WHERE source = 'NHS')       AS nhs,
+       max(lead) FILTER (WHERE source = 'Wikipedia') AS wikipedia
+FROM hits;
+```
+
+Each corpus's own Xapian ranking picks the top hit, so this also shows what each encyclopedia
+*considers* most relevant for the same query.
 
 !!! tip "Filter on the parse, not the string"
     To skip pages that aren't real articles, don't substring-match the raw HTML
