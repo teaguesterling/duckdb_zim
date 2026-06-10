@@ -17,6 +17,7 @@ Returns: `path VARCHAR, title VARCHAR, mimetype VARCHAR, is_redirect BOOLEAN, re
 | `path_prefix` / `title_prefix` | VARCHAR | prefix listing (backed by `findByPath` / `findByTitle`) |
 | `listing` | VARCHAR | `'path'` (all entries) or `'title'` (front articles only) |
 | `include_filepath` (alias `filename`) | BOOLEAN | add the `file_path` column |
+| `parallel` | BOOLEAN | `true` (default): the path-order scan runs across DuckDB's `threads`, partitioned by libzim cluster order (row order not guaranteed). `false`: single-threaded, path-ordered. Lookups / prefixes / title listing are serial regardless. |
 
 Use SQL `LIMIT` / `OFFSET` for bounding/pagination.
 

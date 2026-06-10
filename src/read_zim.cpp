@@ -23,12 +23,15 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "utf8proc_wrapper.hpp"
 
 #include "zim_access.hpp"
 #include "zim_archive_pool.hpp"
 
+#include <algorithm>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace duckdb {
@@ -63,33 +66,86 @@ enum ZimColumn : idx_t {
 	COL_COUNT
 };
 
+// How the scan executes. ParallelScan partitions the cluster-order index space
+// across DuckDB threads; the others are single-threaded.
+//   * Lookup       — exact path/title (0/1 row per archive)
+//   * SerialScan   — cursor over a prefix range or the title listing (order matters)
+//   * ParallelScan — the plain path-order full scan (order is not guaranteed)
+enum class ScanMode { Lookup, SerialScan, ParallelScan };
+
 struct ReadZimBindData : public TableFunctionData {
 	std::vector<std::string> file_paths; // one or more archives (glob/list expanded)
 	// resolved options
 	bool include_content = false;
 	bool content_as_varchar = false;
 	bool include_filepath = false;
+	bool parallel = true; // opt out with parallel := false (forces SerialScan)
 	ScanSpec spec;
 	// exact-lookup mode (path:= or title:=) emits 0/1 row instead of a scan
 	bool single_lookup = false;
 	bool lookup_by_title = false;
 	std::string lookup_key;
-	idx_t column_count = COL_FILE_PATH; // becomes COL_COUNT if include_filepath
+	ScanMode mode = ScanMode::SerialScan; // resolved at the end of bind
+	idx_t column_count = COL_FILE_PATH;   // becomes COL_COUNT if include_filepath
 };
 
 struct ReadZimGlobalState : public GlobalTableFunctionState {
-	std::vector<std::string> files;        // archives to scan, in order
-	idx_t file_idx = 0;                    // index of the archive currently being read
-	std::shared_ptr<ZimArchive> archive;   // current archive (reassigned per file)
-	std::unique_ptr<ZimScanCursor> cursor; // current cursor (scan mode); null otherwise
-	bool lookup_emitted = false;           // single_lookup: emitted for the current file?
-	std::vector<column_t> column_ids;      // projection
-	bool want_content = false;             // content projected AND include_content
-	// MaxThreads()==1: the file_idx/cursor state machine is sequential and not
-	// thread-safe. Parallel scan (phase: partition index ranges) is deferred.
-	idx_t MaxThreads() const override {
-		return 1;
+	ScanMode mode = ScanMode::SerialScan;
+	std::vector<std::string> files;   // archives to scan, in order
+	std::vector<column_t> column_ids; // projection
+	bool want_content = false;        // content projected AND include_content
+	ScanSpec scan_spec;               // bind.spec + want_content; shared by cursor and ScanIndex
+	idx_t max_threads = 1;
+
+	// --- serial (Lookup / SerialScan): sequential file/cursor state machine ---
+	idx_t file_idx = 0;
+	std::shared_ptr<ZimArchive> archive;
+	std::unique_ptr<ZimScanCursor> cursor;
+	bool lookup_emitted = false;
+
+	// --- parallel (ParallelScan): cluster-order morsel dispenser ---
+	std::mutex morsel_lock;
+	idx_t p_file = 0;
+	uint64_t p_index = 0;
+	uint64_t p_count = 0;
+	std::shared_ptr<ZimArchive> p_archive;
+
+	// Hands the next [start, end) cluster-order morsel (within one archive) to a
+	// thread. Returns false once every file is fully dispensed. Thread-safe; the
+	// pooled libzim Archive is itself threadsafe, so the morsels read concurrently.
+	bool NextMorsel(idx_t &out_file, uint64_t &out_start, uint64_t &out_end, std::shared_ptr<ZimArchive> &out_archive) {
+		static constexpr uint64_t MORSEL = 4096;
+		std::lock_guard<std::mutex> guard(morsel_lock);
+		while (p_file < files.size()) {
+			if (!p_archive) {
+				p_archive = ArchivePool::Instance().Get(files[p_file]); // may throw
+				p_count = p_archive->ContentEntryCount();
+				p_index = 0;
+			}
+			if (p_index < p_count) {
+				out_file = p_file;
+				out_start = p_index;
+				out_end = std::min(p_index + MORSEL, p_count);
+				out_archive = p_archive;
+				p_index = out_end;
+				return true;
+			}
+			p_file++;
+			p_archive.reset();
+		}
+		return false;
 	}
+
+	idx_t MaxThreads() const override {
+		return max_threads;
+	}
+};
+
+struct ReadZimLocalState : public LocalTableFunctionState {
+	std::shared_ptr<ZimArchive> archive; // current morsel's archive
+	idx_t file_idx = 0;
+	uint64_t idx = 0; // next cluster-order index to read
+	uint64_t end = 0; // end of the current morsel
 };
 
 LogicalType ContentType(const ReadZimBindData &bind) {
@@ -159,6 +215,8 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 			}
 		} else if (key == "content_as_varchar") {
 			bind->content_as_varchar = BooleanValue::Get(val);
+		} else if (key == "parallel") {
+			bind->parallel = BooleanValue::Get(val);
 		} else if (key == "include_filepath" || key == "filename") {
 			bind->include_filepath = BooleanValue::Get(val);
 		} else if (key == "mimetype") {
@@ -236,6 +294,17 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 		bind->spec.order = ScanOrder::ByPath;
 	}
 
+	// Resolve execution mode. Only the plain path-order full scan parallelizes (it
+	// has no ordering or range contract); exact lookups, prefix ranges, and the title
+	// listing stay single-threaded, as does an explicit `parallel := false`.
+	if (bind->single_lookup) {
+		bind->mode = ScanMode::Lookup;
+	} else if (bind->parallel && !has_path_prefix && !has_title_prefix && bind->spec.order == ScanOrder::ByPath) {
+		bind->mode = ScanMode::ParallelScan;
+	} else {
+		bind->mode = ScanMode::SerialScan;
+	}
+
 	names = {"path", "title", "mimetype", "is_redirect", "redirect_path", "size", "content"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
 	                LogicalType::VARCHAR, LogicalType::UBIGINT, ContentType(*bind)};
@@ -250,14 +319,12 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 }
 
 // Opens files[file_idx] as the current archive; in scan mode also builds the cursor.
-// May throw (missing/corrupt archive) — surfaced as the query's error.
+// Serial paths only (Lookup / SerialScan). May throw — surfaced as the query's error.
 static void OpenCurrentFile(ReadZimGlobalState &g, const ReadZimBindData &bind) {
 	g.archive = ArchivePool::Instance().Get(g.files[g.file_idx]); // may throw
 	g.lookup_emitted = false;
 	if (!bind.single_lookup) {
-		ScanSpec spec = bind.spec;
-		spec.want_content = g.want_content;
-		g.cursor = make_uniq<ZimScanCursor>(g.archive->Scan(spec));
+		g.cursor = make_uniq<ZimScanCursor>(g.archive->Scan(g.scan_spec));
 	}
 }
 
@@ -275,6 +342,7 @@ static void AdvanceFile(ReadZimGlobalState &g, const ReadZimBindData &bind) {
 unique_ptr<GlobalTableFunctionState> ReadZimInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<ReadZimBindData>();
 	auto state = make_uniq<ReadZimGlobalState>();
+	state->mode = bind.mode;
 	state->files = bind.file_paths;
 	state->column_ids = input.column_ids;
 
@@ -288,13 +356,27 @@ unique_ptr<GlobalTableFunctionState> ReadZimInitGlobal(ClientContext &context, T
 		}
 	}
 	state->want_content = content_projected && bind.include_content;
+	state->scan_spec = bind.spec;
+	state->scan_spec.want_content = state->want_content;
 
-	OpenCurrentFile(*state, bind); // open the first archive (file_paths is non-empty)
+	if (bind.mode == ScanMode::ParallelScan) {
+		// Use DuckDB's configured thread count; morsels (and their archives) are
+		// dispensed lazily, so nothing is opened until a thread asks for work.
+		state->max_threads = MaxValue<idx_t>(1, (idx_t)TaskScheduler::GetScheduler(context).NumberOfThreads());
+	} else {
+		state->max_threads = 1;
+		OpenCurrentFile(*state, bind); // serial paths open the first archive eagerly
+	}
 	return std::move(state);
 }
 
-void EmitRow(const ReadZimBindData &bind, const ReadZimGlobalState &gstate, const ZimEntry &row, DataChunk &output,
-             idx_t out_idx) {
+unique_ptr<LocalTableFunctionState> ReadZimInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                     GlobalTableFunctionState *gstate) {
+	return make_uniq<ReadZimLocalState>();
+}
+
+void EmitRow(const ReadZimBindData &bind, const ReadZimGlobalState &gstate, const ZimEntry &row,
+             const std::string &file_path, DataChunk &output, idx_t out_idx) {
 	for (idx_t col = 0; col < gstate.column_ids.size(); col++) {
 		auto cid = gstate.column_ids[col];
 		auto &vec = output.data[col];
@@ -332,8 +414,9 @@ void EmitRow(const ReadZimBindData &bind, const ReadZimGlobalState &gstate, cons
 			break;
 		}
 		case COL_FILE_PATH:
-			// The archive this row came from (file_idx is unchanged until after emit).
-			vec.SetValue(out_idx, Value(gstate.files[gstate.file_idx]));
+			// The archive this row came from (passed in: serial uses the current file,
+			// parallel the morsel's file).
+			vec.SetValue(out_idx, Value(file_path));
 			break;
 		default:
 			break;
@@ -345,6 +428,32 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 	auto &bind = data.bind_data->Cast<ReadZimBindData>();
 	auto &gstate = data.global_state->Cast<ReadZimGlobalState>();
 
+	// --- parallel path-order scan: each thread drains cluster-order morsels. ---
+	// libzim's Archive is threadsafe, so the morsels read the shared pooled handle
+	// concurrently. Row order is not guaranteed (parallel scans never are).
+	if (gstate.mode == ScanMode::ParallelScan) {
+		auto &lstate = data.local_state->Cast<ReadZimLocalState>();
+		idx_t count = 0;
+		while (count < STANDARD_VECTOR_SIZE) {
+			if (lstate.idx >= lstate.end) {
+				if (!gstate.NextMorsel(lstate.file_idx, lstate.idx, lstate.end, lstate.archive)) {
+					break; // every morsel dispensed and drained
+				}
+			}
+			while (lstate.idx < lstate.end && count < STANDARD_VECTOR_SIZE) {
+				auto row = lstate.archive->ScanIndex(lstate.idx, gstate.scan_spec);
+				lstate.idx++;
+				if (row.has_value()) {
+					EmitRow(bind, gstate, *row, gstate.files[lstate.file_idx], output, count);
+					count++;
+				}
+			}
+		}
+		output.SetCardinality(count);
+		return;
+	}
+
+	// --- serial: exact lookup, or a single cursor (prefix range / title listing) ---
 	idx_t count = 0;
 	while (count < STANDARD_VECTOR_SIZE && gstate.file_idx < gstate.files.size()) {
 		if (bind.single_lookup) {
@@ -363,7 +472,7 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 					row->content_loaded = false;
 				}
 				if (row.has_value() && MimetypeAccepted(bind.spec.mimetype_filter, row->mimetype)) {
-					EmitRow(bind, gstate, *row, output, count);
+					EmitRow(bind, gstate, *row, gstate.files[gstate.file_idx], output, count);
 					count++;
 				}
 			}
@@ -374,7 +483,7 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 			// so later files in a glob/list are not silently dropped.
 			ZimEntry row;
 			if (gstate.cursor->Next(row)) {
-				EmitRow(bind, gstate, row, output, count);
+				EmitRow(bind, gstate, row, gstate.files[gstate.file_idx], output, count);
 				count++;
 			} else {
 				AdvanceFile(gstate, bind);
@@ -402,10 +511,11 @@ static unique_ptr<TableRef> ReadZimReplacementScan(ClientContext &context, Repla
 
 void RegisterReadZim(ExtensionLoader &loader) {
 	auto make_fn = [](const LogicalType &arg_type) {
-		TableFunction f("read_zim", {arg_type}, ReadZimFunction, ReadZimBind, ReadZimInitGlobal);
+		TableFunction f("read_zim", {arg_type}, ReadZimFunction, ReadZimBind, ReadZimInitGlobal, ReadZimInitLocal);
 		// ANY so a BOOLEAN, a VARCHAR mimetype, or a LIST(VARCHAR) all bind.
 		f.named_parameters["include_content"] = LogicalType::ANY;
 		f.named_parameters["content_as_varchar"] = LogicalType::BOOLEAN;
+		f.named_parameters["parallel"] = LogicalType::BOOLEAN;
 		f.named_parameters["include_filepath"] = LogicalType::BOOLEAN;
 		f.named_parameters["filename"] = LogicalType::BOOLEAN;
 		// ANY so a single mimetype or a LIST(VARCHAR) of patterns both bind.

@@ -120,7 +120,14 @@ FROM read_zim('wikipedia.zim', include_content := ['text/html', 'text/css']);
 mimetypes — with `image/*` / `*/*` wildcards — to load content for only those entries),
 `content_as_varchar`, `include_filepath` (alias `filename`), `mimetype` (a single pattern
 or a LIST, **Accept-style** with `image/*` / `*/*` wildcards), `path`, `title`,
-`path_prefix`, `title_prefix`, `listing` (`'path'` | `'title'`).
+`path_prefix`, `title_prefix`, `listing` (`'path'` | `'title'`), `parallel`
+(`true`/`false`; see below).
+
+The plain path-order scan runs **in parallel** across DuckDB's configured `threads` by
+default — entries are partitioned by libzim **cluster order** so each compressed cluster is
+decompressed once. Row order is not guaranteed under a parallel scan (it never is in SQL);
+pass `parallel := false` for a single-threaded, path-ordered scan, or add `ORDER BY`. Exact
+lookups, prefix listings, and `listing := 'title'` are single-threaded by nature.
 
 ```sql
 -- Accept-style content typing: all images, then narrow with SQL if you want a preference
@@ -438,6 +445,7 @@ work, so it's excluded from CI for now.
 | 1 | `read_zim`, listing/prefix, `read_zim_metadata`, `zim_metadata`/`_keys`/`zim_counter`/`zim_info`, lookup scalars | **implemented** |
 | 2 | `zim://` filesystem (path + glob) — composition with `webbed`/`markdown`/`read_blob` | **implemented** |
 | 3 | `zim_search` (Xapian full-text) + `zim_suggest` (title autocomplete); utilities `zim_illustration` / `zim_random` / `zim_check`; Accept-style `mimetype` matching | **implemented** |
+| 3.5 (v0.3) | **parallel `read_zim` scan** — cluster-order morsels across DuckDB threads (`parallel` param) | **implemented** |
 | 4 | `ATTACH 'x.zim' AS … (TYPE zim)` | **won't do** — see below |
 
 **v0.2.0 is considered feature-complete.** `ATTACH` was the last planned phase and has
