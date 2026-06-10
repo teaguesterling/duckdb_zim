@@ -21,6 +21,12 @@ named `:=` params).
 >
 > Everything else here (the three-surface analysis, ATTACH weighing, ArchivePool,
 > webbed integration, build order, mimetypes/Counter) stands as written.
+>
+> 4. **Surface C / phase 4 (`ATTACH … TYPE zim`) was evaluated and DROPPED** for v0.2.0.
+>    A ZIM is a dataset, not a multi-table database, so the `read_*` idiom fits and the
+>    catalog idiom does not; the warm-handle benefit is already the ArchivePool's. The §2
+>    weighing below leans this way already; the final rationale lives in
+>    `docs/design.md`. v0.2.0 is feature-complete.
 
 ---
 

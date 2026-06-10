@@ -1,0 +1,47 @@
+site_name: duckdb_zim
+site_description: Read .zim (Kiwix / openZIM) archives directly in DuckDB via libzim.
+site_url: https://duckdb-zim.readthedocs.io/
+repo_url: https://github.com/teaguesterling/duckdb_zim
+repo_name: teaguesterling/duckdb_zim
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - toc.integrate
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Reading archives: reading.md
+  - The zim:// filesystem: filesystem.md
+  - Search & suggestions: search.md
+  - Function reference: reference.md
+  - Recipes: recipes.md
+  - Design notes: design.md
+  - libzim semantics: libzim-semantics.md

@@ -10,8 +10,8 @@ for the HTML that ZIM articles are made of).
 > **Status: phases 1–3 (v0.2.0).** Content scan, lookups, listing, metadata, the
 > `zim://` filesystem, full-text search + title suggestions (`zim_search` / `zim_suggest`,
 > federated across archives), and utilities (`zim_illustration` / `zim_random` /
-> `zim_check`) are implemented. `ATTACH` is still planned (see [Roadmap](#roadmap)).
-> This is a young extension — expect rough edges.
+> `zim_check`) are implemented. With v0.2.0 the reader is **feature-complete**
+> (`ATTACH` was evaluated and dropped — see [Roadmap](#roadmap)).
 
 > **License: GPL-2.0-or-later.** libzim is GPL, so this extension is too. That is
 > intentional and separate from the MIT-licensed `markdown`/`yaml`/`webbed` family;
@@ -381,15 +381,30 @@ work, so it's excluded from CI for now.
 | 1 | `read_zim`, listing/prefix, `read_zim_metadata`, `zim_metadata`/`_keys`/`zim_counter`/`zim_info`, lookup scalars | **implemented** |
 | 2 | `zim://` filesystem (path + glob) — composition with `webbed`/`markdown`/`read_blob` | **implemented** |
 | 3 | `zim_search` (Xapian full-text) + `zim_suggest` (title autocomplete); utilities `zim_illustration` / `zim_random` / `zim_check`; Accept-style `mimetype` matching | **implemented** |
-| 4 | `ATTACH 'x.zim' AS … (TYPE zim)` — read-only catalog ergonomics | planned |
+| 4 | `ATTACH 'x.zim' AS … (TYPE zim)` | **won't do** — see below |
+
+**v0.2.0 is considered feature-complete.** `ATTACH` was the last planned phase and has
+been dropped: a ZIM is a *dataset* (one logical relation + metadata + a search index),
+not a multi-table *database*, so DuckDB's `read_*` function idiom is the right fit — not
+the catalog/`ATTACH` idiom (which suits sqlite/postgres). The only structural "tables" a
+ZIM has are its namespaces; the two useful ones (`C` content, `M` metadata) are already
+`read_zim` / `read_zim_metadata`, and the rest (`W` well-known ≈ the main entry, `X` raw
+index blobs) aren't worth surfacing as rows. `ATTACH`'s one non-cosmetic benefit, a warm
+handle, is already provided by the archive pool; aliasing is a one-line `CREATE VIEW`. If
+peeking at the `W`/`X` namespaces is ever needed, an opt-in raw-enumeration flag on
+`read_zim` is the honest tool, not a catalog.
+
+Future direction, if it comes up, is the *other* catalog shape — a **multi-archive
+library** (browse/join across a shelf of ZIMs) — which the federated `zim_search` /
+`zim_suggest` and `read_zim('*.zim')` already partly cover.
 
 ---
 
 ## How it works
 
 A process-wide pool keeps each opened `zim::Archive` alive across queries, so libzim's
-decompressed-cluster cache stays warm — every function, the `zim://` filesystem, and a
-future `ATTACH` all share one open handle per file. All libzim contact is isolated in a small
+decompressed-cluster cache stays warm — every function and the `zim://` filesystem share
+one open handle per file. All libzim contact is isolated in a small
 access layer (`src/zim_access.*`); the rest of the code is a plain DuckDB binding over
 DuckDB-agnostic structs. See `DESIGN.md` and `docs/libzim-semantics.md`.
 
