@@ -34,6 +34,7 @@
 namespace duckdb {
 
 using zim_ext::ArchivePool;
+using zim_ext::MimetypeAccepted;
 using zim_ext::ScanOrder;
 using zim_ext::ScanSpec;
 using zim_ext::ZimArchive;
@@ -161,7 +162,16 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 		} else if (key == "include_filepath" || key == "filename") {
 			bind->include_filepath = BooleanValue::Get(val);
 		} else if (key == "mimetype") {
-			bind->spec.mimetype = val.GetValue<string>();
+			// Accept-style row filter: a single mimetype, or a LIST, with wildcard
+			// patterns (image/*, */*, *). Empty list = no filter.
+			auto type_id = val.type().id();
+			if (type_id == LogicalTypeId::LIST) {
+				for (auto &child : ListValue::GetChildren(val)) {
+					bind->spec.mimetype_filter.push_back(child.GetValue<string>());
+				}
+			} else {
+				bind->spec.mimetype_filter.push_back(val.GetValue<string>());
+			}
 		} else if (key == "path_prefix") {
 			bind->spec.path_prefix = val.GetValue<string>();
 		} else if (key == "title_prefix") {
@@ -347,19 +357,12 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 				// Apply the include_content mimetype gate to the single fetched row,
 				// matching the scan path: a non-matching entry keeps its metadata but
 				// reports NULL content.
-				if (row.has_value() && row->content_loaded && !bind.spec.content_mimetypes.empty()) {
-					bool allowed = false;
-					for (const auto &m : bind.spec.content_mimetypes) {
-						if (m == row->mimetype) {
-							allowed = true;
-						}
-					}
-					if (!allowed) {
-						row->content.clear();
-						row->content_loaded = false;
-					}
+				if (row.has_value() && row->content_loaded && !bind.spec.content_mimetypes.empty() &&
+				    !MimetypeAccepted(bind.spec.content_mimetypes, row->mimetype)) {
+					row->content.clear();
+					row->content_loaded = false;
 				}
-				if (row.has_value() && (!bind.spec.mimetype.has_value() || row->mimetype == *bind.spec.mimetype)) {
+				if (row.has_value() && MimetypeAccepted(bind.spec.mimetype_filter, row->mimetype)) {
 					EmitRow(bind, gstate, *row, output, count);
 					count++;
 				}
@@ -405,7 +408,8 @@ void RegisterReadZim(ExtensionLoader &loader) {
 		f.named_parameters["content_as_varchar"] = LogicalType::BOOLEAN;
 		f.named_parameters["include_filepath"] = LogicalType::BOOLEAN;
 		f.named_parameters["filename"] = LogicalType::BOOLEAN;
-		f.named_parameters["mimetype"] = LogicalType::VARCHAR;
+		// ANY so a single mimetype or a LIST(VARCHAR) of patterns both bind.
+		f.named_parameters["mimetype"] = LogicalType::ANY;
 		f.named_parameters["path"] = LogicalType::VARCHAR;
 		f.named_parameters["title"] = LogicalType::VARCHAR;
 		f.named_parameters["path_prefix"] = LogicalType::VARCHAR;

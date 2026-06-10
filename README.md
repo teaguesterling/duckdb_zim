@@ -7,33 +7,42 @@ Query an archive's entries, pull article content, read metadata, and compose wit
 rest of the DuckDB extension ecosystem (notably [`webbed`](https://github.com/teaguesterling/duckdb_webbed)
 for the HTML that ZIM articles are made of).
 
-> **Status: phase 1.** Content scan, lookups, listing, and metadata are implemented.
-> The `zim://` filesystem, full-text search, and `ATTACH` are planned (see
-> [Roadmap](#roadmap)). This is a young extension — expect rough edges.
+> **Status: phases 1–3.** Content scan, lookups, listing, metadata, the `zim://`
+> filesystem, and Xapian full-text search (`zim_search`, native builds) are
+> implemented. `ATTACH` is still planned (see [Roadmap](#roadmap)). This is a young
+> extension — expect rough edges.
 
 > **License: GPL-2.0-or-later.** libzim is GPL, so this extension is too. That is
 > intentional and separate from the MIT-licensed `markdown`/`yaml`/`webbed` family;
 > see [License](#license).
 
-> **Platforms: Linux, macOS, and WebAssembly** all build and test green in CI (the
-> search-less stack). Windows isn't supported yet; see [Platforms](#platforms).
+> **Platforms: Linux and macOS** (x64 + arm64, with full-text search) **and WebAssembly**
+> (search-less) all build and test green in CI. Windows isn't supported yet; see
+> [Platforms](#platforms).
 
 ---
 
 ## Install
 
-Not yet published to community-extensions. Build from source (see `HANDOFF.md` /
-`DESIGN.md` for the toolchain), then:
-
-```sql
-LOAD zim;
-```
-
-Once published, the usual:
+A community-extensions submission is in progress. Once it lands, the usual:
 
 ```sql
 INSTALL zim FROM community;
 LOAD zim;
+```
+
+Until then, build from source (DuckDB + extension are pulled as submodules):
+
+```sh
+git clone --recurse-submodules https://github.com/teaguesterling/duckdb_zim.git
+cd duckdb_zim
+make            # needs a vcpkg toolchain for libzim; see DESIGN.md for details
+```
+
+then load the built extension:
+
+```sql
+LOAD 'build/release/extension/zim/zim.duckdb_extension';
 ```
 
 ---
@@ -103,9 +112,17 @@ FROM read_zim('wikipedia.zim', include_content := ['text/html', 'text/css']);
 ```
 
 `read_zim` parameters: `include_content` (`true`/`false`, or a mimetype / list of
-mimetypes to load content for only those entries), `content_as_varchar`,
-`include_filepath` (alias `filename`), `mimetype`, `path`, `title`, `path_prefix`,
-`title_prefix`, `listing` (`'path'` | `'title'`).
+mimetypes — with `image/*` / `*/*` wildcards — to load content for only those entries),
+`content_as_varchar`, `include_filepath` (alias `filename`), `mimetype` (a single pattern
+or a LIST, **Accept-style** with `image/*` / `*/*` wildcards), `path`, `title`,
+`path_prefix`, `title_prefix`, `listing` (`'path'` | `'title'`).
+
+```sql
+-- Accept-style content typing: all images, then narrow with SQL if you want a preference
+SELECT path, mimetype FROM read_zim('wikipedia.zim', mimetype := 'image/*');
+SELECT path FROM read_zim('wikipedia.zim', mimetype := ['image/webp', 'image/png'])
+ORDER BY array_position(['image/webp', 'image/png'], mimetype);   -- webp first
+```
 
 These select mutually exclusive modes and conflicting combinations are rejected (rather
 than silently resolved): pick at most one exact key (`path` *or* `title`) **or** one
@@ -162,6 +179,50 @@ zim_has_entry(file, path)       -- BOOLEAN
 zim_redirect_target(file, path) -- VARCHAR, NULL if not a redirect
 zim_mimetype(file, path)        -- VARCHAR
 zim_main_entry(file)            -- VARCHAR, redirect-resolved landing path
+zim_random(file)                -- VARCHAR, a random entry's path
+zim_check(file)                 -- BOOLEAN, libzim archive integrity check
+zim_illustration(file[, size])  -- BLOB, the cover image / favicon (default 48px), NULL if none
+```
+
+### Full-text search and title suggestions
+
+If the archive carries a Xapian full-text index (`zim_info(file).has_fulltext_index`),
+`zim_search` queries it:
+
+```sql
+SELECT path, title, score, snippet
+FROM zim_search('wikipedia.zim', 'compound heterozygous', max_results := 20);
+
+-- paginate with result_offset; both default to (25, 0)
+SELECT path FROM zim_search('wikipedia.zim', 'photosynthesis',
+                            max_results := 10, result_offset := 10);
+```
+
+Returns `(path, title, score DOUBLE, snippet VARCHAR, file VARCHAR)` ranked by relevance.
+`score` is the Xapian rank; `snippet` is a best-effort highlighted excerpt (`NULL` when
+none is produced). An archive without a full-text index — or the search-less **WebAssembly**
+build — returns no rows rather than erroring. (`max_results` / `result_offset`, not
+`limit` / `offset`, because the latter are SQL reserved words.)
+
+**Federated search** — like `read_zim`, the first argument can be a single path, a **glob**,
+or a `LIST(VARCHAR)`, so a query runs across many archives at once. `max_results` applies
+**per archive**, the `file` column says which one each hit came from, and you rank/trim
+across them in SQL (Xapian scores are per-archive, so not directly comparable):
+
+```sql
+SELECT file, path, title, score
+FROM zim_search('library/*.zim', 'insulin', max_results := 5)
+ORDER BY score DESC LIMIT 20;
+```
+
+`zim_suggest` is title **autocomplete** over the suggestion index — returns
+`(path, title, snippet, file)` and is federated the same way (glob / `LIST`). Unlike
+`zim_search`, it works on every build (it falls back to a title-prefix listing where
+there's no Xapian index, so it's available on Wasm too):
+
+```sql
+SELECT path, title FROM zim_suggest('wikipedia.zim', 'Photosyn', max_results := 10);
+SELECT file, title FROM zim_suggest('library/*.zim', 'Photosyn');   -- across a shelf
 ```
 
 ### Reading a real archive, end to end
@@ -273,15 +334,35 @@ paths, so normalize and join back to the entries table to build an edge list.
 `duck_block_utils`) yields a structured block tree you can render to markdown as retrieval
 context for an offline model.
 
+**Web-capture (zimit) archives** — zimit / browsertrix ZIMs use full-URL content paths
+(`www.nhs.uk/medicines/insulin/`) instead of mwoffliner's `A/Foo`. The extension stays
+scraper-agnostic — paths are opaque strings — so everything is plain SQL on the `path`
+column, no special functions:
+
+```sql
+-- which scraper produced this archive?
+SELECT zim_metadata('archive.zim', 'Scraper');          -- 'zimit …' vs 'mwoffliner …'
+
+-- hosts captured, and entries under one host with their reconstructed source URLs
+SELECT DISTINCT split_part(path, '/', 1) AS host FROM read_zim('archive.zim');
+SELECT path, 'https://' || path AS source_url
+FROM read_zim('archive.zim')
+WHERE path LIKE 'www.nhs.uk/%' AND mimetype = 'text/html';
+
+-- read a captured page straight through the filesystem (trailing slashes resolve)
+SELECT * FROM read_html('zim://archive.zim/www.nhs.uk/medicines/insulin/');   -- LOAD webbed;
+```
+
 ---
 
 ## Platforms
 
-**Linux** (x64 + arm64) and **macOS** (x64 + arm64) build and test green in CI. The
-search-less **WebAssembly** build works too — all three emscripten variants
-(mvp / eh / threads) compile green, settling the earlier open question: libzim + `icu` +
-`zstd` + `liblzma` *do* build under emscripten once `xapian` is dropped. `xapian` (search)
-stays a compile-time option, so `zim_search` (phase 3) will be a native/desktop feature.
+**Linux** (x64 + arm64) and **macOS** (x64 + arm64) build and test green in CI, **with
+full-text search** — `xapian` is pulled in for native triplets. The **WebAssembly** build
+works too (all three emscripten variants compile green), but is **search-less**: `xapian`
+is gated out of the Wasm triplet (`"platform": "!emscripten"` in `vcpkg.json`), since
+libzim + `icu` + `zstd` + `liblzma` build under emscripten but xapian does not. On Wasm,
+`zim_search` binds but returns no rows.
 
 **Windows** is not yet supported — libzim + icu under MSVC/mingw need their own porting
 work, so it's excluded from CI for now.
@@ -294,7 +375,7 @@ work, so it's excluded from CI for now.
 |---|---|---|
 | 1 | `read_zim`, listing/prefix, `read_zim_metadata`, `zim_metadata`/`_keys`/`zim_counter`/`zim_info`, lookup scalars | **implemented** |
 | 2 | `zim://` filesystem (path + glob) — composition with `webbed`/`markdown`/`read_blob` | **implemented** |
-| 3 | `zim_search` / `zim_suggest` (Xapian full-text + suggestion index) | planned |
+| 3 | `zim_search` (Xapian full-text) + `zim_suggest` (title autocomplete); utilities `zim_illustration` / `zim_random` / `zim_check`; Accept-style `mimetype` matching | **implemented** |
 | 4 | `ATTACH 'x.zim' AS … (TYPE zim)` — read-only catalog ergonomics | planned |
 
 ---

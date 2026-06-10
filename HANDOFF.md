@@ -1,4 +1,9 @@
-# duckdb_zim — developer handoff (phase 1 written, build pending)
+# duckdb_zim — developer handoff (HISTORICAL)
+
+> **Historical.** This was the phase-1 kickoff handoff. Phases 1–3 are now built,
+> tested, and merged (content scan, metadata, the `zim://` filesystem, and Xapian
+> full-text search). Kept for the design/reading-order context below; for current
+> usage see `README.md` and for rationale see `DESIGN.md`.
 
 You are picking up **duckdb_zim**, a DuckDB extension that reads `.zim` files
 (Kiwix / openZIM archives) via **libzim**. The design is done, the libzim semantics are

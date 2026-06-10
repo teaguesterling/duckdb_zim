@@ -44,6 +44,24 @@ FROM read_zim('test/oracle/test.zim', include_content := ['text/html', 'text/css
 ----
 4
 
+# --- wildcard gate: include_content := 'image/*' loads only the image -------
+query II
+SELECT mimetype, count(*) FILTER (WHERE content IS NOT NULL) AS loaded
+FROM read_zim('test/oracle/test.zim', include_content := 'image/*')
+GROUP BY mimetype ORDER BY mimetype NULLS FIRST;
+----
+NULL	0
+image/png	1
+text/css	0
+text/html	0
+
+# a text/* wildcard loads html + css, not the png
+query I
+SELECT count(*) FILTER (WHERE content IS NOT NULL)
+FROM read_zim('test/oracle/test.zim', include_content := 'text/*');
+----
+4
+
 # --- the gate works as VARCHAR too (content_as_varchar) ---------------------
 query I
 SELECT content LIKE '%<h1>%'

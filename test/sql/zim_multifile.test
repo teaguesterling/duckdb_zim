@@ -4,9 +4,9 @@
 
 require zim
 
-# a glob expands to the one fixture
+# a glob expands to the matching fixture (test.z* matches test.zim, not test_zimit.zim)
 query I
-SELECT count(*) FROM read_zim('test/oracle/*.zim');
+SELECT count(*) FROM read_zim('test/oracle/test.z*');
 ----
 6
 
@@ -26,7 +26,7 @@ SELECT count(*) FROM read_zim(['test/oracle/test.zim', 'test/oracle/test.zim'], 
 # include_filepath reports the archive each row came from
 query I
 SELECT DISTINCT file_path LIKE '%test.zim'
-FROM read_zim('test/oracle/*.zim', include_filepath := true);
+FROM read_zim('test/oracle/test.z*', include_filepath := true);
 ----
 true
 

@@ -1,0 +1,73 @@
+# name: test/sql/zim_zimit.test
+# description: zimit/browsertrix archives — full-URL paths, trailing slashes, no-index search
+# group: [sql]
+
+#
+# Fixture: test/oracle/test_zimit.zim (regenerate with test/oracle/make_zimit_fixture.py).
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# Content paths are full URLs (host + path), not mwoffliner's A/Foo — they carry dots,
+# multiple slashes, and trailing-slash "directory" pages.
+query III
+SELECT path, title, mimetype FROM read_zim('test/oracle/test_zimit.zim') ORDER BY path;
+----
+example.com/	Home	text/html
+example.com/about	About	text/html
+example.com/products/widget/	Widget	text/html
+example.com/static/style.css	style	text/css
+
+# exact lookup of a full-URL path, including the trailing slash
+query I
+SELECT title FROM read_zim('test/oracle/test_zimit.zim', path := 'example.com/products/widget/');
+----
+Widget
+
+# main entry is the host root
+query I
+SELECT zim_main_entry('test/oracle/test_zimit.zim');
+----
+example.com/
+
+# --- zim:// filesystem over full-URL paths ----------------------------------
+query I
+SELECT content LIKE '%<h1>About</h1>%'
+FROM read_text('zim://test/oracle/test_zimit.zim/example.com/about');
+----
+true
+
+# a trailing-slash directory page resolves through the filesystem
+query I
+SELECT content LIKE '%<h1>Widget</h1>%'
+FROM read_text('zim://test/oracle/test_zimit.zim/example.com/products/widget/');
+----
+true
+
+# bytes match the scalar accessor
+query I
+SELECT content = zim_get_content('test/oracle/test_zimit.zim', 'example.com/about')
+FROM read_blob('zim://test/oracle/test_zimit.zim/example.com/about');
+----
+true
+
+# glob over a full-URL prefix enumerates everything under the host
+query I
+SELECT count(*) FROM read_text('zim://test/oracle/test_zimit.zim/example.com/*');
+----
+4
+
+# --- no fulltext index: search degrades cleanly -----------------------------
+# This archive was built without config_indexing, so it has no Xapian index.
+query I
+SELECT zim_info('test/oracle/test_zimit.zim').has_fulltext_index;
+----
+false
+
+# zim_search returns no rows (rather than erroring) when there's no index
+query I
+SELECT count(*) FROM zim_search('test/oracle/test_zimit.zim', 'widget');
+----
+0

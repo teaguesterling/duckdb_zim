@@ -1,0 +1,56 @@
+# name: test/sql/zim_federated.test
+# description: federated search/suggest across many archives (glob / LIST), with a file column
+# group: [sql]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# single archive still works and now carries a trailing `file` column
+query III
+SELECT path, title, file FROM zim_search('test/oracle/test.zim', 'photosynthesis');
+----
+A/Photosynthesis	Photosynthesis	test/oracle/test.zim
+
+# a LIST of archives searches each; the same archive twice yields 2x the hits
+query I
+SELECT count(*) FROM zim_search(['test/oracle/test.zim', 'test/oracle/test.zim'], 'plants');
+----
+4
+
+# the file column identifies the source archive of every hit
+query I
+SELECT DISTINCT file FROM zim_search(['test/oracle/test.zim', 'test/oracle/test.zim'], 'plants');
+----
+test/oracle/test.zim
+
+# a glob expands like read_zim (test.z* matches test.zim, not test_zimit.zim)
+query I
+SELECT count(*) FROM zim_search('test/oracle/test.z*', 'plants');
+----
+2
+
+# a no-index archive in the federation simply contributes nothing (no error)
+query I
+SELECT DISTINCT file FROM zim_search(['test/oracle/test.zim', 'test/oracle/test_zimit.zim'], 'plants');
+----
+test/oracle/test.zim
+
+# max_results applies per archive
+query I
+SELECT count(*) FROM zim_search(['test/oracle/test.zim', 'test/oracle/test.zim'], 'plants', max_results := 1);
+----
+2
+
+# zim_suggest is federated too, with the same file column
+query III
+SELECT path, title, file FROM zim_suggest(['test/oracle/test.zim'], 'Cal');
+----
+A/Calcium	Calcium	test/oracle/test.zim
+
+# a glob/list that matches no files is rejected
+statement error
+SELECT * FROM zim_search('test/oracle/nope_*.zim', 'x');
+----
+no files matched

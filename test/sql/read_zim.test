@@ -5,8 +5,6 @@
 #
 # Fixture: test/oracle/test.zim (regenerate with test/oracle/make_fixture.py).
 # Expected values are the verified oracle outputs (docs/libzim-semantics.md).
-# Assertions that depend on libzim C++ signatures marked // VERIFY in the source
-# (findByPath/findByTitle prefix scoping) should be confirmed on first run.
 
 require zim
 
@@ -71,13 +69,37 @@ SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css');
 ----
 1
 
-# prefix listing via findByPath  // VERIFY prefix scoping on pinned libzim
+# Accept-style mimetype matching: a subtype wildcard
+query I
+SELECT path FROM read_zim('test/oracle/test.zim', mimetype := 'image/*');
+----
+I/logo.png
+
+# a LIST of patterns (any-match), here exact + exact
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := ['text/html', 'text/css']);
+----
+4
+
+# a LIST mixing exact and wildcard patterns
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := ['text/css', 'image/*']);
+----
+2
+
+# the */* catch-all matches every non-redirect entry (5 items; the redirect has no mimetype)
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := '*/*');
+----
+5
+
+# prefix listing via findByPath
 query I
 SELECT count(*) FROM read_zim('test/oracle/test.zim', path_prefix := 'A/');
 ----
 4
 
-# prefix listing via findByTitle  // VERIFY prefix scoping on pinned libzim
+# prefix listing via findByTitle
 query I
 SELECT count(*) FROM read_zim('test/oracle/test.zim', title_prefix := 'C');
 ----

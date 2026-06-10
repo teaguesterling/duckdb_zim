@@ -76,8 +76,11 @@ struct ScanSpec {
 	ScanOrder order = ScanOrder::ByPath;
 	std::optional<std::string> path_prefix;  // -> findByPath
 	std::optional<std::string> title_prefix; // -> findByTitle
-	std::optional<std::string> mimetype;     // post-filter (libzim has no mimetype index)
-	bool want_content = false;               // fetch blobs during the scan
+	// Accept-style mimetype row filter (post-filter; libzim has no mimetype index).
+	// Empty = no filter. Patterns may be exact (text/html), a subtype wildcard
+	// (image/*), or the catch-alls */* and *. Redirects (no mimetype) never match.
+	std::vector<std::string> mimetype_filter;
+	bool want_content = false; // fetch blobs during the scan
 	// When want_content and this is non-empty, the blob is loaded ONLY for
 	// entries whose mimetype is listed here; others come back content_loaded =
 	// false (NULL content). Empty = load every scanned entry. This is what lets
@@ -150,6 +153,21 @@ public:
 	// Returns hits [offset, offset+limit). Empty when no fulltext index.
 	std::vector<ZimSearchHit> Search(const std::string &query, uint32_t offset, uint32_t limit) const;
 
+	// --- title autocomplete ------------------------------------------------
+	// Ranked title suggestions [offset, offset+limit). Backed by libzim's
+	// SuggestionSearcher where xapian is present; degrades to a findByTitle
+	// prefix listing otherwise (so it works on search-less builds too).
+	std::vector<ZimSearchHit> Suggest(const std::string &query, uint32_t offset, uint32_t limit) const;
+
+	// --- archive-level utilities -------------------------------------------
+	// Illustration (favicon / cover) PNG bytes of the requested square size;
+	// nullopt when the archive has no illustration at that size.
+	std::optional<std::string> Illustration(unsigned int size) const;
+	// A random content entry's path; "" when the archive has no content entries.
+	std::string RandomPath() const;
+	// libzim's archive integrity check (checksum + structural validation).
+	bool CheckIntegrity() const;
+
 private:
 	explicit ZimArchive(const std::string &file_path);
 	std::string file_path_;
@@ -160,6 +178,13 @@ private:
 // tolerates) so callers may pass either form. Exposed for the binding layer's
 // path normalization and unit tests.
 std::string NormalizeContentPath(const std::string &path);
+
+// Accept-style mimetype match: true if `patterns` is empty (no filter) or
+// `mimetype` matches any pattern. Patterns support exact (text/html), subtype
+// wildcard (image/*), and the catch-alls */* and *. An empty mimetype (a
+// redirect) never matches a non-empty pattern set. Shared by the row filter
+// and the include_content content gate.
+bool MimetypeAccepted(const std::vector<std::string> &patterns, const std::string &mimetype);
 
 } // namespace zim_ext
 } // namespace duckdb

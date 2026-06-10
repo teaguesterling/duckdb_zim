@@ -1,0 +1,74 @@
+# name: test/sql/zim_utilities.test
+# description: utility functions — zim_suggest, zim_illustration, zim_random, zim_check
+# group: [sql]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# --- zim_suggest: title autocomplete ---------------------------------------
+# A title prefix suggests the matching article (with a highlighted snippet).
+query II
+SELECT path, title FROM zim_suggest('test/oracle/test.zim', 'Cal');
+----
+A/Calcium	Calcium
+
+query I
+SELECT path FROM zim_suggest('test/oracle/test.zim', 'Photo');
+----
+A/Photosynthesis
+
+# snippet is populated by the suggestion searcher
+query I
+SELECT snippet IS NOT NULL FROM zim_suggest('test/oracle/test.zim', 'Cal');
+----
+true
+
+# max_results caps suggestions; a non-matching query yields none
+query I
+SELECT count(*) FROM zim_suggest('test/oracle/test.zim', 'C', max_results := 1);
+----
+1
+
+query I
+SELECT count(*) FROM zim_suggest('test/oracle/test.zim', 'zzzznotatitle');
+----
+0
+
+# --- zim_check: archive integrity ------------------------------------------
+query I
+SELECT zim_check('test/oracle/test.zim');
+----
+true
+
+# --- zim_random: returns a real entry --------------------------------------
+# The path is random, but it is always an entry that exists in the archive.
+query I
+SELECT zim_has_entry('test/oracle/test.zim', zim_random('test/oracle/test.zim'));
+----
+true
+
+# --- zim_illustration: cover/favicon BLOB ----------------------------------
+# present in the zimit fixture (a 48px illustration was added)
+query I
+SELECT typeof(zim_illustration('test/oracle/test_zimit.zim'));
+----
+BLOB
+
+query I
+SELECT octet_length(zim_illustration('test/oracle/test_zimit.zim')) > 0;
+----
+true
+
+# explicit size argument resolves the same 48px illustration
+query I
+SELECT zim_illustration('test/oracle/test_zimit.zim') = zim_illustration('test/oracle/test_zimit.zim', 48);
+----
+true
+
+# absent illustration -> NULL (test.zim has none)
+query I
+SELECT zim_illustration('test/oracle/test.zim') IS NULL;
+----
+true
