@@ -1,0 +1,85 @@
+# name: test/sql/zim_parallel.test
+# description: parallel read_zim scan (cluster-order morsels) matches the serial scan
+# group: [sql]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+PRAGMA threads=4
+
+# The default scan is parallel; row order is not guaranteed, so ORDER BY. It returns
+# every content entry (incl. the redirect), same as the serial listing.
+query I
+SELECT path FROM read_zim('test/oracle/test.zim') ORDER BY path;
+----
+A/Calcium
+A/Chlorophyll
+A/Photosynth
+A/Photosynthesis
+I/logo.png
+style.css
+
+# parallel := false yields the identical set
+query I
+SELECT path FROM read_zim('test/oracle/test.zim', parallel := false) ORDER BY path;
+----
+A/Calcium
+A/Chlorophyll
+A/Photosynth
+A/Photosynthesis
+I/logo.png
+style.css
+
+# the two modes agree exactly (symmetric set difference is empty)
+query I
+SELECT (SELECT count(*) FROM (SELECT path FROM read_zim('test/oracle/test.zim')
+                              EXCEPT SELECT path FROM read_zim('test/oracle/test.zim', parallel := false)))
+     + (SELECT count(*) FROM (SELECT path FROM read_zim('test/oracle/test.zim', parallel := false)
+                              EXCEPT SELECT path FROM read_zim('test/oracle/test.zim')));
+----
+0
+
+# parallel scan honors the mimetype filter
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/html');
+----
+3
+
+# parallel scan honors include_content + the mimetype gate (content fidelity)
+query I
+SELECT count(*) FILTER (WHERE content IS NOT NULL)
+FROM read_zim('test/oracle/test.zim', include_content := 'text/html');
+----
+3
+
+# redirects carry NULL content under the parallel scan too
+query I
+SELECT content IS NULL FROM read_zim('test/oracle/test.zim', include_content := true)
+WHERE is_redirect;
+----
+true
+
+# multi-file parallel scan: each archive's entries, concatenated
+query I
+SELECT count(*) FROM read_zim(['test/oracle/test.zim', 'test/oracle/test.zim']);
+----
+12
+
+# include_filepath reports the morsel's source archive under the parallel scan
+query I
+SELECT DISTINCT file_path LIKE '%test.zim'
+FROM read_zim('test/oracle/test.z*', include_filepath := true);
+----
+true
+
+# a single-threaded engine still works (parallel scan with 1 thread)
+statement ok
+PRAGMA threads=1
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim');
+----
+6

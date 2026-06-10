@@ -314,6 +314,25 @@ ZimScanCursor ZimArchive::Scan(const ScanSpec &spec) const {
 	return ZimScanCursor(std::move(impl));
 }
 
+uint64_t ZimArchive::ContentEntryCount() const {
+	return archive_->getEntryCount();
+}
+
+std::optional<ZimEntry> ZimArchive::ScanIndex(uint64_t idx, const ScanSpec &spec) const {
+	// Cluster-order random access: a contiguous index range stays inside the same
+	// clusters, so a parallel morsel decompresses each cluster once. Mirrors the
+	// per-entry logic of ZimScanCursor::Next (mimetype filter + content gate).
+	zim::Entry entry = archive_->getEntryByClusterOrder(static_cast<zim::entry_index_type>(idx));
+	ZimEntry row = EntryMeta(entry);
+	if (!spec.mimetype_filter.empty() && !MimetypeAccepted(spec.mimetype_filter, row.mimetype)) {
+		return std::nullopt;
+	}
+	if (spec.want_content && MimetypeAccepted(spec.content_mimetypes, row.mimetype)) {
+		LoadContent(entry, row);
+	}
+	return row;
+}
+
 std::vector<std::string> ZimArchive::MetadataKeys() const {
 	return archive_->getMetadataKeys();
 }

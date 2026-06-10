@@ -141,6 +141,15 @@ public:
 	// --- content scan / listing --------------------------------------------
 	ZimScanCursor Scan(const ScanSpec &spec) const;
 
+	// --- parallel scan support ---------------------------------------------
+	// Total content entries — the index space a parallel scan partitions across
+	// threads. Content entries are addressable by cluster-order index in
+	// [0, ContentEntryCount()).
+	uint64_t ContentEntryCount() const;
+	// Process the content entry at cluster-order index `idx` under `spec` (the same
+	// mimetype filter + content gate the cursor applies). nullopt if filtered out.
+	std::optional<ZimEntry> ScanIndex(uint64_t idx, const ScanSpec &spec) const;
+
 	// --- metadata (M namespace) --------------------------------------------
 	std::vector<std::string> MetadataKeys() const;
 	std::optional<std::string> Metadata(const std::string &key) const; // value bytes

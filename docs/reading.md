@@ -90,6 +90,24 @@ SELECT * FROM 'wikipedia.zim';                                         -- replac
 Use SQL `LIMIT` / `OFFSET` to bound or paginate a scan — it streams, so `LIMIT` stops the
 scan early; there's no separate limit parameter.
 
+## Parallel scans
+
+The plain path-order scan runs **in parallel** across DuckDB's configured `threads` by
+default. Entries are partitioned by libzim **cluster order**, so each compressed cluster is
+decompressed once even across threads, and the pooled (threadsafe) libzim handle is read
+concurrently.
+
+```sql
+SET threads = 8;
+SELECT count(*) FROM read_zim('wikipedia.zim');                 -- parallel
+SELECT * FROM read_zim('wikipedia.zim', parallel := false);     -- single-threaded
+```
+
+!!! note "Order is not guaranteed under a parallel scan"
+    Like any parallel SQL scan, rows come back in no particular order — add `ORDER BY`, or
+    use `parallel := false` for a path-ordered single-threaded scan. Exact lookups, prefix
+    listings, and `listing := 'title'` are single-threaded by nature and unaffected.
+
 ## Metadata
 
 Metadata is a separate key space from content (two distinct libzim doors).
