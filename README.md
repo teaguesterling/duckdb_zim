@@ -7,10 +7,11 @@ Query an archive's entries, pull article content, read metadata, and compose wit
 rest of the DuckDB extension ecosystem (notably [`webbed`](https://github.com/teaguesterling/duckdb_webbed)
 for the HTML that ZIM articles are made of).
 
-> **Status: phases 1–3.** Content scan, lookups, listing, metadata, the `zim://`
-> filesystem, and Xapian full-text search (`zim_search`, native builds) are
-> implemented. `ATTACH` is still planned (see [Roadmap](#roadmap)). This is a young
-> extension — expect rough edges.
+> **Status: phases 1–3 (v0.2.0).** Content scan, lookups, listing, metadata, the
+> `zim://` filesystem, full-text search + title suggestions (`zim_search` / `zim_suggest`,
+> federated across archives), and utilities (`zim_illustration` / `zim_random` /
+> `zim_check`) are implemented. `ATTACH` is still planned (see [Roadmap](#roadmap)).
+> This is a young extension — expect rough edges.
 
 > **License: GPL-2.0-or-later.** libzim is GPL, so this extension is too. That is
 > intentional and separate from the MIT-licensed `markdown`/`yaml`/`webbed` family;
@@ -24,14 +25,18 @@ for the HTML that ZIM articles are made of).
 
 ## Install
 
-A community-extensions submission is in progress. Once it lands, the usual:
+Available from the DuckDB community extensions repository:
 
 ```sql
 INSTALL zim FROM community;
 LOAD zim;
 ```
 
-Until then, build from source (DuckDB + extension are pulled as submodules):
+> The published community build tracks tagged releases; the `zim://` filesystem,
+> `zim_search` / `zim_suggest`, and the other phase 2–3 features land with **v0.2.0**.
+> Build from source (below) for anything ahead of the latest published tag.
+
+To build from source (DuckDB + extension are pulled as submodules):
 
 ```sh
 git clone --recurse-submodules https://github.com/teaguesterling/duckdb_zim.git
