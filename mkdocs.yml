@@ -3,37 +3,22 @@ site_description: Read .zim (Kiwix / openZIM) archives directly in DuckDB via li
 site_url: https://duckdb-zim.readthedocs.io/
 repo_url: https://github.com/teaguesterling/duckdb_zim
 repo_name: teaguesterling/duckdb_zim
-edit_uri: edit/main/docs/
 
+# Built-in theme that ships with mkdocs — no third-party theme dependency, which keeps
+# the Read the Docs build dependency-light and reliable.
 theme:
-  name: material
-  palette:
-    - scheme: default
-      primary: indigo
-      toggle:
-        icon: material/weather-night
-        name: Switch to dark mode
-    - scheme: slate
-      primary: indigo
-      toggle:
-        icon: material/weather-sunny
-        name: Switch to light mode
-  features:
-    - navigation.sections
-    - navigation.top
-    - content.code.copy
-    - toc.integrate
+  name: readthedocs
+  highlightjs: true
 
+# Core Python-Markdown extensions only (all bundled with mkdocs — no extra packages).
 markdown_extensions:
   - admonition
   - attr_list
   - tables
+  - fenced_code
+  - codehilite
   - toc:
       permalink: true
-  - pymdownx.highlight:
-      anchor_linenums: true
-  - pymdownx.superfences
-  - pymdownx.inlinehilite
 
 nav:
   - Home: index.md

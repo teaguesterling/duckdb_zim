@@ -1,1 +1,3 @@
-mkdocs-material>=9.5
+# Pinned to a known-good mkdocs; the readthedocs theme ships with mkdocs itself,
+# so no third-party theme dependency is needed.
+mkdocs==1.6.1
