@@ -4,16 +4,15 @@
 #include "zim_archive_pool.hpp"
 
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/main/database.hpp"
 
 #include <filesystem>
 
 namespace duckdb {
 namespace zim_ext {
 
-ArchivePool &ArchivePool::Instance() {
-	static ArchivePool instance;
-	return instance;
-}
+// Single key per DatabaseInstance: the pool holds every archive for that DB.
+static constexpr const char *POOL_KEY = "zim_archive_pool";
 
 // Cache key: an absolute, normalized path so that './x.zim', 'x.zim', and the absolute
 // form all share one warm handle. weakly_canonical tolerates non-existent paths (it
@@ -31,11 +30,6 @@ static std::string CanonicalKey(const std::string &file_path) {
 	}
 }
 
-void ArchivePool::SetDefaultFileSystem(FileSystem *fs) {
-	std::lock_guard<std::mutex> guard(mu_);
-	default_fs_ = fs;
-}
-
 std::shared_ptr<ZimArchive> ArchivePool::Get(const std::string &file_path, FileSystem *fs) {
 	const std::string key = CanonicalKey(file_path);
 	std::lock_guard<std::mutex> guard(mu_);
@@ -43,29 +37,43 @@ std::shared_ptr<ZimArchive> ArchivePool::Get(const std::string &file_path, FileS
 	auto it = cache_.find(key);
 	if (it != cache_.end()) {
 		if (auto existing = it->second.lock()) {
-			return existing; // warm: reuse the open handle + cluster cache
+			Pin(key, existing); // refresh MRU so the warm handle survives the next gap
+			return existing;    // warm: reuse the open handle + cluster cache
 		}
 		cache_.erase(it); // expired weak_ptr
 	}
 
-	// An explicit per-query FileSystem wins; otherwise fall back to the one
-	// registered at extension load so context-free callers still reach remote files.
-	FileSystem *use_fs = fs ? fs : default_fs_;
-
 	// Open with the caller's original path so the error message shows what they passed.
-	auto archive = ZimArchive::Open(file_path, use_fs); // may throw
+	auto archive = ZimArchive::Open(file_path, fs); // may throw
 	cache_[key] = archive;
+	Pin(key, archive);
 	return archive;
 }
 
-void ArchivePool::Evict(const std::string &file_path) {
-	std::lock_guard<std::mutex> guard(mu_);
-	cache_.erase(CanonicalKey(file_path));
+void ArchivePool::Pin(const std::string &key, const std::shared_ptr<ZimArchive> &archive) {
+	// Move-to-front if already pinned; otherwise push to front and evict the LRU
+	// tail. Called under mu_.
+	for (auto it = pinned_.begin(); it != pinned_.end(); ++it) {
+		if (it->first == key) {
+			pinned_.splice(pinned_.begin(), pinned_, it);
+			return;
+		}
+	}
+	pinned_.emplace_front(key, archive);
+	while (pinned_.size() > MAX_PINNED) {
+		pinned_.pop_back(); // drops the strong ref; the archive lives only as long as
+		                    // an in-flight query (or a newer pin) still holds it
+	}
 }
 
-void ArchivePool::Clear() {
-	std::lock_guard<std::mutex> guard(mu_);
-	cache_.clear();
+ArchivePool &GetArchivePool(ClientContext &context) {
+	auto entry = ObjectCache::GetObjectCache(context).GetOrCreate<ZimArchivePoolEntry>(POOL_KEY);
+	return entry->pool;
+}
+
+ArchivePool &GetArchivePool(DatabaseInstance &db) {
+	auto entry = db.GetObjectCache().GetOrCreate<ZimArchivePoolEntry>(POOL_KEY);
+	return entry->pool;
 }
 
 } // namespace zim_ext

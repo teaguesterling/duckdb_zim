@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "utf8proc_wrapper.hpp"
 
 #include "zim_access.hpp"
@@ -19,7 +20,7 @@
 
 namespace duckdb {
 
-using zim_ext::ArchivePool;
+using zim_ext::GetArchivePool;
 using zim_ext::ZimArchive;
 using zim_ext::ZimInfo;
 
@@ -69,10 +70,10 @@ unique_ptr<FunctionData> MetadataBind(ClientContext &, TableFunctionBindInput &i
 	return std::move(bind);
 }
 
-unique_ptr<GlobalTableFunctionState> MetadataInit(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> MetadataInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<MetadataBindData>();
 	auto state = make_uniq<MetadataGlobalState>();
-	state->archive = ArchivePool::Instance().Get(bind.file_path);
+	state->archive = GetArchivePool(context).Get(bind.file_path, &FileSystem::GetFileSystem(context));
 	state->keys = state->archive->MetadataKeys();
 	return std::move(state);
 }
@@ -103,21 +104,23 @@ void MetadataFunction(ClientContext &, TableFunctionInput &data, DataChunk &outp
 // scalar helpers
 //===--------------------------------------------------------------------===//
 
-// Open once per distinct path within a call to avoid repeated pool lookups.
-static std::shared_ptr<ZimArchive> OpenArg(const Vector &file_vec, idx_t row) {
+// Open through the per-DB pool reached from the execution context. `fs` lets the
+// pool open remote (s3/http) archives via byte-range reads; ignored for local paths.
+static std::shared_ptr<ZimArchive> OpenArg(ExpressionState &state, const Vector &file_vec, idx_t row) {
 	auto fp = FlatVector::GetData<string_t>(file_vec)[row].GetString();
-	return ArchivePool::Instance().Get(fp);
+	auto &ctx = state.GetContext();
+	return GetArchivePool(ctx).Get(fp, &FileSystem::GetFileSystem(ctx));
 }
 
 // zim_metadata(file, key) -> VARCHAR
-void ZimMetadataScalar(DataChunk &args, ExpressionState &, Vector &result) {
+void ZimMetadataScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &files = args.data[0];
 	auto &keys = args.data[1];
 	files.Flatten(args.size());
 	keys.Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = OpenArg(files, i);
+		auto archive = OpenArg(state, files, i);
 		auto key = FlatVector::GetData<string_t>(keys)[i].GetString();
 		auto v = archive->Metadata(key);
 		if (v.has_value() && IsValidUtf8(*v)) {
@@ -131,12 +134,12 @@ void ZimMetadataScalar(DataChunk &args, ExpressionState &, Vector &result) {
 }
 
 // zim_metadata_keys(file) -> LIST(VARCHAR)
-void ZimMetadataKeysScalar(DataChunk &args, ExpressionState &, Vector &result) {
+void ZimMetadataKeysScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &files = args.data[0];
 	files.Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = OpenArg(files, i);
+		auto archive = OpenArg(state, files, i);
 		vector<Value> keys;
 		for (auto &k : archive->MetadataKeys()) {
 			keys.emplace_back(Value(k));
@@ -146,12 +149,12 @@ void ZimMetadataKeysScalar(DataChunk &args, ExpressionState &, Vector &result) {
 }
 
 // zim_counter(file) -> MAP(VARCHAR, BIGINT)
-void ZimCounterScalar(DataChunk &args, ExpressionState &, Vector &result) {
+void ZimCounterScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &files = args.data[0];
 	files.Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = OpenArg(files, i);
+		auto archive = OpenArg(state, files, i);
 		vector<Value> keys, vals;
 		for (auto &kv : archive->Counter()) {
 			keys.emplace_back(Value(kv.first));
@@ -162,12 +165,12 @@ void ZimCounterScalar(DataChunk &args, ExpressionState &, Vector &result) {
 }
 
 // zim_info(file) -> STRUCT(...)
-void ZimInfoScalar(DataChunk &args, ExpressionState &, Vector &result) {
+void ZimInfoScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &files = args.data[0];
 	files.Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = OpenArg(files, i);
+		auto archive = OpenArg(state, files, i);
 		ZimInfo info = archive->Info();
 		child_list_t<Value> fields;
 		fields.emplace_back("uuid", Value(info.uuid));

@@ -41,7 +41,7 @@
 
 namespace duckdb {
 
-using zim_ext::ArchivePool;
+using zim_ext::GetArchivePool;
 using zim_ext::NormalizeContentPath;
 using zim_ext::ScanSpec;
 using zim_ext::ZimArchive;
@@ -114,6 +114,12 @@ public:
 
 class ZimFileSystem : public FileSystem {
 public:
+	// Captures its owning DatabaseInstance (the VFS is registered per-DB) so the
+	// context-free FileSystem methods below can reach that DB's archive pool. The
+	// reference is only dereferenced while serving queries, never at teardown.
+	explicit ZimFileSystem(DatabaseInstance &db) : db(db) {
+	}
+
 	bool CanHandleFile(const string &fpath) override {
 		return StringUtil::StartsWith(fpath, ZIM_SCHEME);
 	}
@@ -131,7 +137,7 @@ public:
 		if (!TryParseZimUrl(path, parsed) || parsed.content.empty()) {
 			throw IOException("Invalid zim:// path '%s' (expected zim://<archive>.zim/<content-path>)", path);
 		}
-		auto archive = ArchivePool::Instance().Get(parsed.archive);
+		auto archive = GetArchivePool(db).Get(parsed.archive);
 		// GetContent follows redirects (a redirect entry serves its target's
 		// bytes, like a symlink) and returns nullopt only when the path is absent.
 		auto data = archive->GetContent(parsed.content);
@@ -194,7 +200,7 @@ public:
 			return false;
 		}
 		try {
-			auto archive = ArchivePool::Instance().Get(parsed.archive);
+			auto archive = GetArchivePool(db).Get(parsed.archive);
 			return archive->HasEntry(parsed.content);
 		} catch (...) {
 			return false;
@@ -213,7 +219,7 @@ public:
 		}
 		std::shared_ptr<ZimArchive> archive;
 		try {
-			archive = ArchivePool::Instance().Get(parsed.archive);
+			archive = GetArchivePool(db).Get(parsed.archive);
 		} catch (...) {
 			return result; // unopenable archive -> no matches
 		}
@@ -241,13 +247,16 @@ public:
 		}
 		return result;
 	}
+
+private:
+	DatabaseInstance &db; // owning DB; source of this VFS's archive pool
 };
 
 } // namespace
 
 void RegisterZimFilesystem(ExtensionLoader &loader) {
-	auto &fs = FileSystem::GetFileSystem(loader.GetDatabaseInstance());
-	fs.RegisterSubSystem(make_uniq<ZimFileSystem>());
+	auto &db = loader.GetDatabaseInstance();
+	FileSystem::GetFileSystem(db).RegisterSubSystem(make_uniq<ZimFileSystem>(db));
 }
 
 } // namespace duckdb

@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "utf8proc_wrapper.hpp"
 
 #include "zim_access.hpp"
@@ -17,7 +18,7 @@
 
 namespace duckdb {
 
-using zim_ext::ArchivePool;
+using zim_ext::GetArchivePool;
 using zim_ext::ZimArchive;
 
 namespace {
@@ -26,9 +27,12 @@ static bool IsValidUtf8(const std::string &s) {
 	return Utf8Proc::IsValid(s.data(), s.size());
 }
 
-static std::shared_ptr<ZimArchive> Open(const Vector &files, idx_t row) {
+// Open through the per-DB pool reached from the execution context. `fs` lets the
+// pool open remote (s3/http) archives via byte-range reads; ignored for local paths.
+static std::shared_ptr<ZimArchive> Open(ExpressionState &state, const Vector &files, idx_t row) {
 	auto fp = FlatVector::GetData<string_t>(files)[row].GetString();
-	return ArchivePool::Instance().Get(fp);
+	auto &ctx = state.GetContext();
+	return GetArchivePool(ctx).Get(fp, &FileSystem::GetFileSystem(ctx));
 }
 
 static bool LooksLikeText(const std::string &mimetype) {
@@ -40,12 +44,12 @@ static bool LooksLikeText(const std::string &mimetype) {
 	       mimetype.find("xml") != std::string::npos; // includes image/svg+xml
 }
 
-void GetContent(DataChunk &args, ExpressionState &, Vector &result) {
+void GetContent(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	args.data[1].Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = Open(args.data[0], i);
+		auto archive = Open(state, args.data[0], i);
 		auto path = FlatVector::GetData<string_t>(args.data[1])[i].GetString();
 		auto content = archive->GetContent(path);
 		if (content.has_value()) {
@@ -56,12 +60,12 @@ void GetContent(DataChunk &args, ExpressionState &, Vector &result) {
 	}
 }
 
-void GetText(DataChunk &args, ExpressionState &, Vector &result) {
+void GetText(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	args.data[1].Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = Open(args.data[0], i);
+		auto archive = Open(state, args.data[0], i);
 		auto path = FlatVector::GetData<string_t>(args.data[1])[i].GetString();
 		auto mime = archive->GetMimetype(path);
 		if (!mime.has_value() || !LooksLikeText(*mime)) {
@@ -79,23 +83,23 @@ void GetText(DataChunk &args, ExpressionState &, Vector &result) {
 	}
 }
 
-void HasEntry(DataChunk &args, ExpressionState &, Vector &result) {
+void HasEntry(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	args.data[1].Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = Open(args.data[0], i);
+		auto archive = Open(state, args.data[0], i);
 		auto path = FlatVector::GetData<string_t>(args.data[1])[i].GetString();
 		result.SetValue(i, Value::BOOLEAN(archive->HasEntry(path)));
 	}
 }
 
-void RedirectTarget(DataChunk &args, ExpressionState &, Vector &result) {
+void RedirectTarget(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	args.data[1].Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = Open(args.data[0], i);
+		auto archive = Open(state, args.data[0], i);
 		auto path = FlatVector::GetData<string_t>(args.data[1])[i].GetString();
 		auto target = archive->GetRedirectTarget(path);
 		if (target.has_value()) {
@@ -106,12 +110,12 @@ void RedirectTarget(DataChunk &args, ExpressionState &, Vector &result) {
 	}
 }
 
-void Mimetype(DataChunk &args, ExpressionState &, Vector &result) {
+void Mimetype(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	args.data[1].Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = Open(args.data[0], i);
+		auto archive = Open(state, args.data[0], i);
 		auto path = FlatVector::GetData<string_t>(args.data[1])[i].GetString();
 		auto mime = archive->GetMimetype(path);
 		if (mime.has_value()) {
@@ -122,11 +126,11 @@ void Mimetype(DataChunk &args, ExpressionState &, Vector &result) {
 	}
 }
 
-void MainEntry(DataChunk &args, ExpressionState &, Vector &result) {
+void MainEntry(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = Open(args.data[0], i);
+		auto archive = Open(state, args.data[0], i);
 		auto path = archive->MainEntryPath();
 		if (path.empty()) {
 			FlatVector::SetNull(result, i, true);
@@ -137,11 +141,11 @@ void MainEntry(DataChunk &args, ExpressionState &, Vector &result) {
 }
 
 // zim_random(file) -> VARCHAR : a random content entry's path
-void Random(DataChunk &args, ExpressionState &, Vector &result) {
+void Random(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = Open(args.data[0], i);
+		auto archive = Open(state, args.data[0], i);
 		auto path = archive->RandomPath();
 		if (path.empty()) {
 			FlatVector::SetNull(result, i, true);
@@ -152,17 +156,17 @@ void Random(DataChunk &args, ExpressionState &, Vector &result) {
 }
 
 // zim_check(file) -> BOOLEAN : libzim archive integrity check
-void Check(DataChunk &args, ExpressionState &, Vector &result) {
+void Check(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = Open(args.data[0], i);
+		auto archive = Open(state, args.data[0], i);
 		result.SetValue(i, Value::BOOLEAN(archive->CheckIntegrity()));
 	}
 }
 
 // zim_illustration(file[, size]) -> BLOB : the archive's cover/favicon PNG (default 48px)
-void Illustration(DataChunk &args, ExpressionState &, Vector &result) {
+void Illustration(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	const bool has_size = args.ColumnCount() > 1;
 	args.data[0].Flatten(args.size());
@@ -170,7 +174,7 @@ void Illustration(DataChunk &args, ExpressionState &, Vector &result) {
 		args.data[1].Flatten(args.size());
 	}
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = Open(args.data[0], i);
+		auto archive = Open(state, args.data[0], i);
 		unsigned int size = 48;
 		if (has_size && FlatVector::Validity(args.data[1]).RowIsValid(i)) {
 			size = static_cast<unsigned int>(FlatVector::GetData<int32_t>(args.data[1])[i]);

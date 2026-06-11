@@ -1,65 +1,105 @@
 //===----------------------------------------------------------------------===//
 // zim_archive_pool.hpp
 //
-// Process-wide cache of open ZimArchive handles keyed by canonical file path.
-// This is the design's load-bearing decision (DESIGN §6): keeping a handle open
-// keeps libzim's decompressed-cluster cache warm across queries, and it is a
-// property of the POOL, not of ATTACH. The read_zim table function, the scalar
-// functions, the (future) zim:// filesystem, and a (future) ATTACH all pull
-// from here, so they share one open handle and one warm cache per file.
+// Per-DatabaseInstance cache of open ZimArchive handles keyed by canonical file
+// path. Keeping a handle open keeps libzim's decompressed-cluster cache warm
+// across queries (DESIGN §6), and it is a property of the POOL, not of ATTACH.
+// The read_zim table function, the scalar functions, the zim:// filesystem, and
+// a (future) ATTACH all pull from here, so they share one open handle and one
+// warm cache per file.
 //
-// Archives are held by weak_ptr: while any query holds a shared_ptr the handle
-// (and its cache) stays alive; once all consumers drop it, libzim frees it.
-// An optional strong-ref pin can be added later if we want to keep N archives
-// hot regardless of in-flight queries.
+// LIFETIME — why the pool lives in the DB's ObjectCache, not a process-static
+// singleton:
+//   The pool's strong-ref pin (below) keeps a remote archive's httpfs FileHandle
+//   alive. A process-static singleton is destroyed at static-destruction time,
+//   AFTER DuckDB has torn down its FileSystem, so closing that handle touches
+//   dead state and the process hangs on exit. DuckDB's ObjectCache is the blessed
+//   fix: DatabaseInstance::~DatabaseInstance() calls object_cache.reset() in the
+//   destructor BODY (database.cpp), before its `config` member (which owns the
+//   VirtualFileSystem, and thus httpfs) is destroyed. So entries are released
+//   while the FileSystem is still alive. Scoping per-DB also stops one DB from
+//   handing another DB's FileSystem-bound handle out of a shared global.
+//
+// Archives are held by weak_ptr; while any query holds a shared_ptr the handle
+// (and its cache) stays alive. A bounded strong-ref LRU (Pin) keeps the last few
+// hot regardless of in-flight queries — cheap for local mmap, valuable for remote
+// (avoids a fresh httpfs connection + header/dirent re-read per call).
 //===----------------------------------------------------------------------===//
 #pragma once
 
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
+
+#include "duckdb/storage/object_cache.hpp"
 
 #include "zim_access.hpp"
 
 namespace duckdb {
+class ClientContext;
+class DatabaseInstance;
+class FileSystem;
+
 namespace zim_ext {
 
 class ArchivePool {
 public:
-	static ArchivePool &Instance();
+	ArchivePool() = default;
 
 	// Returns an open archive for `file_path`, opening it if necessary. Throws
-	// std::runtime_error if the file cannot be opened. Path is canonicalized by
-	// the caller's filesystem semantics before keying (the binding layer passes
-	// the already-resolved path).
+	// std::runtime_error if the file cannot be opened.
 	//
 	// `fs` is only used when `file_path` is a remote URL and the entry isn't
 	// already warm: the archive is then opened through a DuckDB FileHandle
-	// (byte-range reads). Local paths ignore it. Callers with a ClientContext
-	// pass &FileSystem::GetFileSystem(context); context-free callers may omit it
-	// (remote opens then fail with a clear error).
+	// (byte-range reads). Local paths ignore it. Callers obtain `fs` from the same
+	// source they obtained this pool (the ClientContext / DatabaseInstance).
 	std::shared_ptr<ZimArchive> Get(const std::string &file_path, FileSystem *fs = nullptr);
 
-	// Register the database's FileSystem so that *any* consumer (including the
-	// scalar functions, which have no ClientContext at the row level) can open a
-	// remote archive without threading a FileSystem through every call. The
-	// VirtualFileSystem httpfs registers into is per-DatabaseInstance and stable
-	// for its lifetime, and is the same object FileSystem::GetFileSystem(context)
-	// returns. Set once from the extension's Load. An explicit `fs` passed to
-	// Get() still takes precedence.
-	void SetDefaultFileSystem(FileSystem *fs);
-
-	// Drop the cache entry for a path (e.g. on DETACH or explicit invalidation).
-	void Evict(const std::string &file_path);
-	void Clear();
-
 private:
-	ArchivePool() = default;
+	// Hold a strong reference to the most-recently-used archives so they (and their
+	// libzim cluster caches) survive between calls/queries. Most-recent at the front.
+	void Pin(const std::string &key, const std::shared_ptr<ZimArchive> &archive);
+
 	std::mutex mu_;
 	std::unordered_map<std::string, std::weak_ptr<ZimArchive>> cache_;
-	FileSystem *default_fs_ = nullptr; // set at extension load; used for remote opens
+	// Bounded LRU of strong refs. Without this, archives are weak_ptr-only and are
+	// freed the instant no query holds them — so the next call reopens. Cheap for a
+	// local mmap but expensive for a remote archive (new httpfs connection +
+	// header/dirent re-read). Pinning the last few keeps remote handles (and their
+	// keep-alive connections) and decompressed-cluster caches warm.
+	static constexpr size_t MAX_PINNED = 4;
+	std::list<std::pair<std::string, std::shared_ptr<ZimArchive>>> pinned_; // front = MRU
 };
+
+// ObjectCacheEntry wrapper that owns one ArchivePool, scoped to a DatabaseInstance.
+// Non-evictable (GetEstimatedCacheMemory returns an invalid index): it is released
+// only when the DB's ObjectCache is cleared at DatabaseInstance teardown — which
+// happens before the FileSystem is destroyed, so any pinned remote handle closes
+// cleanly. MAX_PINNED already bounds its memory, so it skips the buffer-pool path.
+class ZimArchivePoolEntry : public ObjectCacheEntry {
+public:
+	ArchivePool pool;
+
+	static std::string ObjectType() {
+		return "zim_archive_pool";
+	}
+	std::string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // invalid => non-evictable, lives for the DB's lifetime
+	}
+};
+
+// Reach the per-DatabaseInstance pool. Both overloads resolve to the same
+// ObjectCache entry on the owning DatabaseInstance. Use the ClientContext form
+// from table/scalar functions; the DatabaseInstance form from the zim:// VFS,
+// whose FileSystem methods receive no ClientContext.
+ArchivePool &GetArchivePool(ClientContext &context);
+ArchivePool &GetArchivePool(DatabaseInstance &db);
 
 } // namespace zim_ext
 } // namespace duckdb
