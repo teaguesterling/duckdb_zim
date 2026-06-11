@@ -24,6 +24,9 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
 #include "utf8proc_wrapper.hpp"
 
 #include "zim_access.hpp"
@@ -97,6 +100,12 @@ struct ReadZimGlobalState : public GlobalTableFunctionState {
 	ScanSpec scan_spec;               // bind.spec + want_content; shared by cursor and ScanIndex
 	idx_t max_threads = 1;
 	FileSystem *fs = nullptr; // for remote (s3/http) opens; set at InitGlobal from the context
+
+	// Exact-lookup parameters. Seeded from bind (path:=/title:=) and possibly set by
+	// a pushed-down `WHERE path = const` / `WHERE title = const` at init.
+	bool single_lookup = false;
+	bool lookup_by_title = false;
+	std::string lookup_key;
 
 	// --- serial (Lookup / SerialScan): sequential file/cursor state machine ---
 	idx_t file_idx = 0;
@@ -324,7 +333,7 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 static void OpenCurrentFile(ReadZimGlobalState &g, const ReadZimBindData &bind) {
 	g.archive = ArchivePool::Instance().Get(g.files[g.file_idx], g.fs); // may throw
 	g.lookup_emitted = false;
-	if (!bind.single_lookup) {
+	if (!g.single_lookup) {
 		g.cursor = make_uniq<ZimScanCursor>(g.archive->Scan(g.scan_spec));
 	}
 }
@@ -337,6 +346,79 @@ static void AdvanceFile(ReadZimGlobalState &g, const ReadZimBindData &bind) {
 	} else {
 		g.archive.reset();
 		g.cursor.reset();
+	}
+}
+
+// --- filter pushdown -------------------------------------------------------
+// We register read_zim with filter_pushdown = true but leave filter_prune off,
+// so DuckDB still re-applies every WHERE filter above the scan. This pushdown is
+// therefore a pure read-reduction optimization: at worst a case we don't handle
+// just scans more than necessary; it can never change the result set.
+//
+// Handled: `path = const` / `title = const` -> exact libzim lookup (the big win,
+// especially remote — a few KB instead of a full dirent scan); `mimetype = const`
+// or `mimetype IN (...)` -> the existing Accept-style post-filter. LIKE/prefix,
+// IN on path/title, and ranges are left for DuckDB to apply (future work).
+
+// `col = <varchar const>` -> sets `out`, returns true.
+static bool FilterEqualityString(const TableFilter &filter, std::string &out) {
+	if (filter.filter_type != TableFilterType::CONSTANT_COMPARISON) {
+		return false;
+	}
+	auto &cf = filter.Cast<ConstantFilter>();
+	if (cf.comparison_type != ExpressionType::COMPARE_EQUAL || cf.constant.IsNull() ||
+	    cf.constant.type().id() != LogicalTypeId::VARCHAR) {
+		return false;
+	}
+	out = cf.constant.GetValue<std::string>();
+	return true;
+}
+
+// Append the varchar constants of an equality or IN filter to `out`.
+static void CollectMimetypeConstants(const TableFilter &filter, std::vector<std::string> &out) {
+	if (filter.filter_type == TableFilterType::CONSTANT_COMPARISON) {
+		auto &cf = filter.Cast<ConstantFilter>();
+		if (cf.comparison_type == ExpressionType::COMPARE_EQUAL && !cf.constant.IsNull() &&
+		    cf.constant.type().id() == LogicalTypeId::VARCHAR) {
+			out.push_back(cf.constant.GetValue<std::string>());
+		}
+	} else if (filter.filter_type == TableFilterType::IN_FILTER) {
+		for (auto &v : filter.Cast<InFilter>().values) {
+			if (!v.IsNull() && v.type().id() == LogicalTypeId::VARCHAR) {
+				out.push_back(v.GetValue<std::string>());
+			}
+		}
+	}
+}
+
+static void ApplyPushedFilters(ReadZimGlobalState &g, TableFunctionInitInput &input) {
+	if (!input.filters) {
+		return;
+	}
+	// Only a plain path-order full scan may be redirected to a lookup; a named
+	// path:=/title:=/prefix/listing keeps its mode (the WHERE filter then just
+	// rides as a DuckDB post-filter, which is already applied above the scan).
+	const bool scan_is_open = !g.single_lookup && !g.scan_spec.path_prefix.has_value() &&
+	                          !g.scan_spec.title_prefix.has_value() && g.scan_spec.order == ScanOrder::ByPath;
+	// filters are keyed by *projected* (output) column index; map back to storage.
+	for (auto &entry : input.filters->filters) {
+		const idx_t proj_idx = entry.first;
+		if (proj_idx >= g.column_ids.size()) {
+			continue;
+		}
+		const column_t storage_col = g.column_ids[proj_idx];
+		const TableFilter &filter = *entry.second;
+		if (storage_col == COL_MIMETYPE) {
+			CollectMimetypeConstants(filter, g.scan_spec.mimetype_filter);
+		} else if (scan_is_open && !g.single_lookup && (storage_col == COL_PATH || storage_col == COL_TITLE)) {
+			std::string key;
+			if (FilterEqualityString(filter, key)) {
+				g.single_lookup = true;
+				g.lookup_by_title = (storage_col == COL_TITLE);
+				g.lookup_key = std::move(key);
+				g.mode = ScanMode::Lookup;
+			}
+		}
 	}
 }
 
@@ -361,7 +443,16 @@ unique_ptr<GlobalTableFunctionState> ReadZimInitGlobal(ClientContext &context, T
 	state->scan_spec = bind.spec;
 	state->scan_spec.want_content = state->want_content;
 
-	if (bind.mode == ScanMode::ParallelScan) {
+	// Seed lookup params from the bind (path:=/title:=), then let a pushed-down
+	// WHERE path/title = const turn a plain full scan into an exact lookup and
+	// add any WHERE mimetype to the post-filter. This may flip state->mode to
+	// Lookup, so resolve max_threads / open the first file *after* it runs.
+	state->single_lookup = bind.single_lookup;
+	state->lookup_by_title = bind.lookup_by_title;
+	state->lookup_key = bind.lookup_key;
+	ApplyPushedFilters(*state, input);
+
+	if (state->mode == ScanMode::ParallelScan) {
 		// Use DuckDB's configured thread count; morsels (and their archives) are
 		// dispensed lazily, so nothing is opened until a thread asks for work.
 		state->max_threads = MaxValue<idx_t>(1, (idx_t)TaskScheduler::GetScheduler(context).NumberOfThreads());
@@ -458,22 +549,22 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 	// --- serial: exact lookup, or a single cursor (prefix range / title listing) ---
 	idx_t count = 0;
 	while (count < STANDARD_VECTOR_SIZE && gstate.file_idx < gstate.files.size()) {
-		if (bind.single_lookup) {
+		if (gstate.single_lookup) {
 			// Per-file exact lookup: emit at most one row for the current archive, then
 			// move on. An exact path present in N archives therefore emits N rows.
 			if (!gstate.lookup_emitted) {
 				gstate.lookup_emitted = true;
-				auto row = bind.lookup_by_title ? gstate.archive->GetByTitle(bind.lookup_key, gstate.want_content)
-				                                : gstate.archive->GetByPath(bind.lookup_key, gstate.want_content);
+				auto row = gstate.lookup_by_title ? gstate.archive->GetByTitle(gstate.lookup_key, gstate.want_content)
+				                                  : gstate.archive->GetByPath(gstate.lookup_key, gstate.want_content);
 				// Apply the include_content mimetype gate to the single fetched row,
 				// matching the scan path: a non-matching entry keeps its metadata but
 				// reports NULL content.
-				if (row.has_value() && row->content_loaded && !bind.spec.content_mimetypes.empty() &&
-				    !MimetypeAccepted(bind.spec.content_mimetypes, row->mimetype)) {
+				if (row.has_value() && row->content_loaded && !gstate.scan_spec.content_mimetypes.empty() &&
+				    !MimetypeAccepted(gstate.scan_spec.content_mimetypes, row->mimetype)) {
 					row->content.clear();
 					row->content_loaded = false;
 				}
-				if (row.has_value() && MimetypeAccepted(bind.spec.mimetype_filter, row->mimetype)) {
+				if (row.has_value() && MimetypeAccepted(gstate.scan_spec.mimetype_filter, row->mimetype)) {
 					EmitRow(bind, gstate, *row, gstate.files[gstate.file_idx], output, count);
 					count++;
 				}
@@ -528,6 +619,10 @@ void RegisterReadZim(ExtensionLoader &loader) {
 		f.named_parameters["title_prefix"] = LogicalType::VARCHAR;
 		f.named_parameters["listing"] = LogicalType::VARCHAR;
 		f.projection_pushdown = true;
+		// Push WHERE path/title = const down to an exact libzim lookup, and WHERE
+		// mimetype down to the post-filter. filter_prune stays off, so DuckDB still
+		// re-applies every filter — pushdown is a pure read-reduction optimization.
+		f.filter_pushdown = true;
 		return f;
 	};
 
