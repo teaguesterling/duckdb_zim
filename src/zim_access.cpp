@@ -9,6 +9,7 @@
 // libzim version; the behavior is settled, only the exact spelling may drift.
 //===----------------------------------------------------------------------===//
 #include "zim_access.hpp"
+#include "zim_remote.hpp" // DuckdbZimRemoteReader + FileSystem (remote opens)
 
 #include <stdexcept>
 #include <utility> // std::declval, for the EntryRange iterator type alias
@@ -181,9 +182,18 @@ bool ZimScanCursor::Next(ZimEntry &out) {
 // ZimArchive
 //===--------------------------------------------------------------------===//
 
-ZimArchive::ZimArchive(const std::string &file_path) : file_path_(file_path) {
+ZimArchive::ZimArchive(const std::string &file_path, FileSystem *fs) : file_path_(file_path) {
 	try {
-		archive_ = std::make_unique<zim::Archive>(file_path);
+		if (fs && FileSystem::IsRemoteFile(file_path)) {
+			// Remote archive: read byte ranges through a DuckDB FileHandle. The
+			// zim::Archive holds the reader alive (StreamFileReader keeps a
+			// shared_ptr to it), so we don't store it separately here.
+			auto reader = std::make_shared<DuckdbZimRemoteReader>(*fs, file_path);
+			archive_ = std::make_unique<zim::Archive>(reader);
+		} else {
+			// Local archive: libzim opens the file directly (mmap fast path).
+			archive_ = std::make_unique<zim::Archive>(file_path);
+		}
 	} catch (const std::exception &e) {
 		throw std::runtime_error("failed to open ZIM '" + file_path + "': " + e.what());
 	}
@@ -191,9 +201,9 @@ ZimArchive::ZimArchive(const std::string &file_path) : file_path_(file_path) {
 
 ZimArchive::~ZimArchive() = default;
 
-std::shared_ptr<ZimArchive> ZimArchive::Open(const std::string &file_path) {
+std::shared_ptr<ZimArchive> ZimArchive::Open(const std::string &file_path, FileSystem *fs) {
 	// Cannot std::make_shared with a private ctor; wrap explicitly.
-	return std::shared_ptr<ZimArchive>(new ZimArchive(file_path));
+	return std::shared_ptr<ZimArchive>(new ZimArchive(file_path, fs));
 }
 
 ZimInfo ZimArchive::Info() const {

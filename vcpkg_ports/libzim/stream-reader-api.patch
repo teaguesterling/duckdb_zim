@@ -1,0 +1,449 @@
+diff --git a/include/zim/archive.h b/include/zim/archive.h
+index 6442c75..d66e2e7 100644
+--- a/include/zim/archive.h
++++ b/include/zim/archive.h
+@@ -25,6 +25,7 @@
+ #include "zim.h"
+ #include "entry.h"
+ #include "illustration.h"
++#include "irandomaccessreader.h"
+ #include "uuid.h"
+ 
+ #include <string>
+@@ -256,6 +257,32 @@ namespace zim
+       Archive(const std::vector<FdInput>& fds, OpenConfig openConfig);
+ #endif
+ 
++      /** Archive constructor from a user-provided random-access reader.
++       *
++       *  Construct an archive whose bytes are served by an
++       *  IRandomAccessReader implementation rather than a local file. This
++       *  allows reading a ZIM from arbitrary storage -- for example a remote
++       *  object fetched over HTTP/S3 with byte-range requests -- so that only
++       *  the bytes a given operation touches are retrieved.
++       *
++       *  The reader is retained for the lifetime of the archive and may be
++       *  read from concurrently (see IRandomAccessReader threading notes).
++       *
++       *  Limitation: only single-part archives are supported, and full-text
++       *  (Xapian) search is unavailable through this path (the Xapian index
++       *  requires direct file access). All other access works normally.
++       *
++       *  @param reader The random-access byte source for the archive.
++       */
++      explicit Archive(std::shared_ptr<IRandomAccessReader> reader);
++
++      /** Archive constructor from a user-provided random-access reader.
++       *
++       *  @param reader The random-access byte source for the archive.
++       *  @param openConfig The open configuration to use.
++       */
++      Archive(std::shared_ptr<IRandomAccessReader> reader, OpenConfig openConfig);
++
+       /** Return the real path of the file(s) underlying this ZIM archive.
+        *
+        * In case of a regular (single-piece) ZIM file, returns the path of that
+diff --git a/include/zim/irandomaccessreader.h b/include/zim/irandomaccessreader.h
+new file mode 100644
+index 0000000..d313b0f
+--- /dev/null
++++ b/include/zim/irandomaccessreader.h
+@@ -0,0 +1,73 @@
++/*
++ * Copyright (C) 2026 Teague Sterling
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * is provided AS IS, WITHOUT ANY WARRANTY; without even the implied
++ * warranty of MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, and
++ * NON-INFRINGEMENT.  See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
++ *
++ */
++
++#ifndef ZIM_IRANDOMACCESSREADER_H
++#define ZIM_IRANDOMACCESSREADER_H
++
++#include "zim.h"
++
++namespace zim
++{
++
++/**
++ * A user-providable source of positioned (random-access) reads over a single
++ * ZIM archive.
++ *
++ * Implement this interface to let libzim read a ZIM file from arbitrary storage
++ * that is not a local file descriptor -- for example a remote object fetched
++ * over HTTP/S3 with byte-range requests. Pass an instance to the
++ * Archive(std::shared_ptr<IRandomAccessReader>, OpenConfig) constructor.
++ *
++ * The whole archive is presented as a single contiguous byte range
++ * [0, getSize()). libzim issues positioned reads against it on demand, so only
++ * the bytes that a given operation touches need to be fetched.
++ *
++ * Threading: libzim may call readAt() concurrently from multiple threads.
++ * Implementations must make readAt() safe for concurrent use.
++ *
++ * Limitation: full-text (Xapian) search is not available through this path. The
++ * Xapian index is opened by libzim via a direct file descriptor into the ZIM,
++ * which a custom reader cannot provide; search operations simply return no
++ * results. All other access (enumeration, lookup, content, metadata, prefix
++ * suggestions) works normally.
++ */
++class LIBZIM_API IRandomAccessReader
++{
++  public:
++    virtual ~IRandomAccessReader();
++
++    /** The total size, in bytes, of the archive exposed by this reader. */
++    virtual size_type getSize() const = 0;
++
++    /**
++     * Read exactly `size` bytes starting at byte `offset` into `dest`.
++     *
++     * `dest` must point to a buffer of at least `size` bytes. The range
++     * [offset, offset+size) is always within [0, getSize()). Implementations
++     * must throw (e.g. std::runtime_error) if the requested bytes cannot be
++     * fully retrieved; a short read is an error, not a partial success.
++     *
++     * Must be safe to call concurrently from multiple threads.
++     */
++    virtual void readAt(char* dest, offset_type offset, size_type size) const = 0;
++};
++
++} // namespace zim
++
++#endif // ZIM_IRANDOMACCESSREADER_H
+diff --git a/include/zim/meson.build b/include/zim/meson.build
+index 42d98f2..82fe012 100644
+--- a/include/zim/meson.build
++++ b/include/zim/meson.build
+@@ -6,6 +6,7 @@ install_headers(
+     'blob.h',
+     'error.h',
+     'illustration.h',
++    'irandomaccessreader.h',
+     'item.h',
+     'entry.h',
+     'uuid.h',
+diff --git a/src/archive.cpp b/src/archive.cpp
+index a9addfc..19eb202 100644
+--- a/src/archive.cpp
++++ b/src/archive.cpp
+@@ -26,6 +26,7 @@
+ #include <zim/error.h>
+ #include <zim/tools.h>
+ #include "fileimpl.h"
++#include "file_reader.h"
+ #include "tools.h"
+ #include "log.h"
+ 
+@@ -81,6 +82,16 @@ namespace zim
+     { }
+ #endif
+ 
++  Archive::Archive(std::shared_ptr<IRandomAccessReader> reader)
++    : Archive(reader, OpenConfig())
++    { }
++
++  Archive::Archive(std::shared_ptr<IRandomAccessReader> reader, OpenConfig openConfig)
++    : m_impl(new FileImpl(
++        std::make_shared<StreamFileReader>(reader, offset_t(0), zsize_t(reader->getSize())),
++        std::string(), openConfig))
++    { }
++
+   const std::string& Archive::getFilename() const
+   {
+     return m_impl->getFilename();
+diff --git a/src/file_reader.cpp b/src/file_reader.cpp
+index 1bc7481..78b6430 100644
+--- a/src/file_reader.cpp
++++ b/src/file_reader.cpp
+@@ -299,4 +299,62 @@ FileReader::sub_reader(offset_t offset, zsize_t size) const
+   return std::unique_ptr<const Reader>(new FileReader(_fhandle, _offset + offset, size));
+ }
+ 
++////////////////////////////////////////////////////////////////////////////////
++// StreamFileReader
++////////////////////////////////////////////////////////////////////////////////
++
++StreamFileReader::StreamFileReader(std::shared_ptr<const IRandomAccessReader> source, offset_t offset, zsize_t size)
++  : BaseFileReader(offset, size)
++    , m_source(source)
++{
++}
++
++char StreamFileReader::readImpl(offset_t offset) const
++{
++  offset += _offset;
++  char ret;
++  try {
++    m_source->readAt(&ret, offset.v, 1);
++  } catch (std::runtime_error& e) {
++    Formatter fmt;
++    fmt << "Cannot read a char.\n";
++    fmt << " - Reading offset at " << offset.v << "\n";
++    fmt << " - error is " << e.what() << "\n";
++    throwSystemError(fmt);
++  };
++  return ret;
++}
++
++void StreamFileReader::readImpl(char* dest, offset_t offset, zsize_t size) const
++{
++  offset += _offset;
++  try {
++    m_source->readAt(dest, offset.v, size.v);
++  } catch (std::runtime_error& e) {
++    Formatter fmt;
++    fmt << "Cannot read chars.\n";
++    fmt << " - Reading offset at " << offset.v << "\n";
++    fmt << " - size is " << size.v << "\n";
++    fmt << " - error is " << e.what() << "\n";
++    throwSystemError(fmt);
++  };
++}
++
++const Buffer StreamFileReader::get_mmap_buffer(offset_t offset, zsize_t size) const {
++#ifdef ENABLE_USE_MMAP
++  // A user-provided reader has no file descriptor to mmap. Fall back to the
++  // allocate-and-read path in BaseFileReader::get_buffer.
++  throw MMapException();
++#else
++  return Buffer::makeBuffer(size); // unreachable; get_buffer never calls this when mmap is off
++#endif
++}
++
++std::unique_ptr<const Reader>
++StreamFileReader::sub_reader(offset_t offset, zsize_t size) const
++{
++  ASSERT(offset.v+size.v, <=, _size.v);
++  return std::unique_ptr<const Reader>(new StreamFileReader(m_source, _offset + offset, size));
++}
++
+ } // zim
+diff --git a/src/file_reader.h b/src/file_reader.h
+index 5218ff6..346ddf0 100644
+--- a/src/file_reader.h
++++ b/src/file_reader.h
+@@ -23,6 +23,7 @@
+ 
+ #include "reader.h"
+ #include "fs.h"
++#include <zim/irandomaccessreader.h>
+ 
+ namespace zim {
+ 
+@@ -87,6 +88,28 @@ class LIBZIM_PRIVATE_API FileReader : public BaseFileReader {
+     FileHandle _fhandle;
+ };
+ 
++// Adapter that turns a user-provided IRandomAccessReader (positioned reads over
++// an opaque byte source, e.g. a remote HTTP/S3 object) into a libzim Reader.
++// Modeled on FileReader, but reads through IRandomAccessReader::readAt instead
++// of a file descriptor and never mmaps (get_mmap_buffer always defers to the
++// allocate-and-read fallback in BaseFileReader::get_buffer).
++class LIBZIM_PRIVATE_API StreamFileReader : public BaseFileReader {
++  public: // functions
++    StreamFileReader(std::shared_ptr<const IRandomAccessReader> source,
++                     offset_t offset, zsize_t size);
++    ~StreamFileReader() = default;
++
++    const Buffer get_mmap_buffer(offset_t offset, zsize_t size) const override;
++    std::unique_ptr<const Reader> sub_reader(offset_t offset, zsize_t size) const override;
++
++  private: // functions
++    char readImpl(offset_t offset) const override;
++    void readImpl(char *dest, offset_t offset, zsize_t size) const override;
++
++  private: // data
++    std::shared_ptr<const IRandomAccessReader> m_source;
++};
++
+ class LIBZIM_PRIVATE_API MultiPartFileReader : public BaseFileReader {
+   public:
+     explicit MultiPartFileReader(std::shared_ptr<const FileCompound> source);
+diff --git a/src/fileimpl.cpp b/src/fileimpl.cpp
+index c55f5a0..68fd875 100644
+--- a/src/fileimpl.cpp
++++ b/src/fileimpl.cpp
+@@ -195,9 +195,20 @@ private: // data
+ #endif
+ 
+   FileImpl::FileImpl(std::shared_ptr<FileCompound> _zimFile, OpenConfig openConfig)
++    : FileImpl(makeFileReader(_zimFile), _zimFile,
++               _zimFile ? _zimFile->filename() : std::string(), openConfig)
++  {}
++
++  FileImpl::FileImpl(std::shared_ptr<Reader> reader, std::string name, OpenConfig openConfig)
++    : FileImpl(reader, nullptr, std::move(name), openConfig)
++  {}
++
++  FileImpl::FileImpl(std::shared_ptr<Reader> reader, std::shared_ptr<FileCompound> _zimFile,
++                     std::string name, OpenConfig openConfig)
+     : zimFile(_zimFile),
+-      zimReader(makeFileReader(zimFile)),
++      zimReader(reader),
+       direntReader(new DirentReader(zimReader)),
++      m_filename(std::move(name)),
+       m_hasFrontArticlesIndex(true),
+       m_startUserEntry(0),
+       m_endUserEntry(0)
+@@ -205,10 +216,13 @@ private: // data
+       ,m_xapianDbCreated(false)
+ #endif
+   {
+-    log_trace("read file \"" << zimFile->filename() << '"');
++    log_trace("read file \"" << m_filename << '"');
++
++    if (zimFile && zimFile->fail())
++      throw ZimFileFormatError(std::string("can't open zim-file \"") + m_filename + '"');
+ 
+-    if (zimFile->fail())
+-      throw ZimFileFormatError(std::string("can't open zim-file \"") + zimFile->filename() + '"');
++    if (!zimReader)
++      throw ZimFileFormatError(std::string("can't create reader for zim-file \"") + m_filename + '"');
+ 
+     // read header
+     if (size_type(zimReader->size()) < Fileheader::size) {
+@@ -607,6 +621,13 @@ private: // data
+     if (!header.hasChecksum())
+       return false;
+ 
++    if (!zimFile) {
++      // Reader-backed archive: checksum verification re-reads the file parts by
++      // name, which a custom reader cannot provide. Report unverified rather
++      // than streaming the whole archive.
++      return false;
++    }
++
+     struct zim_MD5_CTX md5ctx;
+     zim_MD5Init(&md5ctx);
+ 
+@@ -663,7 +684,7 @@ private: // data
+   }
+ 
+   time_t FileImpl::getMTime() const {
+-    return zimFile->getMTime();
++    return zimFile ? zimFile->getMTime() : time_t(0);
+   }
+ 
+   zim::zsize_t FileImpl::getFilesize() const {
+@@ -671,7 +692,7 @@ private: // data
+   }
+ 
+   bool FileImpl::is_multiPart() const {
+-    return zimFile->is_multiPart();
++    return zimFile ? zimFile->is_multiPart() : false;
+   }
+ 
+   bool FileImpl::checkIntegrity(IntegrityCheck checkType) {
+@@ -845,6 +866,10 @@ bool checkTitleListing(const IndirectDirentAccessor& accessor, entry_index_type
+ 
+   ItemDataDirectAccessInfo FileImpl::getDirectAccessInformation(cluster_index_t clusterIdx, blob_index_t blobIdx) const
+   {
++    if (!zimFile) {
++      // Reader-backed archive: there is no on-disk file to access directly.
++      return ItemDataDirectAccessInfo();
++    }
+     auto cluster = getCluster(clusterIdx);
+     if (cluster->isCompressed()) {
+       return ItemDataDirectAccessInfo();
+diff --git a/src/fileimpl.h b/src/fileimpl.h
+index 7aba4f2..fac98b6 100644
+--- a/src/fileimpl.h
++++ b/src/fileimpl.h
+@@ -54,9 +54,10 @@ namespace zim
+ 
+   class FileImpl
+   {
+-      std::shared_ptr<FileCompound> zimFile;
++      std::shared_ptr<FileCompound> zimFile; // null for reader-backed archives
+       std::shared_ptr<Reader> zimReader;
+       std::shared_ptr<DirentReader> direntReader;
++      std::string m_filename; // display name; path for file-backed, caller-provided otherwise
+       Fileheader header;
+ 
+       std::unique_ptr<const Reader> clusterOffsetReader;
+@@ -116,11 +117,14 @@ namespace zim
+       FileImpl(FdInput fd, OpenConfig openConfig);
+       FileImpl(const std::vector<FdInput>& fds, OpenConfig openConfig);
+ #endif
++      // Reader-backed archive: positioned reads come from `reader`, there is no
++      // backing FileCompound. `name` is the display name (Archive::getFilename).
++      FileImpl(std::shared_ptr<Reader> reader, std::string name, OpenConfig openConfig);
+       ~FileImpl();
+ 
+       time_t getMTime() const;
+ 
+-      const std::string& getFilename() const   { return zimFile->filename(); }
++      const std::string& getFilename() const   { return m_filename; }
+       const Fileheader& getFileheader() const  { return header; }
+       zsize_t getFilesize() const;
+       bool hasNewNamespaceScheme() const { return header.useNewNamespaceScheme(); }
+@@ -180,6 +184,10 @@ namespace zim
+   private:
+       FileImpl(std::shared_ptr<FileCompound> zimFile, OpenConfig openConfig);
+       FileImpl(std::shared_ptr<FileCompound> zimFile, offset_t offset, zsize_t size, OpenConfig openConfig);
++      // Shared core: initializes everything from an already-built reader.
++      // `zimFile` may be null (reader-backed archive).
++      FileImpl(std::shared_ptr<Reader> reader, std::shared_ptr<FileCompound> zimFile,
++               std::string name, OpenConfig openConfig);
+ 
+       void dropCachedClusters() const;
+ 
+diff --git a/src/irandomaccessreader.cpp b/src/irandomaccessreader.cpp
+new file mode 100644
+index 0000000..e0da772
+--- /dev/null
++++ b/src/irandomaccessreader.cpp
+@@ -0,0 +1,29 @@
++/*
++ * Copyright (C) 2026 Teague Sterling
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * is provided AS IS, WITHOUT ANY WARRANTY; without even the implied
++ * warranty of MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, and
++ * NON-INFRINGEMENT.  See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
++ *
++ */
++
++#include <zim/irandomaccessreader.h>
++
++namespace zim
++{
++
++// Out-of-line definition to anchor the vtable / RTTI in the libzim shared
++// object so that subclasses defined in client code share the same type info.
++IRandomAccessReader::~IRandomAccessReader() = default;
++
++} // namespace zim
+diff --git a/src/meson.build b/src/meson.build
+index 8f2a50f..29e6431 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -25,6 +25,7 @@ common_sources = [
+     'tools.cpp',
+     'compression.cpp',
+     'istreamreader.cpp',
++    'irandomaccessreader.cpp',
+     'namedthread.cpp',
+     'log.cpp',
+     'writer/contentProvider.cpp',

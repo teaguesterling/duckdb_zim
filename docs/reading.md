@@ -108,6 +108,40 @@ SELECT * FROM read_zim('wikipedia.zim', parallel := false);     -- single-thread
     use `parallel := false` for a path-ordered single-threaded scan. Exact lookups, prefix
     listings, and `listing := 'title'` are single-threaded by nature and unaffected.
 
+## Remote archives (S3 / HTTP)
+
+`read_zim` (and every other function here) can open a ZIM on remote storage and
+read it by **byte-range requests** — only the bytes a query touches are fetched,
+never the whole file. Pass an `s3://`, `http://`, `https://`, `gcs://`, … URL
+anywhere a path goes; it rides DuckDB's `httpfs` for transport and auth.
+
+```sql
+INSTALL httpfs; LOAD httpfs;   -- once per session
+
+-- open a ~1 GB remote Wikipedia and read one article: fetches ~0.5% of the file
+SELECT content
+FROM read_zim('https://example.org/wikipedia.zim',
+              path := 'A/London', include_content := true, content_as_varchar := true);
+```
+
+!!! tip "Use targeted access for big remote archives"
+    Range reads make *lookups* and *prefix listings* cheap remotely
+    (`path :=`, `path_prefix :=`). A full unfiltered scan still reads every entry's
+    dirent; for a huge remote archive prefer `path :=` / `path_prefix :=`, and use
+    `parallel := false` for bounded (`LIMIT`) remote listings — the parallel scan
+    pre-reads all dirents to partition by cluster, which is wasteful when you only
+    want a few rows.
+
+!!! warning "Full-text search is local-only"
+    `zim_search` returns no rows on a remote archive: libzim opens the Xapian
+    index through a direct file descriptor, which a byte-range reader can't
+    provide. Listing, lookup, content, metadata, and `zim_suggest` all work
+    remotely; only fulltext search needs a local file.
+
+Remote opens require `enable_external_access` (on by default) and the `httpfs`
+extension; a missing `httpfs` surfaces a clear "INSTALL httpfs" error rather than
+an opaque open failure.
+
 ## Metadata
 
 Metadata is a separate key space from content (two distinct libzim doors).
