@@ -21,6 +21,12 @@ Returns: `path VARCHAR, title VARCHAR, mimetype VARCHAR, is_redirect BOOLEAN, re
 
 Use SQL `LIMIT` / `OFFSET` for bounding/pagination.
 
+**Filter pushdown:** `WHERE path = '…'` / `WHERE title = '…'` are pushed down to a libzim
+exact lookup (equivalent to `path :=` / `title :=`) instead of a full scan — a big win on
+remote archives (a few KB instead of reading every dirent). `WHERE mimetype = …` / `IN (…)`
+push into the Accept-style post-filter. Other predicates (`LIKE`, ranges, `IN` on path/title)
+are applied normally by DuckDB; use `path_prefix :=` for remote prefix listings.
+
 `files` may be a **remote** URL (`s3://`, `http(s)://`, `gcs://`, …): the archive is read
 by byte-range requests via `httpfs` (only the touched bytes are fetched). Requires
 `LOAD httpfs` and `enable_external_access`. See

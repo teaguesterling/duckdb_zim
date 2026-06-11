@@ -31,6 +31,7 @@ python3 test/oracle/make_zimit_fixture.py
 - `zim_metadata.test`        — read_zim_metadata, zim_metadata/_keys/zim_counter/zim_info
 - `zim_scalars.test`         — single-entry lookup scalars
 - `zim_parallel.test`        — parallel `read_zim` scan matches the serial scan
+- `zim_pushdown.test`        — `WHERE path/title/mimetype` filter pushdown == un-pushed full scan
 - `zim_filesystem.test`      — the `zim://` virtual filesystem (read_text/read_blob, glob)
 - `zim_search.test`          — `zim_search` Xapian full-text search (native builds)
 - `zim_federated.test`       — multi-archive `zim_search` / `zim_suggest` (glob/LIST, `file` column)

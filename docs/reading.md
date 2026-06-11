@@ -125,12 +125,15 @@ FROM read_zim('https://example.org/wikipedia.zim',
 ```
 
 !!! tip "Use targeted access for big remote archives"
-    Range reads make *lookups* and *prefix listings* cheap remotely
-    (`path :=`, `path_prefix :=`). A full unfiltered scan still reads every entry's
-    dirent; for a huge remote archive prefer `path :=` / `path_prefix :=`, and use
+    Range reads make *lookups* and *prefix listings* cheap remotely. A plain
+    `WHERE path = '…'` (or `WHERE title = '…'`) is **pushed down** to a libzim exact
+    lookup — fetching a few KB rather than scanning every dirent — as is the `path :=`
+    parameter. (`WHERE path LIKE 'p%'` isn't pushed yet; use `path_prefix := 'p'` for a
+    remote prefix listing.) A full *unfiltered* scan still reads every dirent, so for a
+    huge remote archive prefer a `WHERE path`/`path :=`/`path_prefix :=` form, and use
     `parallel := false` for bounded (`LIMIT`) remote listings — the parallel scan
-    pre-reads all dirents to partition by cluster, which is wasteful when you only
-    want a few rows.
+    pre-reads all dirents to partition by cluster, which is wasteful when you only want
+    a few rows.
 
 !!! warning "Full-text search is local-only"
     `zim_search` returns no rows on a remote archive: libzim opens the Xapian

@@ -1,0 +1,136 @@
+# name: test/sql/zim_pushdown.test
+# description: SQL WHERE filter pushdown for read_zim equals the un-pushed full scan
+# group: [sql]
+
+require zim
+
+# The correctness contract: `WHERE path = const` (pushed down to a libzim exact
+# lookup) must return exactly what an un-pushed full scan + filter returns. We get
+# a genuine un-pushed reference by wrapping the column in an expression
+# (`path || ''`), which DuckDB cannot lower to a TableFilter, so it stays a full
+# scan. EXCEPT in both directions == empty proves identical row sets.
+
+# --- WHERE path = const, non-redirect entry ---
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE path = 'A/Photosynthesis')
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE path || '' = 'A/Photosynthesis')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE path || '' = 'A/Photosynthesis')
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE path = 'A/Photosynthesis')
+);
+----
+0
+
+# the emitted row is correct
+query TTTI
+SELECT path, title, mimetype, is_redirect FROM read_zim('test/oracle/test.zim') WHERE path = 'A/Photosynthesis';
+----
+A/Photosynthesis	Photosynthesis	text/html	false
+
+# --- redirect entry: the path filter must NOT follow the redirect (keeps path=X) ---
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE path = 'A/Photosynth')
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE path || '' = 'A/Photosynth')
+);
+----
+0
+
+query TTI
+SELECT path, redirect_path, is_redirect FROM read_zim('test/oracle/test.zim') WHERE path = 'A/Photosynth';
+----
+A/Photosynth	A/Photosynthesis	true
+
+# --- with content projected + loaded, the lookup matches the full scan too ---
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim', include_content := true, content_as_varchar := true)
+     WHERE path = 'A/Photosynthesis')
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim', include_content := true, content_as_varchar := true)
+     WHERE path || '' = 'A/Photosynthesis')
+);
+----
+0
+
+# --- WHERE title = const ---
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE title = 'Calcium')
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE title || '' = 'Calcium')
+);
+----
+0
+
+# --- WHERE mimetype = const (post-filter) ---
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE mimetype = 'text/html')
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE mimetype || '' = 'text/html')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE mimetype || '' = 'text/html')
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE mimetype = 'text/html')
+);
+----
+0
+
+# --- WHERE mimetype IN (...) (post-filter) ---
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE mimetype IN ('image/png', 'text/css'))
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE mimetype || '' IN ('image/png', 'text/css'))
+);
+----
+0
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE mimetype IN ('image/png', 'text/css');
+----
+2
+
+# --- combined path = const AND mimetype: lookup + post-filter ---
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE path = 'A/Photosynthesis' AND mimetype = 'text/css';
+----
+0
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE path = 'A/Photosynthesis' AND mimetype = 'text/html';
+----
+1
+
+# --- nonexistent path -> 0 rows ---
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE path = 'A/DoesNotExist';
+----
+0
+
+# --- a named path := combined with a WHERE filter still works (named mode wins;
+#     WHERE rides as a post-filter and must not break) ---
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', path := 'A/Photosynthesis') WHERE mimetype = 'text/html';
+----
+1
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', path := 'A/Photosynthesis') WHERE mimetype = 'image/png';
+----
+0

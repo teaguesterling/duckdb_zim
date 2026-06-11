@@ -447,6 +447,7 @@ work, so it's excluded from CI for now.
 | 3 | `zim_search` (Xapian full-text) + `zim_suggest` (title autocomplete); utilities `zim_illustration` / `zim_random` / `zim_check`; Accept-style `mimetype` matching | **implemented** |
 | 3.5 (v0.3) | **parallel `read_zim` scan** — cluster-order morsels across DuckDB threads (`parallel` param) | **implemented** |
 | 3.6 (v0.3) | **remote archives** — read S3/HTTP ZIMs by byte-range via `httpfs` (bundles a libzim `IRandomAccessReader` patch); fulltext search stays local-only | **implemented** |
+| 3.7 | **filter pushdown** — `WHERE path/title = …` → libzim exact lookup, `WHERE mimetype` → post-filter (idiomatic SQL gets the remote-cheap path) | **implemented** |
 | 4 | `ATTACH 'x.zim' AS … (TYPE zim)` | **won't do** — see below |
 
 **v0.2.0 is considered feature-complete.** `ATTACH` was the last planned phase and has
