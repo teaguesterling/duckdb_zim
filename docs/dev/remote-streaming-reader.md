@@ -40,31 +40,70 @@ own libcurl (not a DuckDB-FS bridge). The decisive constraint: **libzim, unlike 
 - `FileImpl` holds `shared_ptr<Reader> zimReader`; ctors fname/fd/FdInput/vector<FdInput>.
 - `Archive` ctors → `new FileImpl(...)`.
 
-## The libzim patch (~120 LOC)
+## VERIFIED against libzim 9.7.0 source (2026-06-10)
 
-1. **`include/zim/istreamreader.h`** (NEW, public `LIBZIM_API`) — the only new public symbol:
+Cloned `openzim/libzim@9.7.0` → `~/Projects/libzim` (branch `stream-reader-api`). Findings that
+**revise** the original plan:
+
+1. **`IStreamReader` is already taken.** `src/istreamreader.{h,cpp}` defines a `LIBZIM_PRIVATE_API`
+   *sequential* primitive-stream reader (`readImpl(buf, nbytes)`, no offset). Our positioned-read
+   public interface must use a different name → **`IRandomAccessReader`**.
+2. **The positioned-read seam is the internal `Reader`** (`src/reader.h`, `LIBZIM_PRIVATE_API`):
+   `readImpl(dest, offset_t, zsize_t)`. `BaseFileReader : Reader` (`src/file_reader.{h,cpp}`) adds
+   offset/size + an abstract `get_mmap_buffer`. `FileReader : BaseFileReader` reads via
+   `_fhandle->readAt(dest, size, offset)` — our adapter template.
+3. **Non-mmap `get_buffer` already exists and works.** `BaseFileReader::get_buffer`
+   (file_reader.cpp:188) catches `MMapException` (or compiles it out when `ENABLE_USE_MMAP` is off)
+   and falls back to *allocate + positioned `read()`*. So header/dirents/clusters/content all flow
+   through the Reader with no mmap. ⚠️ `MMapException` lives in an **anonymous namespace inside
+   file_reader.cpp** → our adapter must live in that TU (or we hoist the exception) so its
+   `get_mmap_buffer` can `throw MMapException` to trigger the fallback.
+4. **FileImpl is coupled to `FileCompound` (`zimFile`) beyond reading.** All public ctors funnel
+   into the private `FileImpl(shared_ptr<FileCompound>, OpenConfig)` (fileimpl.cpp:197). `zimFile`
+   is used in **6 spots** our reader-backed ctor must guard (set `zimFile=nullptr`, store a name):
+   `getFilename()` (.h → stored name), `getMTime()` (→ 0), `is_multiPart()` (→ false),
+   `getFileParts()`/`getDirectAccessInformation()` (→ invalid `ItemDataDirectAccessInfo`),
+   `verify()` (→ false/unsupported; do **not** rewrite — that would whole-file download remotely),
+   and the ctor log/fail-check. `getFilesize()`/`getChecksum()` already use `zimReader` — fine.
+5. **🔴 Xapian needs a real fd — remote full-text search is OUT of scope for v1.**
+   `loadXapianDb()` (fileimpl.cpp:883) → `getDirectAccessInformation()` → `getDbFromAccessInfo()`
+   (tools.cpp:320) which does `openFile(accessInfo.filename)` + `seek(offset)` +
+   `Xapian::Database(fd)`. Xapian mmaps the **OS file directly**; it cannot read through our reader.
+   With the guard, `getDirectAccessInformation` returns invalid → `loadXapianDb` returns `nullptr`
+   → `zim_search` yields **no rows, gracefully** (no crash). `zim_suggest` still works remotely via
+   its non-Xapian prefix fallback (dirent title lookup, through the reader).
+   - **Future remote-search enhancement** (doesn't break "no whole-file download"): the Xapian index
+     is one contiguous *uncompressed* blob (tens of MB), readable *through the reader*. Extract it to
+     a temp file and point Xapian at that. Follow-up, not v1.
+
+## The libzim patch
+
+1. **`include/zim/irandomaccessreader.h`** (NEW, public `LIBZIM_API`) — the only new public symbol:
    ```cpp
    namespace zim {
-     class LIBZIM_API IStreamReader {
+     class LIBZIM_API IRandomAccessReader {
      public:
-       virtual ~IStreamReader();
+       virtual ~IRandomAccessReader();
        virtual size_type getSize() const = 0;
        virtual void readAt(char* dest, offset_type offset, size_type size) const = 0; // threadsafe
      };
    }
    ```
-2. **`include/zim/archive.h`** — `Archive(std::shared_ptr<IStreamReader> reader, OpenConfig = {});`
-3. **`src/stream_reader.{h,cpp}`** (NEW, `LIBZIM_PRIVATE_API`) — `StreamReader : BaseFileReader`,
-   copied from `FileReader`: `readImpl(dest,off,n)` → `m_stream->readAt(m_base+off, n)`;
-   `sub_reader(off,n)` → offset-shifted `StreamReader`; `offset()`→m_base, `size()`→m_size,
-   `getMemorySize()`→0.
-4. **`src/fileimpl.{h,cpp}`** — `FileImpl(shared_ptr<Reader>, OpenConfig)`: extract the
-   post-reader init the fd ctors run into a shared helper; new ctor sets `zimReader` then runs it.
-5. **`src/archive.cpp`** — `Archive(shared_ptr<IStreamReader> r, OpenConfig oc) : m_impl(new
-   FileImpl(std::make_shared<StreamReader>(r), oc)) {}`
-6. **`meson.build`** — new sources + install the new public header.
+2. **`include/zim/archive.h`** — `Archive(std::shared_ptr<IRandomAccessReader> reader, OpenConfig = {});`
+3. **`src/file_reader.{h,cpp}`** (extend; lives here for `MMapException` access) —
+   `StreamFileReader : BaseFileReader`, mirroring `FileReader`: `readImpl(dest,off,n)` →
+   `m_source->readAt(dest, (m_base+off), n)`; `get_mmap_buffer` → `throw MMapException` (force the
+   allocate+read fallback); `sub_reader(off,n)` → offset-shifted `StreamFileReader`;
+   `offset()`→m_base, `size()`→m_size.
+4. **`src/fileimpl.{h,cpp}`** — `FileImpl(shared_ptr<Reader>, std::string name, OpenConfig)`: set
+   `zimReader`, `zimFile=nullptr`, store name; guard the 6 `zimFile` spots above. (Extract shared
+   post-reader init only if the existing private ctor can't be reused as-is.)
+5. **`src/archive.cpp`** — `Archive(shared_ptr<IRandomAccessReader> r, OpenConfig oc)` → builds a
+   `StreamFileReader` over `r` (size = `r->getSize()`), passes it + a display name to `FileImpl`.
+6. **`meson.build`** — install the new public header (`include/zim/meson.build` headers list); the
+   adapter rides existing `file_reader.cpp`.
 
-Scope-out: single `IStreamReader` = single-part archive (remote split archives are rare).
+Scope-out: single `IRandomAccessReader` = single-part archive (remote split archives are rare).
 
 ## vcpkg bundling (carry the patch before upstream)
 
@@ -103,28 +142,40 @@ a look once it works natively.
 
 ## Testing
 
-- **Local-via-reader**: open a local `.zim` through the reader path and diff against mmap
-  (same entries/content) — proves the `StreamReader` adapter in isolation.
-- **HTTP**: `python -m http.server` over `test/oracle/test.zim` → `read_zim('http://localhost:PORT/test.zim')`;
-  entries, content, search, parallel.
+- **C++ unit test (in libzim fork)**: open `test/oracle/test.zim` via an in-memory/fd-backed
+  `IRandomAccessReader` and diff **full enumeration + content** against the same archive opened
+  normally. This isolates the adapter + the 6 `zimFile` guards. (Search is *expected* to return
+  nothing on the reader path — see finding 5; assert that, don't treat it as a bug.)
+- **Local-via-reader (extension)**: same diff through the extension's remote bridge against a
+  `file://`-ish local path forced down the reader branch.
+- **HTTP**: `python -m http.server` over `test/oracle/test.zim` →
+  `read_zim('http://localhost:PORT/test.zim')`; entries, content, **suggest (prefix)**, parallel.
+  `zim_search` → expect 0 rows remotely (documented limitation), not an error.
 - **S3**: if creds available.
 - **Range-read proof**: instrument `readAt` byte totals — a listing scan must read ≪ filesize
   (proves "partial", not whole-file).
-- The NHS↔Wikipedia cross-reference, but with the remote archive.
+- The NHS↔Wikipedia cross-reference, but with the remote archive (uses content/lookup, not search).
 
 ## Open questions
 
 - httpfs `FileHandle`: positioned `Read(buf,n,location)` concurrency-safe? → mutex vs per-thread handle.
-- `BaseFileReader::get_buffer` non-mmap correctness across *all* access (clusters, dirents, xapian)?
+- ~~`get_buffer` non-mmap correctness~~ → **resolved**: the fallback path already exists and serves
+  header/dirents/clusters/content. Xapian is the only bypass (finding 5), handled by scope.
 - Route local through the reader too (uniformity) or keep mmap (perf)? → keep mmap.
 
 ## Checklist
 
-- [ ] Open openZIM/libzim issue proposing `IStreamReader`.
-- [ ] Fork libzim; implement patch; tiny C++ test (open from an in-memory `IStreamReader`).
-- [ ] Generate `stream-reader-api.patch`; add `vcpkg_ports/libzim` overlay; wire `overlay-ports`.
-- [ ] `DuckdbZimStreamReader` + `ZimArchive::Open` remote path + `ArchivePool` plumbing.
+- [x] Clone libzim @ 9.7.0 (`~/Projects/libzim`, branch `stream-reader-api`); map the patch surface.
+- [ ] Implement patch (`IRandomAccessReader` header, `StreamFileReader` adapter, `FileImpl` ctor +
+      6 guards, `Archive` ctor, meson header install).
+- [ ] C++ unit test (open from a fd/in-memory `IRandomAccessReader`; diff enumeration+content; assert
+      search→empty).
+- [ ] Generate `stream-reader-api.patch`; add `vcpkg_ports/libzim` overlay; wire `overlay-ports`
+      (append `./vcpkg_ports` to the existing `overlay-ports` list).
+- [ ] `DuckdbZimRemoteReader : IRandomAccessReader` + `ZimArchive::Open` remote path + `ArchivePool`
+      plumbing (`FileSystem&`).
 - [ ] Remote-URL detection + `enable_external_access` + httpfs-missing error.
-- [ ] Tests (local-via-reader, http server, parallel, byte-count proof).
-- [ ] Docs (installation: httpfs; reading: remote archives).
-- [ ] Upstream PR.
+- [ ] Tests (local-via-reader, http server, suggest, parallel, byte-count proof; search→0 rows).
+- [ ] Docs (installation: httpfs; reading: remote archives; **note: full-text search is local-only**).
+- [ ] Open openZIM/libzim issue/PR proposing the interface — *with the working patch attached*
+      (confirm with Teague first; it's an outward action).
