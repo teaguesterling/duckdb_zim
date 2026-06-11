@@ -96,7 +96,7 @@ struct ReadZimGlobalState : public GlobalTableFunctionState {
 	bool want_content = false;        // content projected AND include_content
 	ScanSpec scan_spec;               // bind.spec + want_content; shared by cursor and ScanIndex
 	idx_t max_threads = 1;
-	FileSystem *fs = nullptr;         // for remote (s3/http) opens; set at InitGlobal from the context
+	FileSystem *fs = nullptr; // for remote (s3/http) opens; set at InitGlobal from the context
 
 	// --- serial (Lookup / SerialScan): sequential file/cursor state machine ---
 	idx_t file_idx = 0;

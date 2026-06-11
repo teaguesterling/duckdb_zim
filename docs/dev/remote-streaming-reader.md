@@ -166,16 +166,25 @@ a look once it works natively.
 ## Checklist
 
 - [x] Clone libzim @ 9.7.0 (`~/Projects/libzim`, branch `stream-reader-api`); map the patch surface.
-- [ ] Implement patch (`IRandomAccessReader` header, `StreamFileReader` adapter, `FileImpl` ctor +
-      6 guards, `Archive` ctor, meson header install).
-- [ ] C++ unit test (open from a fd/in-memory `IRandomAccessReader`; diff enumeration+content; assert
-      search→empty).
-- [ ] Generate `stream-reader-api.patch`; add `vcpkg_ports/libzim` overlay; wire `overlay-ports`
-      (append `./vcpkg_ports` to the existing `overlay-ports` list).
-- [ ] `DuckdbZimRemoteReader : IRandomAccessReader` + `ZimArchive::Open` remote path + `ArchivePool`
-      plumbing (`FileSystem&`).
-- [ ] Remote-URL detection + `enable_external_access` + httpfs-missing error.
-- [ ] Tests (local-via-reader, http server, suggest, parallel, byte-count proof; search→0 rows).
-- [ ] Docs (installation: httpfs; reading: remote archives; **note: full-text search is local-only**).
+- [x] Implement patch (`IRandomAccessReader` header, `StreamFileReader` adapter, `FileImpl` ctor +
+      6 guards, `Archive` ctor, meson header install). Builds clean; libzim fork `~/Projects/libzim`
+      branch `stream-reader-api`, commit `10d2fcc`.
+- [x] C++ proof harness (`test_reader_harness.cpp` in the fork): open `test.zim`/`test_zimit.zim`
+      via an fd-backed `IRandomAccessReader`, diff full enumeration + content vs a normal open → MATCH.
+      (Keep as the basis for a proper gtest in the upstream PR.)
+- [x] Generate `stream-reader-api.patch`; add `vcpkg_ports/libzim` overlay; wire `overlay-ports`.
+      Verified: all four patches apply cleanly in vcpkg order against pristine 9.7.0; the extension's
+      vcpkg build installs the patched header and links (xapian on); 13 suites green.
+- [x] `DuckdbZimRemoteReader : IRandomAccessReader` + `ZimArchive::Open` remote path + `ArchivePool`
+      plumbing (per-call `FileSystem*` + a default registered at extension load → scalars work too).
+- [x] Remote-URL detection (`FileSystem::IsRemoteFile`) + httpfs-missing remediation error.
+- [x] Manual end-to-end proof: 982 MB remote Wikipedia on dumps.wikimedia.org — open + 1 article =
+      5.3 MB (0.5%); local fixtures byte-identical remote vs local (serial+parallel, content,
+      metadata, scalars, suggest); `zim_search` → 0 rows. **Automated remote sqllogictest still TODO**
+      (needs a live range server in the harness).
+- [x] Docs (reading.md "Remote archives", reference.md note, README roadmap row).
+- [ ] **Known rough edges (deferred):** parallel scan over remote pre-reads all dirents (bad for
+      `LIMIT`); scalars re-open per call (no warm pin → repeated remote opens). Fix with the v0.4
+      filter/`LIMIT` pushdown work.
 - [ ] Open openZIM/libzim issue/PR proposing the interface — *with the working patch attached*
       (confirm with Teague first; it's an outward action).
