@@ -33,7 +33,22 @@ public:
 	// std::runtime_error if the file cannot be opened. Path is canonicalized by
 	// the caller's filesystem semantics before keying (the binding layer passes
 	// the already-resolved path).
-	std::shared_ptr<ZimArchive> Get(const std::string &file_path);
+	//
+	// `fs` is only used when `file_path` is a remote URL and the entry isn't
+	// already warm: the archive is then opened through a DuckDB FileHandle
+	// (byte-range reads). Local paths ignore it. Callers with a ClientContext
+	// pass &FileSystem::GetFileSystem(context); context-free callers may omit it
+	// (remote opens then fail with a clear error).
+	std::shared_ptr<ZimArchive> Get(const std::string &file_path, FileSystem *fs = nullptr);
+
+	// Register the database's FileSystem so that *any* consumer (including the
+	// scalar functions, which have no ClientContext at the row level) can open a
+	// remote archive without threading a FileSystem through every call. The
+	// VirtualFileSystem httpfs registers into is per-DatabaseInstance and stable
+	// for its lifetime, and is the same object FileSystem::GetFileSystem(context)
+	// returns. Set once from the extension's Load. An explicit `fs` passed to
+	// Get() still takes precedence.
+	void SetDefaultFileSystem(FileSystem *fs);
 
 	// Drop the cache entry for a path (e.g. on DETACH or explicit invalidation).
 	void Evict(const std::string &file_path);
@@ -43,6 +58,7 @@ private:
 	ArchivePool() = default;
 	std::mutex mu_;
 	std::unordered_map<std::string, std::weak_ptr<ZimArchive>> cache_;
+	FileSystem *default_fs_ = nullptr; // set at extension load; used for remote opens
 };
 
 } // namespace zim_ext

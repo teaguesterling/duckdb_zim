@@ -10,6 +10,9 @@
 #include "zim_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/common/file_system.hpp"
+
+#include "zim_archive_pool.hpp"
 
 namespace duckdb {
 
@@ -21,6 +24,11 @@ void RegisterZimFilesystem(ExtensionLoader &loader); // phase 2 (zim://)
 void RegisterZimSearch(ExtensionLoader &loader);     // phase 3 (xapian FTS)
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Hand the pool the database FileSystem so remote (s3/http) archives can be
+	// opened from any consumer, including the context-free scalar functions. This
+	// is the same VirtualFileSystem httpfs registers into.
+	zim_ext::ArchivePool::Instance().SetDefaultFileSystem(&FileSystem::GetFileSystem(loader.GetDatabaseInstance()));
+
 	RegisterReadZim(loader);
 	RegisterZimMetadata(loader);
 	RegisterZimScalars(loader);

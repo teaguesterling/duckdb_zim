@@ -96,6 +96,7 @@ struct ReadZimGlobalState : public GlobalTableFunctionState {
 	bool want_content = false;        // content projected AND include_content
 	ScanSpec scan_spec;               // bind.spec + want_content; shared by cursor and ScanIndex
 	idx_t max_threads = 1;
+	FileSystem *fs = nullptr;         // for remote (s3/http) opens; set at InitGlobal from the context
 
 	// --- serial (Lookup / SerialScan): sequential file/cursor state machine ---
 	idx_t file_idx = 0;
@@ -118,7 +119,7 @@ struct ReadZimGlobalState : public GlobalTableFunctionState {
 		std::lock_guard<std::mutex> guard(morsel_lock);
 		while (p_file < files.size()) {
 			if (!p_archive) {
-				p_archive = ArchivePool::Instance().Get(files[p_file]); // may throw
+				p_archive = ArchivePool::Instance().Get(files[p_file], fs); // may throw
 				p_count = p_archive->ContentEntryCount();
 				p_index = 0;
 			}
@@ -321,7 +322,7 @@ unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindIn
 // Opens files[file_idx] as the current archive; in scan mode also builds the cursor.
 // Serial paths only (Lookup / SerialScan). May throw — surfaced as the query's error.
 static void OpenCurrentFile(ReadZimGlobalState &g, const ReadZimBindData &bind) {
-	g.archive = ArchivePool::Instance().Get(g.files[g.file_idx]); // may throw
+	g.archive = ArchivePool::Instance().Get(g.files[g.file_idx], g.fs); // may throw
 	g.lookup_emitted = false;
 	if (!bind.single_lookup) {
 		g.cursor = make_uniq<ZimScanCursor>(g.archive->Scan(g.scan_spec));
@@ -345,6 +346,7 @@ unique_ptr<GlobalTableFunctionState> ReadZimInitGlobal(ClientContext &context, T
 	state->mode = bind.mode;
 	state->files = bind.file_paths;
 	state->column_ids = input.column_ids;
+	state->fs = &FileSystem::GetFileSystem(context); // used only when a path is remote
 
 	// Projection pushdown: only load blobs if the content column is actually projected
 	// AND the caller opted in via include_content. SELECT * without include_content

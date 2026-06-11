@@ -29,6 +29,8 @@ class Archive; // fwd; real include only in zim_access.cpp
 }
 
 namespace duckdb {
+class FileSystem; // fwd; only consulted for remote opens (zim_remote.*)
+
 namespace zim_ext {
 
 // One row of the content scan. `content` is populated lazily and only when the
@@ -116,7 +118,10 @@ private:
 class ZimArchive {
 public:
 	// Throws std::runtime_error (wrapping zim::ZimFileFormatError etc.) on failure.
-	static std::shared_ptr<ZimArchive> Open(const std::string &file_path);
+	// `fs` is only used when `file_path` is a remote URL (s3/http/...): the archive
+	// is then opened through a DuckDB FileHandle (byte-range reads) instead of the
+	// local mmap path. Local files ignore `fs` and keep the mmap fast path.
+	static std::shared_ptr<ZimArchive> Open(const std::string &file_path, FileSystem *fs = nullptr);
 	~ZimArchive();
 
 	const std::string &FilePath() const {
@@ -178,7 +183,7 @@ public:
 	bool CheckIntegrity() const;
 
 private:
-	explicit ZimArchive(const std::string &file_path);
+	ZimArchive(const std::string &file_path, FileSystem *fs);
 	std::string file_path_;
 	std::unique_ptr<zim::Archive> archive_; // owns the warm cluster cache
 };

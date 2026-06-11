@@ -24,6 +24,7 @@ set(EXTENSION_SOURCES
     src/zim_extension.cpp
     src/zim_access.cpp
     src/zim_archive_pool.cpp
+    src/zim_remote.cpp
     src/read_zim.cpp
     src/zim_metadata.cpp
     src/zim_scalars.cpp
