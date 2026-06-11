@@ -30,7 +30,7 @@
 
 namespace duckdb {
 
-using zim_ext::ArchivePool;
+using zim_ext::GetArchivePool;
 using zim_ext::ZimArchive;
 using zim_ext::ZimSearchHit;
 
@@ -116,12 +116,14 @@ unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunctionBindInp
 	return std::move(bind);
 }
 
-unique_ptr<GlobalTableFunctionState> SearchInit(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> SearchInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<SearchBindData>();
 	auto state = make_uniq<SearchGlobalState>();
+	auto &pool = GetArchivePool(context);
+	auto *fs = &FileSystem::GetFileSystem(context);
 	// Per archive: up to max_results hits, each tagged with its source file.
 	for (auto &fp : bind.file_paths) {
-		auto archive = ArchivePool::Instance().Get(fp);
+		auto archive = pool.Get(fp, fs);
 		for (auto &hit : archive->Search(bind.query, bind.result_offset, bind.max_results)) {
 			state->hits.push_back(TaggedHit {fp, std::move(hit)});
 		}
@@ -161,11 +163,13 @@ unique_ptr<FunctionData> SuggestBind(ClientContext &context, TableFunctionBindIn
 	return std::move(bind);
 }
 
-unique_ptr<GlobalTableFunctionState> SuggestInit(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> SuggestInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<SearchBindData>();
 	auto state = make_uniq<SearchGlobalState>();
+	auto &pool = GetArchivePool(context);
+	auto *fs = &FileSystem::GetFileSystem(context);
 	for (auto &fp : bind.file_paths) {
-		auto archive = ArchivePool::Instance().Get(fp);
+		auto archive = pool.Get(fp, fs);
 		for (auto &hit : archive->Suggest(bind.query, bind.result_offset, bind.max_results)) {
 			state->hits.push_back(TaggedHit {fp, std::move(hit)});
 		}
