@@ -39,3 +39,26 @@ jobs:
       # format only: the tidy check configures CMake without vcpkg, so this extension's
       # required libzim (pkg-config) isn't found and tidy can't even configure.
       format_checks: 'format'
+
+  # Guards the LINKED_LIBS class of WASM bug: the distribution workflow builds and
+  # uploads the .wasm but never inspects or loads it, so a side module with unresolved
+  # libzim/zstd/lzma symbols ships green. This downloads the v1.5.2 wasm artifacts and
+  # statically checks no dependency symbol is imported-but-undefined (no runtime needed).
+  # See test/wasm/. (A live duckdb-wasm load test is deferred until runtime ZIM reading
+  # in wasm lands — libzim's local mmap path doesn't work in wasm.)
+  wasm-symbol-check:
+    name: WASM symbol resolution check
+    needs: [duckdb-stable-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Download WASM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: zim-v1.5.2-extension-wasm_*
+          path: wasm-artifacts
+      - name: Check for unresolved libzim/zstd/lzma symbols
+        run: bash test/wasm/run_wasm_checks.sh wasm-artifacts
