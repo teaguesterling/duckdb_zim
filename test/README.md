@@ -38,3 +38,17 @@ python3 test/oracle/make_zimit_fixture.py
 - `zim_utilities.test`       — `zim_suggest` / `zim_illustration` / `zim_random` / `zim_check`
 - `zim_zimit.test`           — zimit-style full-URL paths, trailing slashes, no-index search
 - `zim_errors.test`          — binder validation + bad-archive handling
+
+## Remote (http) integration test
+
+`zim_search` over an http(s) URL can't be expressed in sqllogictest (no way to host a
+server), so it lives as a shell script:
+
+- `test/remote/remote_search.sh` — serves the committed `test/oracle/test.zim` over a
+  local HTTP server and asserts a remote `zim_search` returns the same hits as the local
+  `zim_search.test`. Exercises the reader-copy path (libzim copies the small Xapian index
+  out through the reader; see `docs/dev/remote-search-impl-plan.md`).
+
+Run locally after a build: `bash test/remote/remote_search.sh`
+(override `DUCKDB_BIN` / `ZIM_EXTENSION` to point at a prebuilt shell + loadable extension).
+In CI it runs as the `remote-search-test` job against the built artifact.
