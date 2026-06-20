@@ -82,3 +82,27 @@ Larger: a Xapian vcpkg overlay patch + libzim wiring to pass the reader to Xapia
 - Iterate the patch as `vcpkg_ports/libzim/*.patch`; `vcpkg_binary_sources: clear` (CI
   already uses this) forces a rebuild. Native first (`make release` + the new test),
   then the wasm angle composes with the LINKED_LIBS fix.
+
+## Phase A status & findings (implemented + verified)
+
+Verified end-to-end against `restarters_en_all_maxi` (17 MB, 589 KB fulltext index)
+served over HTTP: remote `zim_search` returns the same ranked hits as local search.
+
+- **Setting**: `zim_remote_search_max_local_index` (UBIGINT bytes, default **8 MB**,
+  `0` disables remote search). Lowered from 32 MB to keep first-search latency snappy
+  on broadband (32 MB ≈ 2.7 s download @100 Mbps). Read in `zim_search` and threaded
+  through `ArchivePool::Get → ZimArchive::Open → OpenConfig::maxLocalSearchIndexBytes`.
+- **The real search guard was `Archive::hasFulltextIndex()`** (returned
+  direct-access validity = false for reader-backed). Fixed via
+  `FileImpl::canCopySearchIndexLocally` (in the libzim patch).
+- **Over-fetch (response time)**: httpfs reads in **intrinsic 1 MiB range blocks**, so
+  libzim's scattered reads amplify ~15× (read_zim: 820 KB logical → 12.5 MB physical;
+  search: ~5.3 MB of 17 MB). NOT tunable via `streaming_buffer_size` or
+  `enable_external_file_cache` (both tested, no effect). This is an httpfs-layer
+  artifact, independent of the local-copy logic — a separate optimization (httpfs
+  block-size knob / read coalescing, possibly upstream).
+- **Lazy index load deferred**: `OpenConfig::preloadXapianDb(false)` would skip the
+  index fetch for non-search remote queries, but libzim's lazy `getXapianDb()` returns
+  null for reader-backed archives (search then throws "Cannot create Search without FT
+  Xapian index"). Left eager for now (bounded: index ≤ cap); revisit once that libzim
+  path is understood.

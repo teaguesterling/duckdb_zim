@@ -182,21 +182,27 @@ bool ZimScanCursor::Next(ZimEntry &out) {
 // ZimArchive
 //===--------------------------------------------------------------------===//
 
-ZimArchive::ZimArchive(const std::string &file_path, FileSystem *fs) : file_path_(file_path) {
+ZimArchive::ZimArchive(const std::string &file_path, FileSystem *fs, uint64_t max_local_index_bytes)
+    : file_path_(file_path) {
 	try {
 		if (fs && FileSystem::IsRemoteFile(file_path)) {
 			// Remote archive: read byte ranges through a DuckDB FileHandle. The
 			// zim::Archive holds the reader alive (StreamFileReader keeps a
 			// shared_ptr to it), so we don't store it separately here.
 			auto reader = std::make_shared<DuckdbZimRemoteReader>(*fs, file_path);
-			// Enable remote full-text search for small indexes: libzim copies the
-			// (uncompressed) Xapian index blob out through the reader to a temp file
-			// when it is <= this cap, then opens Xapian on it. Without this the index
-			// needs a local fd and remote zim_search returns nothing.
-			// TODO: expose the cap as a DuckDB setting (zim_remote_search_max_local_index).
-			constexpr size_t kMaxLocalSearchIndexBytes = 32ull * 1024 * 1024; // 32 MB
+			// Remote full-text search: when the (uncompressed) Xapian index is <= the cap
+			// (zim_remote_search_max_local_index), libzim copies just the index blob out
+			// through the reader to a temp file and opens Xapian on it. preloadXapianDb is
+			// OFF so the index is fetched lazily on the first search, not at open: a
+			// non-search remote query (read_zim/metadata) pays nothing for the index.
+			// NOTE: preloadXapianDb is left ON (default). Lazy load (preloadXapianDb(false))
+			// would avoid fetching the index for non-search remote queries, but libzim's
+			// lazy getXapianDb path returns null for reader-backed archives (search then
+			// throws "Cannot create Search without FT Xapian index"). Revisit as an
+			// optimization once that libzim path is understood. The index is small
+			// (<= the cap) so eager preload is a bounded cost.
 			archive_ = std::make_unique<zim::Archive>(
-			    reader, zim::OpenConfig().maxLocalSearchIndexBytes(kMaxLocalSearchIndexBytes));
+			    reader, zim::OpenConfig().maxLocalSearchIndexBytes(max_local_index_bytes));
 		} else {
 			// Local archive: libzim opens the file directly (mmap fast path).
 			archive_ = std::make_unique<zim::Archive>(file_path);
@@ -208,9 +214,10 @@ ZimArchive::ZimArchive(const std::string &file_path, FileSystem *fs) : file_path
 
 ZimArchive::~ZimArchive() = default;
 
-std::shared_ptr<ZimArchive> ZimArchive::Open(const std::string &file_path, FileSystem *fs) {
+std::shared_ptr<ZimArchive> ZimArchive::Open(const std::string &file_path, FileSystem *fs,
+                                            uint64_t max_local_index_bytes) {
 	// Cannot std::make_shared with a private ctor; wrap explicitly.
-	return std::shared_ptr<ZimArchive>(new ZimArchive(file_path, fs));
+	return std::shared_ptr<ZimArchive>(new ZimArchive(file_path, fs, max_local_index_bytes));
 }
 
 ZimInfo ZimArchive::Info() const {

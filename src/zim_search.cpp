@@ -116,6 +116,15 @@ unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunctionBindInp
 	return std::move(bind);
 }
 
+// Resolve the remote-search local-index cap from the setting (falls back to the default).
+static uint64_t ResolveMaxLocalIndex(ClientContext &context) {
+	Value v;
+	if (context.TryGetCurrentSetting("zim_remote_search_max_local_index", v) && !v.IsNull()) {
+		return v.GetValue<uint64_t>();
+	}
+	return zim_ext::DEFAULT_MAX_LOCAL_SEARCH_INDEX;
+}
+
 unique_ptr<GlobalTableFunctionState> SearchInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<SearchBindData>();
 	auto state = make_uniq<SearchGlobalState>();
@@ -123,7 +132,7 @@ unique_ptr<GlobalTableFunctionState> SearchInit(ClientContext &context, TableFun
 	auto *fs = &FileSystem::GetFileSystem(context);
 	// Per archive: up to max_results hits, each tagged with its source file.
 	for (auto &fp : bind.file_paths) {
-		auto archive = pool.Get(fp, fs);
+		auto archive = pool.Get(fp, fs, ResolveMaxLocalIndex(context));
 		for (auto &hit : archive->Search(bind.query, bind.result_offset, bind.max_results)) {
 			state->hits.push_back(TaggedHit {fp, std::move(hit)});
 		}
@@ -169,7 +178,7 @@ unique_ptr<GlobalTableFunctionState> SuggestInit(ClientContext &context, TableFu
 	auto &pool = GetArchivePool(context);
 	auto *fs = &FileSystem::GetFileSystem(context);
 	for (auto &fp : bind.file_paths) {
-		auto archive = pool.Get(fp, fs);
+		auto archive = pool.Get(fp, fs, ResolveMaxLocalIndex(context));
 		for (auto &hit : archive->Suggest(bind.query, bind.result_offset, bind.max_results)) {
 			state->hits.push_back(TaggedHit {fp, std::move(hit)});
 		}

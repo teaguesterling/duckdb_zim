@@ -56,7 +56,8 @@ public:
 	// already warm: the archive is then opened through a DuckDB FileHandle
 	// (byte-range reads). Local paths ignore it. Callers obtain `fs` from the same
 	// source they obtained this pool (the ClientContext / DatabaseInstance).
-	std::shared_ptr<ZimArchive> Get(const std::string &file_path, FileSystem *fs = nullptr);
+	std::shared_ptr<ZimArchive> Get(const std::string &file_path, FileSystem *fs = nullptr,
+	                                uint64_t max_local_index_bytes = DEFAULT_MAX_LOCAL_SEARCH_INDEX);
 
 private:
 	// Hold a strong reference to the most-recently-used archives so they (and their
