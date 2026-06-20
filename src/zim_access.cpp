@@ -215,7 +215,7 @@ ZimArchive::ZimArchive(const std::string &file_path, FileSystem *fs, uint64_t ma
 ZimArchive::~ZimArchive() = default;
 
 std::shared_ptr<ZimArchive> ZimArchive::Open(const std::string &file_path, FileSystem *fs,
-                                            uint64_t max_local_index_bytes) {
+                                             uint64_t max_local_index_bytes) {
 	// Cannot std::make_shared with a private ctor; wrap explicitly.
 	return std::shared_ptr<ZimArchive>(new ZimArchive(file_path, fs, max_local_index_bytes));
 }

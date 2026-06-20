@@ -25,12 +25,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// zim_archive_pool.hpp); consumers reach it via their ClientContext or, for the
 	// zim:// VFS, the DatabaseInstance captured at registration.
 	DBConfig::GetConfig(loader.GetDatabaseInstance())
-	    .AddExtensionOption(
-	        "zim_remote_search_max_local_index",
-	        "Maximum size (bytes) of a remote ZIM's full-text index to copy locally so "
-	        "search works; 0 disables remote search. Larger values cover bigger archives "
-	        "but lengthen the first remote search (the whole index is fetched once).",
-	        LogicalType::UBIGINT, Value::UBIGINT(8ull * 1024 * 1024));
+	    .AddExtensionOption("zim_remote_search_max_local_index",
+	                        "Maximum size (bytes) of a remote ZIM's full-text index to copy locally so "
+	                        "search works; 0 disables remote search. Larger values cover bigger archives "
+	                        "but lengthen the first remote search (the whole index is fetched once).",
+	                        LogicalType::UBIGINT, Value::UBIGINT(8ull * 1024 * 1024));
 
 	RegisterReadZim(loader);
 	RegisterZimMetadata(loader);
