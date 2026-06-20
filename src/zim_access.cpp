@@ -189,7 +189,14 @@ ZimArchive::ZimArchive(const std::string &file_path, FileSystem *fs) : file_path
 			// zim::Archive holds the reader alive (StreamFileReader keeps a
 			// shared_ptr to it), so we don't store it separately here.
 			auto reader = std::make_shared<DuckdbZimRemoteReader>(*fs, file_path);
-			archive_ = std::make_unique<zim::Archive>(reader);
+			// Enable remote full-text search for small indexes: libzim copies the
+			// (uncompressed) Xapian index blob out through the reader to a temp file
+			// when it is <= this cap, then opens Xapian on it. Without this the index
+			// needs a local fd and remote zim_search returns nothing.
+			// TODO: expose the cap as a DuckDB setting (zim_remote_search_max_local_index).
+			constexpr size_t kMaxLocalSearchIndexBytes = 32ull * 1024 * 1024; // 32 MB
+			archive_ = std::make_unique<zim::Archive>(
+			    reader, zim::OpenConfig().maxLocalSearchIndexBytes(kMaxLocalSearchIndexBytes));
 		} else {
 			// Local archive: libzim opens the file directly (mmap fast path).
 			archive_ = std::make_unique<zim::Archive>(file_path);
