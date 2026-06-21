@@ -62,3 +62,17 @@ statement error
 SELECT * FROM zim_search('test/oracle/test.zim', 'x', max_results := -1);
 ----
 must be >= 0
+
+# with_snippet := false skips snippet generation (which reads each hit's full body),
+# so the snippet column is NULL — a cheaper path, especially for remote archives.
+query I
+SELECT bool_and(snippet IS NULL) FROM zim_search('test/oracle/test.zim', 'plants', with_snippet := false);
+----
+true
+
+# results are otherwise identical with snippets off (same path/title/score ordering).
+query II
+SELECT path, title FROM zim_search('test/oracle/test.zim', 'plants', with_snippet := false) ORDER BY path;
+----
+A/Chlorophyll	Chlorophyll
+A/Photosynthesis	Photosynthesis

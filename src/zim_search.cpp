@@ -1,9 +1,9 @@
 //===----------------------------------------------------------------------===//
 // zim_search.cpp — full-text search + title suggestions over ZIM archives.
 //
-//   zim_search(files, query [, max_results := 25, result_offset := 0])
+//   zim_search(files, query [, max_results := 25, result_offset := 0, with_snippet := true])
 //       -> table(path, title, score DOUBLE, snippet VARCHAR, file VARCHAR)
-//   zim_suggest(files, query [, max_results := 25, result_offset := 0])
+//   zim_suggest(files, query [, max_results := 25, result_offset := 0, with_snippet := true])
 //       -> table(path, title, snippet VARCHAR, file VARCHAR)
 //
 // `files` is a single path, a glob, or a LIST(VARCHAR) — like read_zim — so a
@@ -41,6 +41,7 @@ struct SearchBindData : public TableFunctionData {
 	std::string query;
 	uint32_t max_results = 25;
 	uint32_t result_offset = 0;
+	bool with_snippet = true;
 };
 
 // A hit plus the archive it came from.
@@ -98,6 +99,8 @@ static void ParseSearchParams(SearchBindData &bind, TableFunctionBindInput &inpu
 			bind.max_results = NonNegativeParam(kv.second, "max_results");
 		} else if (kv.first == "result_offset") {
 			bind.result_offset = NonNegativeParam(kv.second, "result_offset");
+		} else if (kv.first == "with_snippet") {
+			bind.with_snippet = kv.second.GetValue<bool>();
 		} else {
 			throw BinderException("%s: unknown parameter '%s'", fn, kv.first);
 		}
@@ -133,7 +136,7 @@ unique_ptr<GlobalTableFunctionState> SearchInit(ClientContext &context, TableFun
 	// Per archive: up to max_results hits, each tagged with its source file.
 	for (auto &fp : bind.file_paths) {
 		auto archive = pool.Get(fp, fs, ResolveMaxLocalIndex(context));
-		for (auto &hit : archive->Search(bind.query, bind.result_offset, bind.max_results)) {
+		for (auto &hit : archive->Search(bind.query, bind.result_offset, bind.max_results, bind.with_snippet)) {
 			state->hits.push_back(TaggedHit {fp, std::move(hit)});
 		}
 	}
@@ -179,7 +182,7 @@ unique_ptr<GlobalTableFunctionState> SuggestInit(ClientContext &context, TableFu
 	auto *fs = &FileSystem::GetFileSystem(context);
 	for (auto &fp : bind.file_paths) {
 		auto archive = pool.Get(fp, fs, ResolveMaxLocalIndex(context));
-		for (auto &hit : archive->Suggest(bind.query, bind.result_offset, bind.max_results)) {
+		for (auto &hit : archive->Suggest(bind.query, bind.result_offset, bind.max_results, bind.with_snippet)) {
 			state->hits.push_back(TaggedHit {fp, std::move(hit)});
 		}
 	}
@@ -206,6 +209,7 @@ TableFunction MakeFn(const string &name, const LogicalType &files_type, table_fu
 	TableFunction f(name, {files_type, LogicalType::VARCHAR}, fn, bind, init);
 	f.named_parameters["max_results"] = LogicalType::BIGINT;
 	f.named_parameters["result_offset"] = LogicalType::BIGINT;
+	f.named_parameters["with_snippet"] = LogicalType::BOOLEAN;
 	return f;
 }
 

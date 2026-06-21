@@ -415,7 +415,8 @@ bool ZimArchive::HasFulltextIndex() const {
 	return archive_->hasFulltextIndex();
 }
 
-std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t offset, uint32_t limit) const {
+std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t offset, uint32_t limit,
+                                             bool with_snippet) const {
 	std::vector<ZimSearchHit> hits;
 #ifdef LIBZIM_WITH_XAPIAN
 	if (!archive_->hasFulltextIndex()) {
@@ -435,9 +436,14 @@ std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t 
 		hit.path = it.getPath();
 		hit.title = it.getTitle();
 		hit.score = static_cast<double>(it.getScore());
-		auto snippet = it.getSnippet();
-		if (!snippet.empty()) {
-			hit.snippet = std::move(snippet);
+		// Snippet generation reads each hit's full body (getData) to highlight it;
+		// skip it when the caller only wants ranked path/title -- much cheaper for
+		// remote archives (no content clusters fetched, just the index + dirents).
+		if (with_snippet) {
+			auto snippet = it.getSnippet();
+			if (!snippet.empty()) {
+				hit.snippet = std::move(snippet);
+			}
 		}
 		hits.push_back(std::move(hit));
 	}
@@ -450,7 +456,8 @@ std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t 
 	return hits;
 }
 
-std::vector<ZimSearchHit> ZimArchive::Suggest(const std::string &query, uint32_t offset, uint32_t limit) const {
+std::vector<ZimSearchHit> ZimArchive::Suggest(const std::string &query, uint32_t offset, uint32_t limit,
+                                              bool with_snippet) const {
 	std::vector<ZimSearchHit> hits;
 #ifdef LIBZIM_WITH_XAPIAN
 	zim::SuggestionSearcher searcher(*archive_);
@@ -460,7 +467,7 @@ std::vector<ZimSearchHit> ZimArchive::Suggest(const std::string &query, uint32_t
 		ZimSearchHit hit;
 		hit.path = it->getPath();
 		hit.title = it->getTitle();
-		if (it->hasSnippet()) {
+		if (with_snippet && it->hasSnippet()) {
 			hit.snippet = it->getSnippet();
 		}
 		hits.push_back(std::move(hit));

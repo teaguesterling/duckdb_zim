@@ -171,13 +171,15 @@ public:
 	// --- full-text search (optional libzim feature) ------------------------
 	bool HasFulltextIndex() const;
 	// Returns hits [offset, offset+limit). Empty when no fulltext index.
-	std::vector<ZimSearchHit> Search(const std::string &query, uint32_t offset, uint32_t limit) const;
+	std::vector<ZimSearchHit> Search(const std::string &query, uint32_t offset, uint32_t limit,
+	                                 bool with_snippet = true) const;
 
 	// --- title autocomplete ------------------------------------------------
 	// Ranked title suggestions [offset, offset+limit). Backed by libzim's
 	// SuggestionSearcher where xapian is present; degrades to a findByTitle
 	// prefix listing otherwise (so it works on search-less builds too).
-	std::vector<ZimSearchHit> Suggest(const std::string &query, uint32_t offset, uint32_t limit) const;
+	std::vector<ZimSearchHit> Suggest(const std::string &query, uint32_t offset, uint32_t limit,
+	                                  bool with_snippet = true) const;
 
 	// --- archive-level utilities -------------------------------------------
 	// Illustration (favicon / cover) PNG bytes of the requested square size;
