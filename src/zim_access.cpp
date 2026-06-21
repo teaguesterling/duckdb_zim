@@ -449,16 +449,26 @@ std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t 
 			hits.push_back(std::move(hit));
 		}
 	} catch (const std::exception &e) {
-		throw std::runtime_error(std::string("zim_search: could not open the full-text index for '") + file_path_ +
-		                         "': " + e.what() +
-		                         " (a remote index larger than zim_remote_search_max_local_index is "
-		                         "not copied locally -- raise the setting or use a local copy)");
+		// Only the "index exists but couldn't be opened" failure (getXapianDb returned
+		// null -> libzim throws "Cannot create Search without FT Xapian index") maps to
+		// the copy-cap advice. Surface anything else (httpfs read error, corrupt index,
+		// temp-file failure) unchanged so the message isn't misleading.
+		const std::string what = e.what();
+		if (what.find("Cannot create Search") != std::string::npos) {
+			throw std::runtime_error(std::string("zim_search: the full-text index for '") + file_path_ +
+			                         "' could not be opened -- a remote index larger than "
+			                         "zim_remote_search_max_local_index is not copied locally (raise the "
+			                         "setting or use a local copy); underlying error: " +
+			                         what);
+		}
+		throw;
 	}
 #else
 	// libzim built without xapian: no full-text search available. (void the args.)
 	(void)query;
 	(void)offset;
 	(void)limit;
+	(void)with_snippet;
 #endif
 	return hits;
 }
@@ -481,6 +491,7 @@ std::vector<ZimSearchHit> ZimArchive::Suggest(const std::string &query, uint32_t
 	}
 #else
 	// No xapian: fall back to a title-prefix listing (no ranking/snippet).
+	(void)with_snippet;
 	uint32_t skipped = 0;
 	for (auto entry : archive_->findByTitle(query)) {
 		if (skipped < offset) {
