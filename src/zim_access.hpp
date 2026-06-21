@@ -115,13 +115,19 @@ private:
 // RAII handle around a single open zim::Archive. Cheap to copy by shared_ptr
 // via the ArchivePool; never construct directly outside the pool in the binding
 // layer (the pool keeps the libzim cluster cache warm across queries).
+// Default cap for copying a remote ZIM's full-text index locally to enable search
+// (overridable via the zim_remote_search_max_local_index setting). Sized so the
+// first remote search stays snappy on broadband; big indexes want Phase B.
+static constexpr uint64_t DEFAULT_MAX_LOCAL_SEARCH_INDEX = 8ull * 1024 * 1024; // 8 MB
+
 class ZimArchive {
 public:
 	// Throws std::runtime_error (wrapping zim::ZimFileFormatError etc.) on failure.
 	// `fs` is only used when `file_path` is a remote URL (s3/http/...): the archive
 	// is then opened through a DuckDB FileHandle (byte-range reads) instead of the
 	// local mmap path. Local files ignore `fs` and keep the mmap fast path.
-	static std::shared_ptr<ZimArchive> Open(const std::string &file_path, FileSystem *fs = nullptr);
+	static std::shared_ptr<ZimArchive> Open(const std::string &file_path, FileSystem *fs = nullptr,
+	                                        uint64_t max_local_index_bytes = DEFAULT_MAX_LOCAL_SEARCH_INDEX);
 	~ZimArchive();
 
 	const std::string &FilePath() const {
@@ -183,7 +189,7 @@ public:
 	bool CheckIntegrity() const;
 
 private:
-	ZimArchive(const std::string &file_path, FileSystem *fs);
+	ZimArchive(const std::string &file_path, FileSystem *fs, uint64_t max_local_index_bytes);
 	std::string file_path_;
 	std::unique_ptr<zim::Archive> archive_; // owns the warm cluster cache
 };

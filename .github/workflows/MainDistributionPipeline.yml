@@ -62,3 +62,33 @@ jobs:
           path: wasm-artifacts
       - name: Check for unresolved libzim/zstd/lzma symbols
         run: bash test/wasm/run_wasm_checks.sh wasm-artifacts
+
+  # Remote full-text search can't be a sqllogictest (no server host), so run the
+  # test/remote/remote_search.sh integration test against the built linux artifact +
+  # a matching DuckDB CLI: serve the committed test.zim over http and assert a remote
+  # zim_search returns the same hits as the local search (the reader-copy path).
+  remote-search-test:
+    name: Remote search integration test
+    needs: [duckdb-stable-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download linux extension artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*linux_amd64*"
+          path: ext-artifacts
+      - name: Fetch matching DuckDB CLI (v1.5.2)
+        run: |
+          curl -fL -o duckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.5.2/duckdb_cli-linux-amd64.zip
+          unzip -o duckdb.zip -d duckdb-cli
+          ./duckdb-cli/duckdb --version
+      - name: Run remote search test
+        run: |
+          set -euo pipefail
+          ext="$(find ext-artifacts \( -name 'zim.duckdb_extension' -o -name 'zim.duckdb_extension.gz' \) | head -1)"
+          if [ -z "$ext" ]; then echo "no zim.duckdb_extension in artifacts:"; find ext-artifacts -type f; exit 1; fi
+          if [ "${ext##*.}" = "gz" ]; then gunzip -kf "$ext"; ext="${ext%.gz}"; fi
+          ext="$(readlink -f "$ext")"
+          echo "extension: $ext"
+          DUCKDB_BIN="$PWD/duckdb-cli/duckdb" ZIM_EXTENSION="$ext" bash test/remote/remote_search.sh

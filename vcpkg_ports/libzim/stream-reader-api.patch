@@ -134,8 +134,45 @@ index 42d98f2..82fe012 100644
      'item.h',
      'entry.h',
      'uuid.h',
+diff --git a/include/zim/zim.h b/include/zim/zim.h
+index d68d4e3..77154fb 100644
+--- a/include/zim/zim.h
++++ b/include/zim/zim.h
+@@ -24,6 +24,7 @@
+ 
+ #include <cstdint>
+ #include <string>
++#include <cstddef>
+ 
+ #ifdef __GNUC__
+ #define DEPRECATED __attribute__((deprecated))
+@@ -127,8 +128,24 @@ namespace zim
+        return OpenConfig(*this).preloadDirentRanges(nbRanges);
+      }
+ 
++     /**
++      * Cap (in bytes) for the remote/reader-backed full-text search fallback:
++      * when an archive is opened from an IRandomAccessReader (no local file),
++      * Xapian cannot mmap the index. If the (uncompressed) index is at most this
++      * many bytes, libzim copies just the index blob out through the reader to a
++      * temp file and opens Xapian on that. 0 (default) disables the fallback.
++      */
++     OpenConfig& maxLocalSearchIndexBytes(size_t bytes) {
++       m_maxLocalSearchIndexBytes = bytes;
++       return *this;
++     }
++     OpenConfig maxLocalSearchIndexBytes(size_t bytes) const {
++       return OpenConfig(*this).maxLocalSearchIndexBytes(bytes);
++     }
++
+      bool m_preloadXapianDb;
+      int  m_preloadDirentRanges;
++     size_t m_maxLocalSearchIndexBytes;
+   };
+ 
+   struct FdInput {
 diff --git a/src/archive.cpp b/src/archive.cpp
-index a9addfc..19eb202 100644
+index a9addfc..e3a5ade 100644
 --- a/src/archive.cpp
 +++ b/src/archive.cpp
 @@ -26,6 +26,7 @@
@@ -146,7 +183,17 @@ index a9addfc..19eb202 100644
  #include "tools.h"
  #include "log.h"
  
-@@ -81,6 +82,16 @@ namespace zim
+@@ -36,7 +37,8 @@ namespace zim
+   OpenConfig::OpenConfig()
+     :
+         m_preloadXapianDb(true),
+-        m_preloadDirentRanges(DIRENT_LOOKUP_CACHE_SIZE)
++        m_preloadDirentRanges(DIRENT_LOOKUP_CACHE_SIZE),
++        m_maxLocalSearchIndexBytes(0)
+     { }
+ 
+   Archive::Archive(const std::string& fname)
+@@ -81,6 +83,16 @@ namespace zim
      { }
  #endif
  
@@ -163,6 +210,20 @@ index a9addfc..19eb202 100644
    const std::string& Archive::getFilename() const
    {
      return m_impl->getFilename();
+@@ -394,7 +406,12 @@ namespace zim
+     auto entry = Entry(m_impl, entry_index_type(r.second));
+     auto item = entry.getItem(true);
+     auto accessInfo = item.getDirectAccessInformation();
+-    return accessInfo.isValid();
++    if (accessInfo.isValid()) {
++      return true;
++    }
++    // Reader-backed (remote) archive: no direct file access, but the index is
++    // still searchable if it can be copied locally (loadXapianDb's fallback).
++    return m_impl->canCopySearchIndexLocally(r.second);
+   }
+ 
+   bool Archive::hasTitleIndex() const {
 diff --git a/src/file_reader.cpp b/src/file_reader.cpp
 index 1bc7481..78b6430 100644
 --- a/src/file_reader.cpp
@@ -272,10 +333,21 @@ index 5218ff6..346ddf0 100644
    public:
      explicit MultiPartFileReader(std::shared_ptr<const FileCompound> source);
 diff --git a/src/fileimpl.cpp b/src/fileimpl.cpp
-index c55f5a0..68fd875 100644
+index c55f5a0..c974f09 100644
 --- a/src/fileimpl.cpp
 +++ b/src/fileimpl.cpp
-@@ -195,9 +195,20 @@ private: // data
+@@ -26,6 +26,10 @@
+ #ifdef ENABLE_XAPIAN
+ #include "search_internal.h"
+ #include "xapian.h"
++#ifndef _WIN32
++#include <unistd.h>
++#include <cstdlib>
++#endif
+ #endif
+ 
+ #include "zim_types.h"
+@@ -195,9 +199,20 @@ private: // data
  #endif
  
    FileImpl::FileImpl(std::shared_ptr<FileCompound> _zimFile, OpenConfig openConfig)
@@ -297,12 +369,13 @@ index c55f5a0..68fd875 100644
        m_hasFrontArticlesIndex(true),
        m_startUserEntry(0),
        m_endUserEntry(0)
-@@ -205,10 +216,13 @@ private: // data
+@@ -205,10 +220,14 @@ private: // data
        ,m_xapianDbCreated(false)
  #endif
    {
 -    log_trace("read file \"" << zimFile->filename() << '"');
 +    log_trace("read file \"" << m_filename << '"');
++    m_maxLocalSearchIndexBytes = openConfig.m_maxLocalSearchIndexBytes;
 +
 +    if (zimFile && zimFile->fail())
 +      throw ZimFileFormatError(std::string("can't open zim-file \"") + m_filename + '"');
@@ -314,7 +387,7 @@ index c55f5a0..68fd875 100644
  
      // read header
      if (size_type(zimReader->size()) < Fileheader::size) {
-@@ -607,6 +621,13 @@ private: // data
+@@ -607,6 +626,13 @@ private: // data
      if (!header.hasChecksum())
        return false;
  
@@ -328,7 +401,7 @@ index c55f5a0..68fd875 100644
      struct zim_MD5_CTX md5ctx;
      zim_MD5Init(&md5ctx);
  
-@@ -663,7 +684,7 @@ private: // data
+@@ -663,7 +689,7 @@ private: // data
    }
  
    time_t FileImpl::getMTime() const {
@@ -337,7 +410,7 @@ index c55f5a0..68fd875 100644
    }
  
    zim::zsize_t FileImpl::getFilesize() const {
-@@ -671,7 +692,7 @@ private: // data
+@@ -671,7 +697,7 @@ private: // data
    }
  
    bool FileImpl::is_multiPart() const {
@@ -346,7 +419,7 @@ index c55f5a0..68fd875 100644
    }
  
    bool FileImpl::checkIntegrity(IntegrityCheck checkType) {
-@@ -845,6 +866,10 @@ bool checkTitleListing(const IndirectDirentAccessor& accessor, entry_index_type
+@@ -845,6 +871,10 @@ bool checkTitleListing(const IndirectDirentAccessor& accessor, entry_index_type
  
    ItemDataDirectAccessInfo FileImpl::getDirectAccessInformation(cluster_index_t clusterIdx, blob_index_t blobIdx) const
    {
@@ -357,8 +430,82 @@ index c55f5a0..68fd875 100644
      auto cluster = getCluster(clusterIdx);
      if (cluster->isCompressed()) {
        return ItemDataDirectAccessInfo();
+@@ -879,6 +909,19 @@ bool checkTitleListing(const IndirectDirentAccessor& accessor, entry_index_type
+     return cluster->getBlob(dirent.getBlobNumber(), offset, size);
+   }
+ 
++  bool FileImpl::canCopySearchIndexLocally(entry_index_t idx) const {
++    if (zimFile || m_maxLocalSearchIndexBytes == 0) {
++      return false;
++    }
++    auto dirent = getDirent(idx);
++    if (dirent->isRedirect()) {
++      return false;
++    }
++    auto cluster = getCluster(dirent->getClusterNumber());
++    zsize_t sz = cluster->getBlobSize(dirent->getBlobNumber());
++    return sz.v > 0 && sz.v <= m_maxLocalSearchIndexBytes;
++  }
++
+ #ifdef ENABLE_XAPIAN
+   std::shared_ptr<XapianDb> FileImpl::loadXapianDb() {
+     FileImpl::FindxResult r;
+@@ -893,13 +936,48 @@ bool checkTitleListing(const IndirectDirentAccessor& accessor, entry_index_type
+     if (xapianDirent->isRedirect()) {
+       return nullptr;
+     }
++    Xapian::Database xapianDatabase;
+     auto accessInfo = getDirectAccessInformation(xapianDirent->getClusterNumber(), xapianDirent->getBlobNumber());
+-    if (!accessInfo.isValid()) {
++    if (accessInfo.isValid()) {
++      if (!getDbFromAccessInfo(accessInfo, xapianDatabase)) {
++        return nullptr;
++      }
++    } else if (!zimFile && m_maxLocalSearchIndexBytes > 0) {
++      // Reader-backed (remote) archive: no on-disk file for Xapian to mmap. If the
++      // (uncompressed) index is small enough, copy just the index blob out through
++      // the reader to a temp file and open Xapian on its fd. Large indexes need the
++      // random-access glass reader (future work).
++#ifndef _WIN32
++      auto cluster = getCluster(xapianDirent->getClusterNumber());
++      zsize_t idxSize = cluster->getBlobSize(xapianDirent->getBlobNumber());
++      if (idxSize.v == 0 || idxSize.v > m_maxLocalSearchIndexBytes) {
++        return nullptr;
++      }
++      auto blob = getBlob(*xapianDirent);
++      char tmpl[] = "/tmp/libzim-xapian-XXXXXX";
++      int tmpfd = mkstemp(tmpl);
++      if (tmpfd < 0) {
++        return nullptr;
++      }
++      ::unlink(tmpl); // anonymous: inode stays alive via the fd, removed on close
++      const char* data = blob.data();
++      size_t remaining = blob.size();
++      while (remaining > 0) {
++        ssize_t w = ::write(tmpfd, data, remaining);
++        if (w <= 0) { ::close(tmpfd); return nullptr; }
++        data += w; remaining -= size_t(w);
++      }
++      if (::lseek(tmpfd, 0, SEEK_SET) != 0) { ::close(tmpfd); return nullptr; }
++      try {
++        xapianDatabase = Xapian::Database(tmpfd); // Xapian takes ownership of the fd
++      } catch (Xapian::DatabaseError&) {
++        ::close(tmpfd);
++        return nullptr;
++      }
++#else
+       return nullptr;
+-    }
+-
+-    Xapian::Database xapianDatabase;
+-    if (!getDbFromAccessInfo(accessInfo, xapianDatabase)) {
++#endif
++    } else {
+       return nullptr;
+     }
+ 
 diff --git a/src/fileimpl.h b/src/fileimpl.h
-index 7aba4f2..fac98b6 100644
+index 7aba4f2..91a20b0 100644
 --- a/src/fileimpl.h
 +++ b/src/fileimpl.h
 @@ -54,9 +54,10 @@ namespace zim
@@ -373,7 +520,17 @@ index 7aba4f2..fac98b6 100644
        Fileheader header;
  
        std::unique_ptr<const Reader> clusterOffsetReader;
-@@ -116,11 +117,14 @@ namespace zim
+@@ -100,6 +101,9 @@ namespace zim
+       using ByTitleDirentLookup = zim::DirentLookup<ByTitleDirentLookupConfig>;
+       std::unique_ptr<ByTitleDirentLookup> m_byTitleDirentLookup;
+ 
++      // Cap for the remote/reader-backed Xapian local-copy fallback (0 = off).
++      size_t m_maxLocalSearchIndexBytes = 0;
++
+ #ifdef ENABLE_XAPIAN
+       std::shared_ptr<XapianDb> mp_xapianDb;
+       mutable std::mutex m_xapianDbCreationMutex;
+@@ -116,11 +120,14 @@ namespace zim
        FileImpl(FdInput fd, OpenConfig openConfig);
        FileImpl(const std::vector<FdInput>& fds, OpenConfig openConfig);
  #endif
@@ -389,7 +546,19 @@ index 7aba4f2..fac98b6 100644
        const Fileheader& getFileheader() const  { return header; }
        zsize_t getFilesize() const;
        bool hasNewNamespaceScheme() const { return header.useNewNamespaceScheme(); }
-@@ -180,6 +184,10 @@ namespace zim
+@@ -173,6 +180,11 @@ namespace zim
+       size_t getDirentCacheCurrentSize() const;
+       void setDirentCacheMaxSize(size_t nbDirents);
+ 
++      // True if the fulltext index at `idx` is searchable by copying it out
++      // through the reader to a temp file (reader-backed archive + index within
++      // m_maxLocalSearchIndexBytes). Mirrors loadXapianDb's reader-copy branch.
++      bool canCopySearchIndexLocally(entry_index_t idx) const;
++
+ #ifdef ENABLE_XAPIAN
+       std::shared_ptr<XapianDb> loadXapianDb();
+       std::shared_ptr<XapianDb> getXapianDb();
+@@ -180,6 +192,10 @@ namespace zim
    private:
        FileImpl(std::shared_ptr<FileCompound> zimFile, OpenConfig openConfig);
        FileImpl(std::shared_ptr<FileCompound> zimFile, offset_t offset, zsize_t size, OpenConfig openConfig);

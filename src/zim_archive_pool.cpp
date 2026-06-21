@@ -30,7 +30,8 @@ static std::string CanonicalKey(const std::string &file_path) {
 	}
 }
 
-std::shared_ptr<ZimArchive> ArchivePool::Get(const std::string &file_path, FileSystem *fs) {
+std::shared_ptr<ZimArchive> ArchivePool::Get(const std::string &file_path, FileSystem *fs,
+                                             uint64_t max_local_index_bytes) {
 	const std::string key = CanonicalKey(file_path);
 	std::lock_guard<std::mutex> guard(mu_);
 
@@ -44,7 +45,10 @@ std::shared_ptr<ZimArchive> ArchivePool::Get(const std::string &file_path, FileS
 	}
 
 	// Open with the caller's original path so the error message shows what they passed.
-	auto archive = ZimArchive::Open(file_path, fs); // may throw
+	// NOTE: the cache key omits max_local_index_bytes; the first opener's cap sticks for
+	// the cached handle. The setting is global, so this only matters if it is changed and
+	// a non-search query opens the same remote archive first (the cap only affects search).
+	auto archive = ZimArchive::Open(file_path, fs, max_local_index_bytes); // may throw
 	cache_[key] = archive;
 	Pin(key, archive);
 	return archive;
