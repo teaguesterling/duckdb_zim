@@ -422,30 +422,37 @@ std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t 
 	if (!archive_->hasFulltextIndex()) {
 		return hits; // caller decides whether to fall back to title search
 	}
-	zim::Searcher searcher(*archive_);
-	zim::Query q;
-	q.setQuery(query);
-	auto search = searcher.search(q);
-	auto results = search.getResults(offset, limit);
-	// The pinned libzim (9.7.0) SearchIterator exposes getScore() (an int rank)
-	// and getSnippet(). Snippet generation is best-effort: it can come back empty
-	// (e.g. the query produced no highlightable span), in which case we leave it
-	// NULL rather than emit an empty string.
-	for (auto it = results.begin(); it != results.end(); ++it) {
-		ZimSearchHit hit;
-		hit.path = it.getPath();
-		hit.title = it.getTitle();
-		hit.score = static_cast<double>(it.getScore());
-		// Snippet generation reads each hit's full body (getData) to highlight it;
-		// skip it when the caller only wants ranked path/title -- much cheaper for
-		// remote archives (no content clusters fetched, just the index + dirents).
-		if (with_snippet) {
-			auto snippet = it.getSnippet();
-			if (!snippet.empty()) {
-				hit.snippet = std::move(snippet);
+	// hasFulltextIndex() reports index *existence*; opening it can still fail when a
+	// remote index exceeds zim_remote_search_max_local_index (not copied locally).
+	// Catch that and surface an actionable error rather than returning silent empties
+	// (which would read as "no matches").
+	try {
+		zim::Searcher searcher(*archive_);
+		zim::Query q;
+		q.setQuery(query);
+		auto search = searcher.search(q);
+		auto results = search.getResults(offset, limit);
+		for (auto it = results.begin(); it != results.end(); ++it) {
+			ZimSearchHit hit;
+			hit.path = it.getPath();
+			hit.title = it.getTitle();
+			hit.score = static_cast<double>(it.getScore());
+			// Snippet generation reads each hit's full body (getData) to highlight it;
+			// skip it when the caller only wants ranked path/title -- much cheaper for
+			// remote archives (no content clusters fetched, just the index + dirents).
+			if (with_snippet) {
+				auto snippet = it.getSnippet();
+				if (!snippet.empty()) {
+					hit.snippet = std::move(snippet);
+				}
 			}
+			hits.push_back(std::move(hit));
 		}
-		hits.push_back(std::move(hit));
+	} catch (const std::exception &e) {
+		throw std::runtime_error(std::string("zim_search: could not open the full-text index for '") + file_path_ +
+		                         "': " + e.what() +
+		                         " (a remote index larger than zim_remote_search_max_local_index is "
+		                         "not copied locally -- raise the setting or use a local copy)");
 	}
 #else
 	// libzim built without xapian: no full-text search available. (void the args.)

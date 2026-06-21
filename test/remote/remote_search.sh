@@ -54,5 +54,20 @@ sql2="LOAD '$ZIM_EXTENSION'; INSTALL httpfs; LOAD httpfs;
 n="$("$DUCKDB_BIN" -unsigned -noheader -list -c "$sql2" 2>/dev/null | tail -1 || echo 0)"
 if [ "${n:-0}" -lt 1 ]; then echo "FAIL: narrow remote query returned no hits ($n)"; fail=1; fi
 
+# has_fulltext_index reports index *existence* over http (not copyability): a remote
+# archive whose index exceeds the cap must still report true (regression guard for the
+# bug where it returned false for big-index remote archives).
+fts="$("$DUCKDB_BIN" -unsigned -noheader -list \
+  -c "LOAD '$ZIM_EXTENSION'; INSTALL httpfs; LOAD httpfs; SELECT zim_info('$url').has_fulltext_index;" 2>/dev/null | tail -1)"
+if [ "$fts" != "true" ]; then echo "FAIL: remote has_fulltext_index='$fts' (expected true)"; fail=1; fi
+
+# When the index can't be copied locally (here forced with a 1-byte cap), search must
+# surface a clear, actionable error rather than silent empty rows.
+err="$("$DUCKDB_BIN" -unsigned \
+  -c "LOAD '$ZIM_EXTENSION'; INSTALL httpfs; LOAD httpfs; SET zim_remote_search_max_local_index=1; SELECT count(*) FROM zim_search('$url','plants');" 2>&1 || true)"
+if ! grep -q "zim_remote_search_max_local_index" <<<"$err"; then
+  echo "FAIL: over-cap remote search did not surface the actionable error; got: $err"; fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then echo "PASS: remote zim_search matches local search"; fi
 exit "$fail"
