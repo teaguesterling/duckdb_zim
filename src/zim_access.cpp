@@ -415,42 +415,66 @@ bool ZimArchive::HasFulltextIndex() const {
 	return archive_->hasFulltextIndex();
 }
 
-std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t offset, uint32_t limit) const {
+std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t offset, uint32_t limit,
+                                             bool with_snippet) const {
 	std::vector<ZimSearchHit> hits;
 #ifdef LIBZIM_WITH_XAPIAN
 	if (!archive_->hasFulltextIndex()) {
 		return hits; // caller decides whether to fall back to title search
 	}
-	zim::Searcher searcher(*archive_);
-	zim::Query q;
-	q.setQuery(query);
-	auto search = searcher.search(q);
-	auto results = search.getResults(offset, limit);
-	// The pinned libzim (9.7.0) SearchIterator exposes getScore() (an int rank)
-	// and getSnippet(). Snippet generation is best-effort: it can come back empty
-	// (e.g. the query produced no highlightable span), in which case we leave it
-	// NULL rather than emit an empty string.
-	for (auto it = results.begin(); it != results.end(); ++it) {
-		ZimSearchHit hit;
-		hit.path = it.getPath();
-		hit.title = it.getTitle();
-		hit.score = static_cast<double>(it.getScore());
-		auto snippet = it.getSnippet();
-		if (!snippet.empty()) {
-			hit.snippet = std::move(snippet);
+	// hasFulltextIndex() reports index *existence*; opening it can still fail when a
+	// remote index exceeds zim_remote_search_max_local_index (not copied locally).
+	// Catch that and surface an actionable error rather than returning silent empties
+	// (which would read as "no matches").
+	try {
+		zim::Searcher searcher(*archive_);
+		zim::Query q;
+		q.setQuery(query);
+		auto search = searcher.search(q);
+		auto results = search.getResults(offset, limit);
+		for (auto it = results.begin(); it != results.end(); ++it) {
+			ZimSearchHit hit;
+			hit.path = it.getPath();
+			hit.title = it.getTitle();
+			hit.score = static_cast<double>(it.getScore());
+			// Snippet generation reads each hit's full body (getData) to highlight it;
+			// skip it when the caller only wants ranked path/title -- much cheaper for
+			// remote archives (no content clusters fetched, just the index + dirents).
+			if (with_snippet) {
+				auto snippet = it.getSnippet();
+				if (!snippet.empty()) {
+					hit.snippet = std::move(snippet);
+				}
+			}
+			hits.push_back(std::move(hit));
 		}
-		hits.push_back(std::move(hit));
+	} catch (const std::exception &e) {
+		// Only the "index exists but couldn't be opened" failure (getXapianDb returned
+		// null -> libzim throws "Cannot create Search without FT Xapian index") maps to
+		// the copy-cap advice. Surface anything else (httpfs read error, corrupt index,
+		// temp-file failure) unchanged so the message isn't misleading.
+		const std::string what = e.what();
+		if (what.find("Cannot create Search") != std::string::npos) {
+			throw std::runtime_error(std::string("zim_search: the full-text index for '") + file_path_ +
+			                         "' could not be opened -- a remote index larger than "
+			                         "zim_remote_search_max_local_index is not copied locally (raise the "
+			                         "setting or use a local copy); underlying error: " +
+			                         what);
+		}
+		throw;
 	}
 #else
 	// libzim built without xapian: no full-text search available. (void the args.)
 	(void)query;
 	(void)offset;
 	(void)limit;
+	(void)with_snippet;
 #endif
 	return hits;
 }
 
-std::vector<ZimSearchHit> ZimArchive::Suggest(const std::string &query, uint32_t offset, uint32_t limit) const {
+std::vector<ZimSearchHit> ZimArchive::Suggest(const std::string &query, uint32_t offset, uint32_t limit,
+                                              bool with_snippet) const {
 	std::vector<ZimSearchHit> hits;
 #ifdef LIBZIM_WITH_XAPIAN
 	zim::SuggestionSearcher searcher(*archive_);
@@ -460,13 +484,14 @@ std::vector<ZimSearchHit> ZimArchive::Suggest(const std::string &query, uint32_t
 		ZimSearchHit hit;
 		hit.path = it->getPath();
 		hit.title = it->getTitle();
-		if (it->hasSnippet()) {
+		if (with_snippet && it->hasSnippet()) {
 			hit.snippet = it->getSnippet();
 		}
 		hits.push_back(std::move(hit));
 	}
 #else
 	// No xapian: fall back to a title-prefix listing (no ranking/snippet).
+	(void)with_snippet;
 	uint32_t skipped = 0;
 	for (auto entry : archive_->findByTitle(query)) {
 		if (skipped < offset) {
