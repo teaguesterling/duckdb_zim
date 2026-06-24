@@ -1,0 +1,520 @@
+diff --git a/backends/dbfactory.cc b/backends/dbfactory.cc
+index 7d8e1ff..7a150b5 100644
+--- a/backends/dbfactory.cc
++++ b/backends/dbfactory.cc
+@@ -27,6 +27,7 @@
+ #include "xapian/constants.h"
+ #include "xapian/database.h"
+ #include "xapian/error.h"
++#include "xapian/randomaccessreader.h"
+ #include "xapian/version.h" // For XAPIAN_HAS_XXX_BACKEND.
+ 
+ #include "backends.h"
+@@ -257,6 +258,25 @@ Database::Database(const string &path, int flags)
+     throw DatabaseNotFoundError("Couldn't detect type of database");
+ }
+ 
++Xapian::RandomAccessReader::~RandomAccessReader() { }
++
++Database::Database(RandomAccessReader& reader, int flags)
++{
++    LOGCALL_CTOR(API, "Database", "reader"|flags);
++#ifdef XAPIAN_HAS_GLASS_BACKEND
++    int type = flags & DB_BACKEND_MASK_;
++    switch (type) {
++	case 0: case DB_BACKEND_GLASS:
++	    internal.push_back(new GlassDatabase(reader));
++	    return;
++    }
++#else
++    (void)reader;
++    (void)flags;
++#endif
++    throw DatabaseOpeningError("Couldn't detect type of database");
++}
++
+ Database::Database(int fd, int flags)
+ {
+     LOGCALL_CTOR(API, "Database", fd|flags);
+diff --git a/backends/glass/glass_database.cc b/backends/glass/glass_database.cc
+index 18e3614..1a91c69 100644
+--- a/backends/glass/glass_database.cc
++++ b/backends/glass/glass_database.cc
+@@ -178,6 +178,24 @@ GlassDatabase::GlassDatabase(int fd)
+     open_tables(Xapian::DB_READONLY_);
+ }
+ 
++GlassDatabase::GlassDatabase(const Xapian::RandomAccessReader& reader)
++	: db_dir(),
++	  readonly(true),
++	  version_file(reader),
++	  postlist_table(reader, version_file.get_offset(), readonly),
++	  position_table(reader, version_file.get_offset(), readonly),
++	  termlist_table(reader, version_file.get_offset(), readonly, true),
++	  value_manager(&postlist_table, &termlist_table),
++	  synonym_table(reader, version_file.get_offset(), readonly),
++	  spelling_table(reader, version_file.get_offset(), readonly),
++	  docdata_table(reader, version_file.get_offset(), readonly),
++	  lock(),
++	  changes(string())
++{
++    LOGCALL_CTOR(DB, "GlassDatabase", "reader");
++    open_tables(Xapian::DB_READONLY_);
++}
++
+ GlassDatabase::~GlassDatabase()
+ {
+     LOGCALL_DTOR(DB, "GlassDatabase");
+diff --git a/backends/glass/glass_database.h b/backends/glass/glass_database.h
+index dfdd555..28912fe 100644
+--- a/backends/glass/glass_database.h
++++ b/backends/glass/glass_database.h
+@@ -231,6 +231,9 @@ class GlassDatabase : public Xapian::Database::Internal {
+ 
+     explicit GlassDatabase(int fd);
+ 
++    /// Open a single-file glass database backed by a RandomAccessReader.
++    explicit GlassDatabase(const Xapian::RandomAccessReader& reader);
++
+     ~GlassDatabase();
+ 
+     /// Get a postlist table cursor (used by GlassValueList).
+diff --git a/backends/glass/glass_docdata.h b/backends/glass/glass_docdata.h
+index 90b6075..92cb08b 100644
+--- a/backends/glass/glass_docdata.h
++++ b/backends/glass/glass_docdata.h
+@@ -50,6 +50,9 @@ class GlassDocDataTable : public GlassLazyTable {
+     GlassDocDataTable(int fd, off_t offset_, bool readonly)
+ 	: GlassLazyTable("docdata", fd, offset_, readonly) { }
+ 
++    GlassDocDataTable(const Xapian::RandomAccessReader & reader, off_t offset_, bool readonly)
++	: GlassLazyTable("docdata", reader, offset_, readonly) { }
++
+     /** Get the document data for document @a did.
+      *
+      *  If the document doesn't exist, the empty string is returned.
+diff --git a/backends/glass/glass_lazytable.h b/backends/glass/glass_lazytable.h
+index 36cdcb9..60ab2c9 100644
+--- a/backends/glass/glass_lazytable.h
++++ b/backends/glass/glass_lazytable.h
+@@ -36,6 +36,10 @@ class GlassLazyTable : public GlassTable {
+ 
+     GlassLazyTable(const char * name_, int fd, off_t offset_, bool readonly)
+ 	: GlassTable(name_, fd, offset_, readonly, true) { }
++
++    GlassLazyTable(const char * name_, const Xapian::RandomAccessReader & reader,
++		   off_t offset_, bool readonly)
++	: GlassTable(name_, reader, offset_, readonly, true) { }
+ };
+ 
+ #endif // XAPIAN_INCLUDED_GLASS_LAZYTABLE_H
+diff --git a/backends/glass/glass_positionlist.h b/backends/glass/glass_positionlist.h
+index 8301720..79e33a7 100644
+--- a/backends/glass/glass_positionlist.h
++++ b/backends/glass/glass_positionlist.h
+@@ -57,6 +57,9 @@ class GlassPositionListTable : public GlassLazyTable {
+     GlassPositionListTable(int fd, off_t offset_, bool readonly_)
+ 	: GlassLazyTable("position", fd, offset_, readonly_) { }
+ 
++    GlassPositionListTable(const Xapian::RandomAccessReader & reader, off_t offset_, bool readonly_)
++	: GlassLazyTable("position", reader, offset_, readonly_) { }
++
+     /** Pack a position list into a string.
+      *
+      *  @param s The string to append the position list data to.
+diff --git a/backends/glass/glass_postlist.h b/backends/glass/glass_postlist.h
+index cb718c0..0c12641 100644
+--- a/backends/glass/glass_postlist.h
++++ b/backends/glass/glass_postlist.h
+@@ -79,6 +79,11 @@ class GlassPostListTable : public GlassTable {
+ 	  doclen_pl()
+     { }
+ 
++    GlassPostListTable(const Xapian::RandomAccessReader & reader, off_t offset_, bool readonly_)
++	: GlassTable("postlist", reader, offset_, readonly_),
++	  doclen_pl()
++    { }
++
+     void open(int flags_, const RootInfo & root_info,
+ 	      glass_revision_number_t rev) {
+ 	doclen_pl.reset(0);
+diff --git a/backends/glass/glass_spelling.h b/backends/glass/glass_spelling.h
+index ff92d6c..e3fc7db 100644
+--- a/backends/glass/glass_spelling.h
++++ b/backends/glass/glass_spelling.h
+@@ -94,6 +94,9 @@ class GlassSpellingTable : public GlassLazyTable {
+     GlassSpellingTable(int fd, off_t offset_, bool readonly)
+ 	: GlassLazyTable("spelling", fd, offset_, readonly) { }
+ 
++    GlassSpellingTable(const Xapian::RandomAccessReader & reader, off_t offset_, bool readonly)
++	: GlassLazyTable("spelling", reader, offset_, readonly) { }
++
+     /** Merge in batched-up changes.
+      *
+      *  @return Updated upperbound on the word frequency.
+diff --git a/backends/glass/glass_synonym.h b/backends/glass/glass_synonym.h
+index d241be7..d8190bc 100644
+--- a/backends/glass/glass_synonym.h
++++ b/backends/glass/glass_synonym.h
+@@ -58,6 +58,9 @@ class GlassSynonymTable : public GlassLazyTable {
+     GlassSynonymTable(int fd, off_t offset_, bool readonly)
+ 	: GlassLazyTable("synonym", fd, offset_, readonly) { }
+ 
++    GlassSynonymTable(const Xapian::RandomAccessReader & reader, off_t offset_, bool readonly)
++	: GlassLazyTable("synonym", reader, offset_, readonly) { }
++
+     // Merge in batched-up changes.
+     void merge_changes();
+ 
+diff --git a/backends/glass/glass_table.cc b/backends/glass/glass_table.cc
+index 1d6e501..5246927 100644
+--- a/backends/glass/glass_table.cc
++++ b/backends/glass/glass_table.cc
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include <config.h>
++#include "xapian/randomaccessreader.h"
+ 
+ #include "glass_table.h"
+ 
+@@ -165,7 +166,14 @@ GlassTable::read_block(uint4 n, uint8_t * p) const
+ 	GlassTable::throw_database_closed();
+     AssertRel(n,<,free_list.get_first_unused_block());
+ 
+-    io_read_block(handle, reinterpret_cast<char *>(p), block_size, n, offset);
++    if (m_reader) {
++	off_t pos = offset + off_t(n) * block_size;
++	size_t got = m_reader->read_at(reinterpret_cast<char *>(p), pos, block_size);
++	if (got != size_t(block_size))
++	    throw Xapian::DatabaseCorruptError("Short read of glass block");
++    } else {
++	io_read_block(handle, reinterpret_cast<char *>(p), block_size, n, offset);
++    }
+ 
+     if (GET_LEVEL(p) != LEVEL_FREELIST) {
+ 	int dir_end = DIR_END(p);
+@@ -1442,6 +1450,10 @@ GlassTable::readahead_key(const string &key) const
+     if (handle < 0)
+ 	RETURN(false);
+ 
++    // Reader-backed databases have no fd to readahead through.
++    if (m_reader)
++	RETURN(false);
++
+     // If the table only has one level, there are no branch blocks to preread.
+     if (level == 0)
+ 	RETURN(false);
+@@ -1728,6 +1740,43 @@ GlassTable::GlassTable(const char * tablename_, const string & path_,
+     LOGCALL_CTOR(DB, "GlassTable", tablename_ | path_ | readonly_ | lazy_);
+ }
+ 
++GlassTable::GlassTable(const char * tablename_,
++		       const Xapian::RandomAccessReader & reader,
++		       off_t offset_, bool readonly_, bool lazy_)
++	: tablename(tablename_),
++	  revision_number(0),
++	  item_count(0),
++	  block_size(0),
++	  faked_root_block(true),
++	  sequential(true),
++	  handle(-3),
++	  level(0),
++	  root(0),
++	  kt(0),
++	  buffer(0),
++	  free_list(),
++	  name(),
++	  seq_count(0),
++	  changed_n(0),
++	  changed_c(0),
++	  max_item_size(0),
++	  Btree_modified(false),
++	  full_compaction(false),
++	  writable(!readonly_),
++	  cursor_created_since_last_modification(false),
++	  cursor_version(0),
++	  changes_obj(NULL),
++	  split_p(0),
++	  compress_min(0),
++	  comp_stream(Z_DEFAULT_STRATEGY),
++	  lazy(lazy_),
++	  last_readahead(BLK_UNUSED),
++	  offset(offset_)
++{
++    LOGCALL_CTOR(DB, "GlassTable", tablename_ | "reader" | offset_ | readonly_ | lazy_);
++    m_reader = &reader;
++}
++
+ GlassTable::GlassTable(const char * tablename_, int fd, off_t offset_,
+ 		       bool readonly_, bool lazy_)
+ 	: tablename(tablename_),
+diff --git a/backends/glass/glass_table.h b/backends/glass/glass_table.h
+index bc0a991..e72af6a 100644
+--- a/backends/glass/glass_table.h
++++ b/backends/glass/glass_table.h
+@@ -427,6 +427,8 @@ class GlassChanges;
+  *  Tags which are null strings _are_ valid, and are different from a
+  *  tag simply not being in the table.
+  */
++namespace Xapian { class RandomAccessReader; }
++
+ class GlassTable {
+     friend class GlassCursor; /* Should probably fix this. */
+     friend class GlassFreeList;
+@@ -470,6 +472,10 @@ class GlassTable {
+     GlassTable(const char * tablename_, int fd, off_t offset_,
+ 	       bool readonly_, bool lazy = false);
+ 
++    /// Construct a single-file table backed by a RandomAccessReader.
++    GlassTable(const char * tablename_, const Xapian::RandomAccessReader& reader,
++	       off_t offset_, bool readonly_, bool lazy = false);
++
+     /** Close the Btree.
+      *
+      *  Any outstanding changes (ie, changes made without commit() having
+@@ -794,6 +800,9 @@ class GlassTable {
+      */
+     int handle;
+ 
++    /// If non-NULL, blocks are read from here instead of handle.
++    const Xapian::RandomAccessReader* m_reader = NULL;
++
+     /// number of levels, counting from 0
+     int level;
+ 
+diff --git a/backends/glass/glass_termlisttable.h b/backends/glass/glass_termlisttable.h
+index 2230235..13cea72 100644
+--- a/backends/glass/glass_termlisttable.h
++++ b/backends/glass/glass_termlisttable.h
+@@ -56,6 +56,9 @@ class GlassTermListTable : public GlassTable {
+     GlassTermListTable(int fd, off_t offset_, bool readonly, bool lazy_)
+ 	: GlassTable("termlist", fd, offset_, readonly, lazy_) { }
+ 
++    GlassTermListTable(const Xapian::RandomAccessReader & reader, off_t offset_, bool readonly, bool lazy_)
++	: GlassTable("termlist", reader, offset_, readonly, lazy_) { }
++
+     /** Set the termlist data for document @a did.
+      *
+      *  Any existing data is replaced.
+diff --git a/backends/glass/glass_version.cc b/backends/glass/glass_version.cc
+index b3275b4..0999bc7 100644
+--- a/backends/glass/glass_version.cc
++++ b/backends/glass/glass_version.cc
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include <config.h>
++#include "xapian/randomaccessreader.h"
+ 
+ #include "glass_version.h"
+ 
+@@ -84,6 +85,16 @@ GlassVersion::GlassVersion(int fd_)
+     }
+ }
+ 
++GlassVersion::GlassVersion(const Xapian::RandomAccessReader& reader)
++    : rev(0), fd(-1), offset(0), db_dir(), changes(NULL),
++      doccount(0), total_doclen(0), last_docid(0),
++      doclen_lbound(0), doclen_ubound(0),
++      wdf_ubound(0), spelling_wordfreq_ubound(0),
++      oldest_changeset(0)
++{
++    m_reader = &reader;
++}
++
+ GlassVersion::~GlassVersion()
+ {
+     // Either this is a single-file database, or this fd is from opening a new
+@@ -96,6 +107,34 @@ void
+ GlassVersion::read()
+ {
+     LOGCALL_VOID(DB, "GlassVersion::read", NO_ARGS);
++    if (m_reader) {
++	char rbuf[256];
++	size_t got = m_reader->read_at(rbuf, offset, sizeof(rbuf));
++	const char * p = rbuf;
++	const char * end = p + got;
++	if (got < GLASS_VERSION_MAGIC_LEN ||
++	    memcmp(rbuf, GLASS_VERSION_MAGIC, GLASS_VERSION_MAGIC_LEN) != 0)
++	    throw Xapian::DatabaseCorruptError("Rev file magic incorrect");
++	unsigned version;
++	version = static_cast<unsigned char>(rbuf[GLASS_VERSION_MAGIC_LEN]);
++	version <<= 8;
++	version |= static_cast<unsigned char>(rbuf[GLASS_VERSION_MAGIC_LEN + 1]);
++	if (version != GLASS_FORMAT_VERSION)
++	    throw Xapian::DatabaseVersionError("Unsupported glass format version");
++	p += GLASS_VERSION_MAGIC_AND_VERSION_LEN;
++	uuid.assign(p);
++	p += uuid.BINARY_SIZE;
++	if (!unpack_uint(&p, end, &rev))
++	    throw Xapian::DatabaseCorruptError("Rev file failed to decode revision");
++	for (unsigned table_no = 0; table_no < Glass::MAX_; ++table_no) {
++	    if (!root[table_no].unserialise(&p, end))
++		throw Xapian::DatabaseCorruptError("Rev file root_info missing");
++	    old_root[table_no] = root[table_no];
++	}
++	serialised_stats.assign(p, end);
++	unserialise_stats();
++	return;
++    }
+     FD close_fd(-1);
+     int fd_in;
+     if (single_file()) {
+diff --git a/backends/glass/glass_version.h b/backends/glass/glass_version.h
+index e6532bb..2e6c06b 100644
+--- a/backends/glass/glass_version.h
++++ b/backends/glass/glass_version.h
+@@ -91,6 +91,8 @@ using Glass::RootInfo;
+  *  of the database, the revision of the database, and the root block info for
+  *  each table.
+  */
++namespace Xapian { class RandomAccessReader; }
++
+ class GlassVersion {
+     glass_revision_number_t rev;
+ 
+@@ -110,6 +112,9 @@ class GlassVersion {
+      */
+     int fd;
+ 
++    /// If non-NULL, reads come from here instead of fd (single-file image).
++    const Xapian::RandomAccessReader* m_reader = NULL;
++
+     /** Offset into the file at which the version data starts.
+      *
+      *  Will be 0, except for an embedded multi-file database.
+@@ -164,6 +169,8 @@ class GlassVersion {
+ 
+     explicit GlassVersion(int fd_);
+ 
++    explicit GlassVersion(const Xapian::RandomAccessReader& reader);
++
+     ~GlassVersion();
+ 
+     /** Create the version file. */
+diff --git a/include/Makefile.mk b/include/Makefile.mk
+index 6348f20..f2cec83 100644
+--- a/include/Makefile.mk
++++ b/include/Makefile.mk
+@@ -14,6 +14,7 @@ xapianinclude_HEADERS =\
+ 	include/xapian/constinfo.h\
+ 	include/xapian/database.h\
+ 	include/xapian/dbfactory.h\
++	include/xapian/randomaccessreader.h\
+ 	include/xapian/deprecated.h\
+ 	include/xapian/derefwrapper.h\
+ 	include/xapian/document.h\
+diff --git a/include/xapian.h b/include/xapian.h
+index ae2f92e..5761920 100644
+--- a/include/xapian.h
++++ b/include/xapian.h
+@@ -57,6 +57,7 @@
+ #include <xapian/errorhandler.h>
+ 
+ // Access to databases, documents, etc.
++#include <xapian/randomaccessreader.h>
+ #include <xapian/database.h>
+ #include <xapian/dbfactory.h>
+ #include <xapian/document.h>
+diff --git a/include/xapian/database.h b/include/xapian/database.h
+index 4760e80..02af569 100644
+--- a/include/xapian/database.h
++++ b/include/xapian/database.h
+@@ -65,6 +65,8 @@ class Document;
+  *  unsupported format (for example, created by a newer version of Xapian
+  *  which uses an incompatible format).
+  */
++class RandomAccessReader;
++
+ class XAPIAN_VISIBILITY_DEFAULT Database {
+ 	/// @internal Implementation behind check() static methods.
+ 	static size_t check_(const std::string * path_ptr, int fd, int opts,
+@@ -119,6 +121,14 @@ class XAPIAN_VISIBILITY_DEFAULT Database {
+ 	 */
+ 	explicit Database(int fd, int flags = 0);
+ 
++    /** Open a single-file glass database backed by a RandomAccessReader.
++     *
++     *  Like Database(int), but reads come from @a reader (positioned byte
++     *  reads) instead of a file descriptor, so the database image need not be
++     *  a local file. @a reader must outlive the Database.
++     */
++    explicit Database(RandomAccessReader& reader, int flags = 0);
++
+ 	/** @private @internal Create a Database from its internals.
+ 	 */
+ 	explicit Database(Internal *internal);
+diff --git a/include/xapian/randomaccessreader.h b/include/xapian/randomaccessreader.h
+new file mode 100644
+index 0000000..433eb20
+--- /dev/null
++++ b/include/xapian/randomaccessreader.h
+@@ -0,0 +1,67 @@
++/** @file
++ * @brief Abstract random-access byte reader for backing a Database
++ */
++/* Copyright (C) 2026 Olly Betts
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
++ * USA
++ */
++
++#ifndef XAPIAN_INCLUDED_RANDOMACCESSREADER_H
++#define XAPIAN_INCLUDED_RANDOMACCESSREADER_H
++
++#if !defined XAPIAN_IN_XAPIAN_H && !defined XAPIAN_LIB_BUILD
++# error Never use <xapian/randomaccessreader.h> directly; include <xapian.h> instead.
++#endif
++
++#include <xapian/visibility.h>
++
++#include <cstddef>
++#include <sys/types.h>
++
++namespace Xapian {
++
++/** Abstract source of random-access bytes for a single-file database.
++ *
++ *  Pass an implementation to Database(RandomAccessReader&) to open a glass
++ *  database image that is not a local file (e.g. a byte range served over
++ *  HTTP, or an index embedded inside a larger container). The glass backend
++ *  issues positioned reads against it on demand, so only the blocks a query
++ *  touches are fetched.
++ *
++ *  Threading: read_at() may be called concurrently from multiple threads;
++ *  implementations must make it safe for concurrent use.
++ */
++class XAPIAN_VISIBILITY_DEFAULT RandomAccessReader {
++  public:
++    virtual ~RandomAccessReader();
++
++    /** Read bytes at a byte offset.
++     *
++     *  @param buf   Destination buffer (at least @a len bytes).
++     *  @param pos   Byte offset to read from, in [0, get_size()).
++     *  @param len   Number of bytes to read.
++     *  @return      Number of bytes actually read; may be less than @a len
++     *               only when @a pos + @a len would exceed get_size().
++     */
++    virtual std::size_t read_at(char* buf, off_t pos, std::size_t len) const = 0;
++
++    /** The total number of addressable bytes (the database image size). */
++    virtual off_t get_size() const = 0;
++};
++
++}
++
++#endif // XAPIAN_INCLUDED_RANDOMACCESSREADER_H
