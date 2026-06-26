@@ -30,3 +30,16 @@ Decision: private vcpkg overlay (Xapian 1.4.22).
 ## Iterate: xapian baseline ba20235; regenerate patch via git diff ba20235 HEAD --
 <source pathspecs>. Standalone: ./configure --enable-static --disable-shared
 --disable-documentation && make -j. libzim: ~/Projects/libzim branch stream-reader-api.
+
+## DONE - Phase B working end-to-end (verified at scale)
+
+libzim wiring (stream-reader-api.patch): ZimXapianReader adapter over zimReader at the
+index byte range; loadXapianDb uses Xapian::Database(adapter) above the cap (range
+reads, no limit), temp-file copy below. XapianDb owns the adapter.
+
+VERIFIED: zim_search on wikipedia_en_medicine_maxi (2.2GB, 166MB index, 20x cap ->
+range reader) returns correct ranked results fetching ~6.6MB = 0.3pct/cold query.
+Overlay xapian@1.4.22#4 + patched libzim build clean; local zim_search.test passes.
+
+Follow-ups: rebase onto current main (#13); update remote_search.sh over-cap test
+(over-cap now succeeds, needs range-capable server); stale "raise the cap" message.
