@@ -449,16 +449,17 @@ std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t 
 			hits.push_back(std::move(hit));
 		}
 	} catch (const std::exception &e) {
-		// Only the "index exists but couldn't be opened" failure (getXapianDb returned
-		// null -> libzim throws "Cannot create Search without FT Xapian index") maps to
-		// the copy-cap advice. Surface anything else (httpfs read error, corrupt index,
-		// temp-file failure) unchanged so the message isn't misleading.
+		// The index exists (hasFulltextIndex) but the Searcher couldn't open it. Remote
+		// archives range-read the index in place, so an index larger than
+		// zim_remote_search_max_local_index is NOT a failure anymore. A remaining
+		// "Cannot create Search" here means the index couldn't be opened at all (e.g. a
+		// compressed index cluster, a corrupt index, or a remote read error); surface
+		// the underlying message rather than stale copy-cap advice.
 		const std::string what = e.what();
 		if (what.find("Cannot create Search") != std::string::npos) {
 			throw std::runtime_error(std::string("zim_search: the full-text index for '") + file_path_ +
-			                         "' could not be opened -- a remote index larger than "
-			                         "zim_remote_search_max_local_index is not copied locally (raise the "
-			                         "setting or use a local copy); underlying error: " +
+			                         "' exists but could not be opened (it may be compressed, corrupt, or "
+			                         "unreadable over the network); underlying error: " +
 			                         what);
 		}
 		throw;
