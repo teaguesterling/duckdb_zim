@@ -6,7 +6,8 @@
 #   range_http_server.py <port> <dir> [bind]
 import http.server, os, re, sys
 
-PORT = int(sys.argv[1]); DIRECTORY = sys.argv[2]
+PORT = int(sys.argv[1])
+DIRECTORY = sys.argv[2]
 BIND = sys.argv[3] if len(sys.argv) > 3 else "127.0.0.1"
 
 
