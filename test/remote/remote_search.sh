@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Integration test for remote full-text search (the reader-copy path).
+# Integration test for remote full-text search over http.
 #
-# zim_search over an http(s) URL has no local file for Xapian to mmap; libzim copies
-# the (small) index blob out through the reader to a temp file and opens Xapian on it
-# (see docs/dev/remote-search-impl-plan.md). sqllogictest can't host a server, so this
-# serves the committed test/oracle/test.zim over a local HTTP server and asserts that
-# a remote zim_search returns the same hits as the local search in test/sql/zim_search.test.
+# zim_search over an http(s) URL has no local file for Xapian to mmap. libzim handles it
+# two ways (see docs/dev/remote-search-design.md + phase-b-progress.md):
+#   - index <= zim_remote_search_max_local_index: copy the index blob to a temp file;
+#   - otherwise: range-read the index in place (Xapian fetches only the blocks it needs).
+# Both need a range-capable server, so this uses test/remote/range_http_server.py (plain
+# `python3 -m http.server` has no Range support). sqllogictest can't host a server, so we
+# serve the committed test/oracle/test.zim and assert remote results match the local
+# search in test/sql/zim_search.test -- including the over-cap range-reader path.
 #
 # Env overrides: DUCKDB_BIN, ZIM_EXTENSION (paths to the built shell + loadable ext).
 set -euo pipefail
@@ -24,7 +27,7 @@ fixture="test.zim"
 # Pick a free port.
 port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 
-python3 -m http.server "$port" --bind 127.0.0.1 --directory "$fixture_dir" >/dev/null 2>&1 &
+python3 "$here/range_http_server.py" "$port" "$fixture_dir" 127.0.0.1 >/dev/null 2>&1 &
 server_pid=$!
 cleanup() { kill "$server_pid" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -61,13 +64,18 @@ fts="$("$DUCKDB_BIN" -unsigned -noheader -list \
   -c "LOAD '$ZIM_EXTENSION'; INSTALL httpfs; LOAD httpfs; SELECT zim_info('$url').has_fulltext_index;" 2>/dev/null | tail -1)"
 if [ "$fts" != "true" ]; then echo "FAIL: remote has_fulltext_index='$fts' (expected true)"; fail=1; fi
 
-# When the index can't be copied locally (here forced with a 1-byte cap), search must
-# surface a clear, actionable error rather than silent empty rows.
-err="$("$DUCKDB_BIN" -unsigned \
-  -c "LOAD '$ZIM_EXTENSION'; INSTALL httpfs; LOAD httpfs; SET zim_remote_search_max_local_index=1; SELECT count(*) FROM zim_search('$url','plants');" 2>&1 || true)"
-if ! grep -q "zim_remote_search_max_local_index" <<<"$err"; then
-  echo "FAIL: over-cap remote search did not surface the actionable error; got: $err"; fail=1
-fi
+# Phase B: with the local-copy cap forced to 1 byte, the index exceeds it, so search
+# must fall back to range-reading the index in place -- and still return the same hits
+# (not an error, and not empty). This exercises the random-access glass reader path.
+overcap="$("$DUCKDB_BIN" -unsigned -noheader -list \
+  -c "LOAD '$ZIM_EXTENSION'; INSTALL httpfs; LOAD httpfs; SET zim_remote_search_max_local_index=1; SELECT path FROM zim_search('$url','plants') ORDER BY path;" 2>&1 || true)"
+echo "--- over-cap (range-reader) zim_search('plants') ---"
+echo "$overcap"
+for expect in "A/Chlorophyll" "A/Photosynthesis"; do
+  if ! grep -qx "$expect" <<<"$overcap"; then
+    echo "FAIL: over-cap range-reader search missing '$expect'; got: $overcap"; fail=1
+  fi
+done
 
 if [ "$fail" -eq 0 ]; then echo "PASS: remote zim_search matches local search"; fi
 exit "$fail"
