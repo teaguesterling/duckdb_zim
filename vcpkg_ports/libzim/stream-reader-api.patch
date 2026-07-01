@@ -339,7 +339,7 @@ index 5218ff6..346ddf0 100644
    public:
      explicit MultiPartFileReader(std::shared_ptr<const FileCompound> source);
 diff --git a/src/fileimpl.cpp b/src/fileimpl.cpp
-index c55f5a0..d898e49 100644
+index c55f5a0..bceefab 100644
 --- a/src/fileimpl.cpp
 +++ b/src/fileimpl.cpp
 @@ -26,6 +26,10 @@
@@ -382,12 +382,12 @@ index c55f5a0..d898e49 100644
 -    log_trace("read file \"" << zimFile->filename() << '"');
 +    log_trace("read file \"" << m_filename << '"');
 +    m_maxLocalSearchIndexBytes = openConfig.m_maxLocalSearchIndexBytes;
-+
-+    if (zimFile && zimFile->fail())
-+      throw ZimFileFormatError(std::string("can't open zim-file \"") + m_filename + '"');
  
 -    if (zimFile->fail())
 -      throw ZimFileFormatError(std::string("can't open zim-file \"") + zimFile->filename() + '"');
++    if (zimFile && zimFile->fail())
++      throw ZimFileFormatError(std::string("can't open zim-file \"") + m_filename + '"');
++
 +    if (!zimReader)
 +      throw ZimFileFormatError(std::string("can't create reader for zim-file \"") + m_filename + '"');
  
@@ -436,7 +436,7 @@ index c55f5a0..d898e49 100644
      auto cluster = getCluster(clusterIdx);
      if (cluster->isCompressed()) {
        return ItemDataDirectAccessInfo();
-@@ -880,6 +910,29 @@ bool checkTitleListing(const IndirectDirentAccessor& accessor, entry_index_type
+@@ -880,6 +910,83 @@ bool checkTitleListing(const IndirectDirentAccessor& accessor, entry_index_type
    }
  
  #ifdef ENABLE_XAPIAN
@@ -463,10 +463,64 @@ index c55f5a0..d898e49 100644
 +  };
 +}
 +
++  bool FileImpl::getReaderBackedXapianDb(entry_index_t direntIdx, Xapian::Database& db,
++                                         std::shared_ptr<Xapian::RandomAccessReader>& hold) const {
++    if (zimFile) {
++      return false; // only reader-backed (remote) archives need this path
++    }
++    auto dirent = getDirent(direntIdx);
++    if (dirent->isRedirect()) {
++      return false;
++    }
++    auto cluster = getCluster(dirent->getClusterNumber());
++    if (cluster->isCompressed()) {
++      return false;
++    }
++    zsize_t idxSize = cluster->getBlobSize(dirent->getBlobNumber());
++    if (idxSize.v == 0) {
++      return false;
++    }
++#ifndef _WIN32
++    if (m_maxLocalSearchIndexBytes > 0 && idxSize.v <= m_maxLocalSearchIndexBytes) {
++      auto blob = getBlob(*dirent);
++      char tmpl[] = "/tmp/libzim-xapian-XXXXXX";
++      int tmpfd = mkstemp(tmpl);
++      if (tmpfd < 0) {
++        return false;
++      }
++      ::unlink(tmpl);
++      const char* data = blob.data();
++      size_t remaining = blob.size();
++      while (remaining > 0) {
++        ssize_t w = ::write(tmpfd, data, remaining);
++        if (w <= 0) { ::close(tmpfd); return false; }
++        data += w; remaining -= size_t(w);
++      }
++      if (::lseek(tmpfd, 0, SEEK_SET) != 0) { ::close(tmpfd); return false; }
++      try {
++        db = Xapian::Database(tmpfd);
++      } catch (Xapian::DatabaseError&) {
++        ::close(tmpfd);
++        return false;
++      }
++      return true;
++    }
++#endif
++    offset_type idxOffset =
++      getBlobOffset(dirent->getClusterNumber(), dirent->getBlobNumber()).v;
++    hold = std::make_shared<ZimXapianReader>(zimReader, idxOffset, std::size_t(idxSize.v));
++    try {
++      db = Xapian::Database(*hold);
++    } catch (Xapian::DatabaseError&) {
++      return false;
++    }
++    return true;
++  }
++
    std::shared_ptr<XapianDb> FileImpl::loadXapianDb() {
      FileImpl::FindxResult r;
      r = m_direntLookup->find('X', "fulltext/xapian");
-@@ -893,13 +946,65 @@ bool checkTitleListing(const IndirectDirentAccessor& accessor, entry_index_type
+@@ -893,13 +1000,65 @@ bool checkTitleListing(const IndirectDirentAccessor& accessor, entry_index_type
      if (xapianDirent->isRedirect()) {
        return nullptr;
      }
@@ -538,7 +592,7 @@ index c55f5a0..d898e49 100644
        return nullptr;
      }
  
-@@ -918,7 +1023,7 @@ bool checkTitleListing(const IndirectDirentAccessor& accessor, entry_index_type
+@@ -918,7 +1077,7 @@ bool checkTitleListing(const IndirectDirentAccessor& accessor, entry_index_type
          }
        } catch(...) {}
  
@@ -548,7 +602,7 @@ index c55f5a0..d898e49 100644
        // Do nothing
      }
 diff --git a/src/fileimpl.h b/src/fileimpl.h
-index 7aba4f2..f5c5100 100644
+index 7aba4f2..4e2b096 100644
 --- a/src/fileimpl.h
 +++ b/src/fileimpl.h
 @@ -54,9 +54,10 @@ namespace zim
@@ -589,7 +643,17 @@ index 7aba4f2..f5c5100 100644
        const Fileheader& getFileheader() const  { return header; }
        zsize_t getFilesize() const;
        bool hasNewNamespaceScheme() const { return header.useNewNamespaceScheme(); }
-@@ -180,6 +187,10 @@ namespace zim
+@@ -176,10 +183,20 @@ namespace zim
+ #ifdef ENABLE_XAPIAN
+       std::shared_ptr<XapianDb> loadXapianDb();
+       std::shared_ptr<XapianDb> getXapianDb();
++      // Build a Xapian::Database for the (uncompressed) index entry at direntIdx on a
++      // reader-backed (remote) archive: copies a small index to a temp file, else
++      // range-reads it in place. Fills db + hold (hold must outlive db). False if the
++      // archive is file-backed, the index is compressed/empty, or opening fails.
++      bool getReaderBackedXapianDb(entry_index_t direntIdx, Xapian::Database& db,
++                                   std::shared_ptr<Xapian::RandomAccessReader>& hold) const;
+ #endif
    private:
        FileImpl(std::shared_ptr<FileCompound> zimFile, OpenConfig openConfig);
        FileImpl(std::shared_ptr<FileCompound> zimFile, offset_t offset, zsize_t size, OpenConfig openConfig);
@@ -693,3 +757,42 @@ index 515b882..00410e9 100644
      Xapian::Database m_db;
  
      std::recursive_mutex m_mutex;
+diff --git a/src/suggestion.cpp b/src/suggestion.cpp
+index 8f4a072..3cf6db6 100644
+--- a/src/suggestion.cpp
++++ b/src/suggestion.cpp
+@@ -63,12 +63,15 @@ void SuggestionDataBase::initXapianDb() {
+ 
+   auto xapianEntry = Entry(impl, entry_index_type(r.second));
+   auto accessInfo = xapianEntry.getItem().getDirectAccessInformation();
+-  if (!accessInfo.isValid()) {
+-      return;
+-  }
+ 
+   Xapian::Database database;
+-  if (!getDbFromAccessInfo(accessInfo, database)) {
++  if (accessInfo.isValid()) {
++    if (!getDbFromAccessInfo(accessInfo, database)) {
++      return;
++    }
++  } else if (!impl->getReaderBackedXapianDb(r.second, database, m_reader)) {
++    // Reader-backed (remote) archive: range-read the title index in place (the same
++    // path as the fulltext index). False -> index unopenable -> no suggestion DB.
+     return;
+   }
+ 
+diff --git a/src/suggestion_internal.h b/src/suggestion_internal.h
+index b835cca..423bd30 100644
+--- a/src/suggestion_internal.h
++++ b/src/suggestion_internal.h
+@@ -63,6 +63,10 @@ class SuggestionDataBase {
+     Xapian::Query parseQuery(const std::string& query);
+ 
+   public: // xapian based data
++    // For reader-backed (remote) archives: keeps the random-access reader the title
++    // index is read through alive. Declared before m_database so it outlives it.
++    std::shared_ptr<Xapian::RandomAccessReader> m_reader;
++
+     // The Xapian database we will search on.
+     Xapian::Database m_database;
+ 

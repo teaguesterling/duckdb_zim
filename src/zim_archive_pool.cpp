@@ -46,8 +46,10 @@ std::shared_ptr<ZimArchive> ArchivePool::Get(const std::string &file_path, FileS
 
 	// Open with the caller's original path so the error message shows what they passed.
 	// NOTE: the cache key omits max_local_index_bytes; the first opener's cap sticks for
-	// the cached handle. The setting is global, so this only matters if it is changed and
-	// a non-search query opens the same remote archive first (the cap only affects search).
+	// the cached handle. Since Phase B (range-reading the index in place), the cap no
+	// longer gates whether a large remote index is searchable -- it only decides copy vs
+	// range-read, both of which return correct results. So a stale cached cap changes at
+	// most an internal fetch strategy, not correctness (issue #16, downgraded post-Phase-B).
 	auto archive = ZimArchive::Open(file_path, fs, max_local_index_bytes); // may throw
 	cache_[key] = archive;
 	Pin(key, archive);
