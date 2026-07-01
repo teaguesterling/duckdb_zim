@@ -77,5 +77,19 @@ for expect in "A/Chlorophyll" "A/Photosynthesis"; do
   fi
 done
 
-if [ "$fail" -eq 0 ]; then echo "PASS: remote zim_search matches local search"; fi
+# zim_suggest (title index) over http must also work -- default cap (copy path) and
+# forced over-cap (range-read the title index in place). The title index has its own
+# loader in libzim; regression guard against it silently returning nothing remotely.
+for cap_sql in "" "SET zim_remote_search_max_local_index=1;"; do
+  label="default cap"; [ -n "$cap_sql" ] && label="over-cap (range-reader)"
+  sug="$("$DUCKDB_BIN" -unsigned -noheader -list \
+    -c "LOAD '$ZIM_EXTENSION'; INSTALL httpfs; LOAD httpfs; $cap_sql SELECT title FROM zim_suggest('$url','photo');" 2>&1 || true)"
+  echo "--- $label zim_suggest('photo') ---"
+  echo "$sug"
+  if ! grep -qx "Photosynthesis" <<<"$sug"; then
+    echo "FAIL: remote zim_suggest ($label) missing 'Photosynthesis'; got: $sug"; fail=1
+  fi
+done
+
+if [ "$fail" -eq 0 ]; then echo "PASS: remote zim_search + zim_suggest match local search"; fi
 exit "$fail"
