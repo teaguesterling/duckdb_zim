@@ -29,6 +29,7 @@
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar/string_common.hpp" // duckdb::Glob (the matcher)
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -138,9 +139,17 @@ public:
 			throw IOException("Invalid zim:// path '%s' (expected zim://<archive>.zim/<content-path>)", path);
 		}
 		auto archive = GetArchivePool(db).Get(parsed.archive);
+		// Decompression-bomb guard: cap the decompressed entry size. Resolve the
+		// setting through the opener (the VFS has no ClientContext); fall back to the
+		// default when no opener is available.
+		uint64_t max_content = zim_ext::DEFAULT_MAX_CONTENT_SIZE;
+		Value cap_val;
+		if (FileOpener::TryGetCurrentSetting(opener, "zim_max_content_size", cap_val) && !cap_val.IsNull()) {
+			max_content = cap_val.GetValue<uint64_t>();
+		}
 		// GetContent follows redirects (a redirect entry serves its target's
 		// bytes, like a symlink) and returns nullopt only when the path is absent.
-		auto data = archive->GetContent(parsed.content);
+		auto data = archive->GetContent(parsed.content, max_content);
 		if (!data) {
 			if (flags.ReturnNullIfNotExists()) {
 				return nullptr;

@@ -48,6 +48,31 @@ static std::string BlobToString(const zim::Blob &blob) {
 	return std::string(blob.data(), blob.size());
 }
 
+// Shared, capped materialization for every getData() site. A ZIM cluster is
+// compressed, so a crafted archive can declare a huge uncompressed item size and
+// force an unbounded allocation (decompression bomb). Before materializing, check
+// the item's reported size against `max_bytes`; refuse an oversize item with a
+// clean error rather than allocating. `max_bytes == 0` disables the cap. The blob
+// itself is re-checked after the fact as defense-in-depth in case a declared size
+// ever understates the real output. `what` names the entry for the error message.
+static std::string MaterializeCapped(const zim::Item &item, uint64_t max_bytes, const std::string &what) {
+	if (max_bytes != 0) {
+		const uint64_t declared = static_cast<uint64_t>(item.getSize());
+		if (declared > max_bytes) {
+			throw std::runtime_error("zim: " + what + " decompressed size " + std::to_string(declared) +
+			                         " bytes exceeds zim_max_content_size (" + std::to_string(max_bytes) +
+			                         " bytes); raise zim_max_content_size or set it to 0 to disable the cap");
+		}
+	}
+	auto blob = item.getData();
+	if (max_bytes != 0 && static_cast<uint64_t>(blob.size()) > max_bytes) {
+		throw std::runtime_error("zim: " + what + " materialized size " + std::to_string(blob.size()) +
+		                         " bytes exceeds zim_max_content_size (" + std::to_string(max_bytes) +
+		                         " bytes); the archive's declared item size understated the real output");
+	}
+	return BlobToString(blob);
+}
+
 // Materialize the non-content metadata for an entry (no blob fetch).
 static ZimEntry EntryMeta(const zim::Entry &entry) {
 	ZimEntry row;
@@ -96,13 +121,13 @@ bool MimetypeAccepted(const std::vector<std::string> &patterns, const std::strin
 	return false;
 }
 
-static void LoadContent(const zim::Entry &entry, ZimEntry &row) {
+static void LoadContent(const zim::Entry &entry, ZimEntry &row, uint64_t max_content_bytes) {
 	if (row.is_redirect) {
 		row.content_loaded = true; // redirects have no body
 		return;
 	}
 	auto item = entry.getItem(true); // follow redirects
-	row.content = BlobToString(item.getData());
+	row.content = MaterializeCapped(item, max_content_bytes, "entry '" + row.path + "'");
 	row.content_loaded = true;
 }
 
@@ -170,7 +195,7 @@ bool ZimScanCursor::Next(ZimEntry &out) {
 			continue;
 		}
 		if (spec.want_content && MimetypeAccepted(spec.content_mimetypes, row.mimetype)) {
-			LoadContent(entry, row);
+			LoadContent(entry, row, spec.max_content_bytes);
 		}
 		out = std::move(row);
 		return true;
@@ -241,7 +266,8 @@ bool ZimArchive::HasEntry(const std::string &path) const {
 	return archive_->hasEntryByPath(NormalizeContentPath(path));
 }
 
-std::optional<ZimEntry> ZimArchive::GetByPath(const std::string &path, bool want_content) const {
+std::optional<ZimEntry> ZimArchive::GetByPath(const std::string &path, bool want_content,
+                                              uint64_t max_content_bytes) const {
 	auto p = NormalizeContentPath(path);
 	if (!archive_->hasEntryByPath(p)) {
 		return std::nullopt;
@@ -249,31 +275,32 @@ std::optional<ZimEntry> ZimArchive::GetByPath(const std::string &path, bool want
 	zim::Entry entry = archive_->getEntryByPath(p);
 	ZimEntry row = EntryMeta(entry);
 	if (want_content) {
-		LoadContent(entry, row);
+		LoadContent(entry, row, max_content_bytes);
 	}
 	return row;
 }
 
-std::optional<ZimEntry> ZimArchive::GetByTitle(const std::string &title, bool want_content) const {
+std::optional<ZimEntry> ZimArchive::GetByTitle(const std::string &title, bool want_content,
+                                               uint64_t max_content_bytes) const {
 	if (!archive_->hasEntryByTitle(title)) {
 		return std::nullopt;
 	}
 	zim::Entry entry = archive_->getEntryByTitle(title);
 	ZimEntry row = EntryMeta(entry);
 	if (want_content) {
-		LoadContent(entry, row);
+		LoadContent(entry, row, max_content_bytes);
 	}
 	return row;
 }
 
-std::optional<std::string> ZimArchive::GetContent(const std::string &path) const {
+std::optional<std::string> ZimArchive::GetContent(const std::string &path, uint64_t max_content_bytes) const {
 	auto p = NormalizeContentPath(path);
 	if (!archive_->hasEntryByPath(p)) {
 		return std::nullopt;
 	}
 	zim::Entry entry = archive_->getEntryByPath(p);
 	auto item = entry.getItem(true); // follow redirects
-	return BlobToString(item.getData());
+	return MaterializeCapped(item, max_content_bytes, "entry '" + p + "'");
 }
 
 std::optional<std::string> ZimArchive::GetMimetype(const std::string &path) const {
@@ -352,7 +379,7 @@ std::optional<ZimEntry> ZimArchive::ScanIndex(uint64_t idx, const ScanSpec &spec
 		return std::nullopt;
 	}
 	if (spec.want_content && MimetypeAccepted(spec.content_mimetypes, row.mimetype)) {
-		LoadContent(entry, row);
+		LoadContent(entry, row, spec.max_content_bytes);
 	}
 	return row;
 }
@@ -416,7 +443,7 @@ bool ZimArchive::HasFulltextIndex() const {
 }
 
 std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t offset, uint32_t limit,
-                                             bool with_snippet) const {
+                                             bool with_snippet, uint64_t max_content_bytes) const {
 	std::vector<ZimSearchHit> hits;
 #ifdef LIBZIM_WITH_XAPIAN
 	if (!archive_->hasFulltextIndex()) {
@@ -437,13 +464,28 @@ std::vector<ZimSearchHit> ZimArchive::Search(const std::string &query, uint32_t 
 			hit.path = it.getPath();
 			hit.title = it.getTitle();
 			hit.score = static_cast<double>(it.getScore());
-			// Snippet generation reads each hit's full body (getData) to highlight it;
-			// skip it when the caller only wants ranked path/title -- much cheaper for
-			// remote archives (no content clusters fetched, just the index + dirents).
+			// Snippet generation reads each hit's full body (getData, inside libzim) to
+			// highlight it; skip it when the caller only wants ranked path/title -- much
+			// cheaper for remote archives (no content clusters fetched, just the index +
+			// dirents). Also skip it when the hit's body exceeds the output cap: a
+			// decompression-bomb entry that ranks in a search must not be materialized to
+			// build a snippet. Best-effort — a lookup failure falls back to the old
+			// behavior (libzim already bounds a snippet's own length).
 			if (with_snippet) {
-				auto snippet = it.getSnippet();
-				if (!snippet.empty()) {
-					hit.snippet = std::move(snippet);
+				bool over_cap = false;
+				if (max_content_bytes != 0) {
+					try {
+						auto hit_item = archive_->getEntryByPath(hit.path).getItem(true);
+						over_cap = static_cast<uint64_t>(hit_item.getSize()) > max_content_bytes;
+					} catch (...) {
+						over_cap = false;
+					}
+				}
+				if (!over_cap) {
+					auto snippet = it.getSnippet();
+					if (!snippet.empty()) {
+						hit.snippet = std::move(snippet);
+					}
 				}
 			}
 			hits.push_back(std::move(hit));
@@ -511,12 +553,12 @@ std::vector<ZimSearchHit> ZimArchive::Suggest(const std::string &query, uint32_t
 	return hits;
 }
 
-std::optional<std::string> ZimArchive::Illustration(unsigned int size) const {
+std::optional<std::string> ZimArchive::Illustration(unsigned int size, uint64_t max_content_bytes) const {
 	if (!archive_->hasIllustration(size)) {
 		return std::nullopt;
 	}
 	auto item = archive_->getIllustrationItem(size);
-	return BlobToString(item.getData());
+	return MaterializeCapped(item, max_content_bytes, "illustration (" + std::to_string(size) + "px)");
 }
 
 std::string ZimArchive::RandomPath() const {

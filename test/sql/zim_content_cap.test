@@ -1,0 +1,84 @@
+# name: test/sql/zim_content_cap.test
+# description: decompression-bomb output cap (zim_max_content_size) — every
+#              materialization path fails cleanly at the boundary instead of
+#              allocating. BOUNDED: a low cap against the tiny oracle fixture,
+#              so the test asserts "clean error at the boundary" and can never
+#              itself allocate a large blob / OOM CI.
+# group: [sql]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# The setting exists and defaults to a generous, protective cap (> 0); normal
+# reads are unaffected by the default.
+query I
+SELECT current_setting('zim_max_content_size') > 0;
+----
+true
+
+# --- negative: a low cap refuses an oversize entry with a clean error ----------
+# 30 bytes is below the ~130-byte A/Photosynthesis body but above the 16/17-byte
+# binary/css entries, so the same archive exercises both reject and allow.
+statement ok
+SET zim_max_content_size = 30;
+
+# read_zim table function (scan/lookup materialization path)
+statement error
+SELECT content FROM read_zim('test/oracle/test.zim', path := 'A/Photosynthesis', include_content := true);
+----
+exceeds zim_max_content_size
+
+# scalar accessor path (zim_get_content)
+statement error
+SELECT zim_get_content('test/oracle/test.zim', 'A/Photosynthesis');
+----
+exceeds zim_max_content_size
+
+# text scalar path (zim_get_text)
+statement error
+SELECT zim_get_text('test/oracle/test.zim', 'A/Photosynthesis');
+----
+exceeds zim_max_content_size
+
+# zim:// virtual filesystem read path (read_text/read_blob over zim://)
+statement error
+SELECT content FROM read_text('zim://test/oracle/test.zim/A/Photosynthesis');
+----
+exceeds zim_max_content_size
+
+# --- positive: entries under the cap still read (the cap is a ceiling, not a wall)
+# style.css is 17 bytes, under the 30-byte cap.
+query I
+SELECT content IS NOT NULL
+FROM read_zim('test/oracle/test.zim', path := 'style.css', include_content := true);
+----
+true
+
+# a metadata-only / listing scan never materializes content, so it is never blocked.
+query I
+SELECT count(*) >= 5 FROM read_zim('test/oracle/test.zim');
+----
+true
+
+# --- 0 disables the cap (explicit opt-out): the refused entry now reads ---------
+statement ok
+SET zim_max_content_size = 0;
+
+query I
+SELECT content IS NOT NULL
+FROM read_zim('test/oracle/test.zim', path := 'A/Photosynthesis', include_content := true);
+----
+true
+
+# --- the default cap does not reject reasonable content ------------------------
+statement ok
+RESET zim_max_content_size;
+
+query I
+SELECT content LIKE '%Photosynthesis%'
+FROM read_zim('test/oracle/test.zim', path := 'A/Photosynthesis',
+              include_content := true, content_as_varchar := true);
+----
+true

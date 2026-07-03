@@ -70,6 +70,15 @@ struct ZimSearchHit {
 	std::optional<std::string> snippet;
 };
 
+// Default ceiling (bytes) on the decompressed size of a single ZIM entry the
+// extension will materialize into memory (overridable via the zim_max_content_size
+// setting; 0 disables the cap). A ZIM cluster is compressed (zstd/xz/lzma), so a
+// small crafted archive can declare a huge uncompressed item and force an
+// unbounded allocation (decompression bomb). This cap fails such reads cleanly
+// before allocating. Sized generously so normal articles and typical embedded
+// media read unaffected; lower it when reading untrusted archives.
+static constexpr uint64_t DEFAULT_MAX_CONTENT_SIZE = 2ull * 1024 * 1024 * 1024; // 2 GiB
+
 // How a content scan should be ordered / scoped. Drives the choice of the
 // underlying libzim range (iterByPath/iterByTitle/findByPath/findByTitle).
 enum class ScanOrder { ByPath, ByTitle };
@@ -89,6 +98,11 @@ struct ScanSpec {
 	// a bulk scan materialize, say, just text/html without paying to decompress
 	// the images alongside them.
 	std::vector<std::string> content_mimetypes;
+	// Ceiling (bytes) on the decompressed size of any single entry materialized
+	// during this scan. 0 disables the cap. Defaults to the protective cap so a
+	// caller that materializes content without explicitly setting it is still
+	// guarded against decompression-bomb clusters (see zim_max_content_size).
+	uint64_t max_content_bytes = DEFAULT_MAX_CONTENT_SIZE;
 };
 
 // Forward-only cursor over content entries. Wraps a libzim EntryRange iterator
@@ -141,10 +155,15 @@ public:
 	// `want_content` controls whether the blob is loaded. A leading "C/" in
 	// `path` is stripped before lookup. Returns nullopt when absent.
 	bool HasEntry(const std::string &path) const;
-	std::optional<ZimEntry> GetByPath(const std::string &path, bool want_content) const;
-	std::optional<ZimEntry> GetByTitle(const std::string &title, bool want_content) const;
+	// `max_content_bytes` caps the decompressed blob size when want_content is set
+	// (0 disables the cap); an oversize entry throws rather than allocating.
+	std::optional<ZimEntry> GetByPath(const std::string &path, bool want_content,
+	                                  uint64_t max_content_bytes = 0) const;
+	std::optional<ZimEntry> GetByTitle(const std::string &title, bool want_content,
+	                                   uint64_t max_content_bytes = 0) const;
 	// Just the bytes for a content path (redirect-following). nullopt if absent.
-	std::optional<std::string> GetContent(const std::string &path) const;
+	// `max_content_bytes` caps the decompressed size (0 disables); throws if exceeded.
+	std::optional<std::string> GetContent(const std::string &path, uint64_t max_content_bytes = 0) const;
 	std::optional<std::string> GetMimetype(const std::string &path) const;
 	std::optional<std::string> GetRedirectTarget(const std::string &path) const;
 	std::string MainEntryPath() const; // redirect-resolved; "" if none
@@ -171,8 +190,10 @@ public:
 	// --- full-text search (optional libzim feature) ------------------------
 	bool HasFulltextIndex() const;
 	// Returns hits [offset, offset+limit). Empty when no fulltext index.
+	// `max_content_bytes` caps the per-hit body size read for snippet generation
+	// (0 disables); a hit whose body exceeds the cap comes back without a snippet.
 	std::vector<ZimSearchHit> Search(const std::string &query, uint32_t offset, uint32_t limit,
-	                                 bool with_snippet = true) const;
+	                                 bool with_snippet = true, uint64_t max_content_bytes = 0) const;
 
 	// --- title autocomplete ------------------------------------------------
 	// Ranked title suggestions [offset, offset+limit). Backed by libzim's
@@ -184,7 +205,8 @@ public:
 	// --- archive-level utilities -------------------------------------------
 	// Illustration (favicon / cover) PNG bytes of the requested square size;
 	// nullopt when the archive has no illustration at that size.
-	std::optional<std::string> Illustration(unsigned int size) const;
+	// `max_content_bytes` caps the decompressed illustration size (0 disables).
+	std::optional<std::string> Illustration(unsigned int size, uint64_t max_content_bytes = 0) const;
 	// A random content entry's path; "" when the archive has no content entries.
 	std::string RandomPath() const;
 	// libzim's archive integrity check (checksum + structural validation).

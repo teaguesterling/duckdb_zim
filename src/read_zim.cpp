@@ -57,6 +57,15 @@ static bool IsValidUtf8(const std::string &s) {
 	return Utf8Proc::IsValid(s.data(), s.size());
 }
 
+// Resolve the decompression-bomb output cap from the setting (falls back to the default).
+static uint64_t ResolveMaxContentSize(ClientContext &context) {
+	Value v;
+	if (context.TryGetCurrentSetting("zim_max_content_size", v) && !v.IsNull()) {
+		return v.GetValue<uint64_t>();
+	}
+	return zim_ext::DEFAULT_MAX_CONTENT_SIZE;
+}
+
 // Column layout. file_path is appended only when requested; keep its index last.
 enum ZimColumn : idx_t {
 	COL_PATH = 0,
@@ -445,6 +454,10 @@ unique_ptr<GlobalTableFunctionState> ReadZimInitGlobal(ClientContext &context, T
 	state->want_content = content_projected && bind.include_content;
 	state->scan_spec = bind.spec;
 	state->scan_spec.want_content = state->want_content;
+	// Decompression-bomb guard: cap the decompressed size of any entry this scan
+	// materializes. Applies to the parallel/serial cursor (via scan_spec) and to the
+	// exact-lookup path below.
+	state->scan_spec.max_content_bytes = ResolveMaxContentSize(context);
 
 	// Seed lookup params from the bind (path:=/title:=), then let a pushed-down
 	// WHERE path/title = const turn a plain full scan into an exact lookup and
@@ -557,8 +570,11 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 			// move on. An exact path present in N archives therefore emits N rows.
 			if (!gstate.lookup_emitted) {
 				gstate.lookup_emitted = true;
-				auto row = gstate.lookup_by_title ? gstate.archive->GetByTitle(gstate.lookup_key, gstate.want_content)
-				                                  : gstate.archive->GetByPath(gstate.lookup_key, gstate.want_content);
+				auto row = gstate.lookup_by_title
+				               ? gstate.archive->GetByTitle(gstate.lookup_key, gstate.want_content,
+				                                            gstate.scan_spec.max_content_bytes)
+				               : gstate.archive->GetByPath(gstate.lookup_key, gstate.want_content,
+				                                           gstate.scan_spec.max_content_bytes);
 				// Apply the include_content mimetype gate to the single fetched row,
 				// matching the scan path: a non-matching entry keeps its metadata but
 				// reports NULL content.

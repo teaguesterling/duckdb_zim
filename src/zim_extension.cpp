@@ -8,6 +8,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "zim_extension.hpp"
+#include "zim_access.hpp" // zim_ext::DEFAULT_MAX_CONTENT_SIZE
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -30,6 +31,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                        "search works; 0 disables remote search. Larger values cover bigger archives "
 	                        "but lengthen the first remote search (the whole index is fetched once).",
 	                        LogicalType::UBIGINT, Value::UBIGINT(8ull * 1024 * 1024));
+
+	// Ceiling (bytes) on the decompressed size of any single ZIM entry the extension
+	// will materialize into memory. ZIM clusters are compressed, so a small crafted
+	// archive can declare a huge uncompressed item and force an unbounded allocation
+	// (decompression bomb). Reads of an entry larger than this fail cleanly before
+	// allocating. 0 disables the cap. Default 2 GiB — generous enough for normal
+	// articles and typical embedded media; lower it when reading untrusted archives.
+	DBConfig::GetConfig(loader.GetDatabaseInstance())
+	    .AddExtensionOption("zim_max_content_size",
+	                        "Maximum decompressed size (bytes) of a single ZIM entry to materialize; reads "
+	                        "of a larger entry fail cleanly instead of allocating (decompression-bomb guard). "
+	                        "0 disables the cap. Lower it when reading untrusted archives.",
+	                        LogicalType::UBIGINT, Value::UBIGINT(zim_ext::DEFAULT_MAX_CONTENT_SIZE));
 
 	RegisterReadZim(loader);
 	RegisterZimMetadata(loader);

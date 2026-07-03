@@ -128,15 +128,26 @@ static uint64_t ResolveMaxLocalIndex(ClientContext &context) {
 	return zim_ext::DEFAULT_MAX_LOCAL_SEARCH_INDEX;
 }
 
+// Resolve the decompression-bomb output cap (bounds per-hit snippet body reads).
+static uint64_t ResolveMaxContentSize(ClientContext &context) {
+	Value v;
+	if (context.TryGetCurrentSetting("zim_max_content_size", v) && !v.IsNull()) {
+		return v.GetValue<uint64_t>();
+	}
+	return zim_ext::DEFAULT_MAX_CONTENT_SIZE;
+}
+
 unique_ptr<GlobalTableFunctionState> SearchInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<SearchBindData>();
 	auto state = make_uniq<SearchGlobalState>();
 	auto &pool = GetArchivePool(context);
 	auto *fs = &FileSystem::GetFileSystem(context);
 	// Per archive: up to max_results hits, each tagged with its source file.
+	const uint64_t max_content = ResolveMaxContentSize(context);
 	for (auto &fp : bind.file_paths) {
 		auto archive = pool.Get(fp, fs, ResolveMaxLocalIndex(context));
-		for (auto &hit : archive->Search(bind.query, bind.result_offset, bind.max_results, bind.with_snippet)) {
+		for (auto &hit :
+		     archive->Search(bind.query, bind.result_offset, bind.max_results, bind.with_snippet, max_content)) {
 			state->hits.push_back(TaggedHit {fp, std::move(hit)});
 		}
 	}
