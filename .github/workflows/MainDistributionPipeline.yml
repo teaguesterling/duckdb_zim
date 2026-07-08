@@ -16,7 +16,7 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.2
+      duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
       extension_name: zim
       # Disable the shared DuckDB binary cache: it hands back an icu (or host-tool)
@@ -24,16 +24,12 @@ jobs:
       # gcc-toolset-14 (the build fails only when the cache is consulted; a fresh build
       # of every dep succeeds). 'clear' forces building all deps from source.
       vcpkg_binary_sources: 'clear'
-      # Windows isn't supported yet: libzim + icu under MSVC/mingw need their own porting
-      # work (mingw in particular fails to build the deps). Phase-1 ships Linux + macOS;
-      # revisit Windows later. (Wasm is likewise a documented open question -- see README.)
-      exclude_archs: 'windows_amd64;windows_arm64;windows_amd64_mingw'
 
   code-quality-check:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.2
+      duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
       extension_name: zim
       # format only: the tidy check configures CMake without vcpkg, so this extension's
@@ -42,7 +38,7 @@ jobs:
 
   # Guards the LINKED_LIBS class of WASM bug: the distribution workflow builds and
   # uploads the .wasm but never inspects or loads it, so a side module with unresolved
-  # libzim/zstd/lzma symbols ships green. This downloads the v1.5.2 wasm artifacts and
+  # libzim/zstd/lzma symbols ships green. This downloads the v1.5.4 wasm artifacts and
   # statically checks no dependency symbol is imported-but-undefined (no runtime needed).
   # See test/wasm/. (A live duckdb-wasm load test is deferred until runtime ZIM reading
   # in wasm lands — libzim's local mmap path doesn't work in wasm.)
@@ -58,7 +54,7 @@ jobs:
       - name: Download WASM artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: zim-v1.5.2-extension-wasm_*
+          pattern: zim-v1.5.4-extension-wasm_*
           path: wasm-artifacts
       - name: Check for unresolved libzim/zstd/lzma symbols
         run: bash test/wasm/run_wasm_checks.sh wasm-artifacts
@@ -78,9 +74,9 @@ jobs:
         with:
           pattern: "*linux_amd64*"
           path: ext-artifacts
-      - name: Fetch matching DuckDB CLI (v1.5.2)
+      - name: Fetch matching DuckDB CLI (v1.5.4)
         run: |
-          curl -fL -o duckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.5.2/duckdb_cli-linux-amd64.zip
+          curl -fL -o duckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip
           unzip -o duckdb.zip -d duckdb-cli
           ./duckdb-cli/duckdb --version
       - name: Run remote search test

@@ -157,8 +157,7 @@ public:
 	bool HasEntry(const std::string &path) const;
 	// `max_content_bytes` caps the decompressed blob size when want_content is set
 	// (0 disables the cap); an oversize entry throws rather than allocating.
-	std::optional<ZimEntry> GetByPath(const std::string &path, bool want_content,
-	                                  uint64_t max_content_bytes = 0) const;
+	std::optional<ZimEntry> GetByPath(const std::string &path, bool want_content, uint64_t max_content_bytes = 0) const;
 	std::optional<ZimEntry> GetByTitle(const std::string &title, bool want_content,
 	                                   uint64_t max_content_bytes = 0) const;
 	// Just the bytes for a content path (redirect-following). nullopt if absent.

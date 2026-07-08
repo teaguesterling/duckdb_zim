@@ -570,11 +570,10 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 			// move on. An exact path present in N archives therefore emits N rows.
 			if (!gstate.lookup_emitted) {
 				gstate.lookup_emitted = true;
-				auto row = gstate.lookup_by_title
-				               ? gstate.archive->GetByTitle(gstate.lookup_key, gstate.want_content,
-				                                            gstate.scan_spec.max_content_bytes)
-				               : gstate.archive->GetByPath(gstate.lookup_key, gstate.want_content,
-				                                           gstate.scan_spec.max_content_bytes);
+				auto row = gstate.lookup_by_title ? gstate.archive->GetByTitle(gstate.lookup_key, gstate.want_content,
+				                                                               gstate.scan_spec.max_content_bytes)
+				                                  : gstate.archive->GetByPath(gstate.lookup_key, gstate.want_content,
+				                                                              gstate.scan_spec.max_content_bytes);
 				// Apply the include_content mimetype gate to the single fetched row,
 				// matching the scan path: a non-matching entry keeps its metadata but
 				// reports NULL content.

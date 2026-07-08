@@ -1,10 +1,11 @@
 # name: test/sql/zim_content_cap.test
 # description: decompression-bomb output cap (zim_max_content_size) — every
+# group: [sql]
+
 #              materialization path fails cleanly at the boundary instead of
 #              allocating. BOUNDED: a low cap against the tiny oracle fixture,
 #              so the test asserts "clean error at the boundary" and can never
 #              itself allocate a large blob / OOM CI.
-# group: [sql]
 
 require zim
 
