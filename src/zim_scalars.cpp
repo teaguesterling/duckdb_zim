@@ -27,6 +27,15 @@ static bool IsValidUtf8(const std::string &s) {
 	return Utf8Proc::IsValid(s.data(), s.size());
 }
 
+// Resolve the decompression-bomb output cap from the setting (falls back to the default).
+static uint64_t ResolveMaxContentSize(ClientContext &context) {
+	Value v;
+	if (context.TryGetCurrentSetting("zim_max_content_size", v) && !v.IsNull()) {
+		return v.GetValue<uint64_t>();
+	}
+	return zim_ext::DEFAULT_MAX_CONTENT_SIZE;
+}
+
 // Open through the per-DB pool reached from the execution context. `fs` lets the
 // pool open remote (s3/http) archives via byte-range reads; ignored for local paths.
 static std::shared_ptr<ZimArchive> Open(ExpressionState &state, const Vector &files, idx_t row) {
@@ -48,10 +57,11 @@ void GetContent(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	args.data[1].Flatten(args.size());
+	const uint64_t max_content = ResolveMaxContentSize(state.GetContext());
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto archive = Open(state, args.data[0], i);
 		auto path = FlatVector::GetData<string_t>(args.data[1])[i].GetString();
-		auto content = archive->GetContent(path);
+		auto content = archive->GetContent(path, max_content);
 		if (content.has_value()) {
 			result.SetValue(i, Value::BLOB_RAW(*content));
 		} else {
@@ -64,6 +74,7 @@ void GetText(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	args.data[1].Flatten(args.size());
+	const uint64_t max_content = ResolveMaxContentSize(state.GetContext());
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto archive = Open(state, args.data[0], i);
 		auto path = FlatVector::GetData<string_t>(args.data[1])[i].GetString();
@@ -72,7 +83,7 @@ void GetText(DataChunk &args, ExpressionState &state, Vector &result) {
 			FlatVector::SetNull(result, i, true); // binary or absent -> NULL, never mangle
 			continue;
 		}
-		auto content = archive->GetContent(path);
+		auto content = archive->GetContent(path, max_content);
 		// Mimetype said text, but guard the bytes too: a mislabeled entry with invalid
 		// UTF-8 becomes NULL rather than throwing/mangling.
 		if (content.has_value() && IsValidUtf8(*content)) {
@@ -173,13 +184,14 @@ void Illustration(DataChunk &args, ExpressionState &state, Vector &result) {
 	if (has_size) {
 		args.data[1].Flatten(args.size());
 	}
+	const uint64_t max_content = ResolveMaxContentSize(state.GetContext());
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto archive = Open(state, args.data[0], i);
 		unsigned int size = 48;
 		if (has_size && FlatVector::Validity(args.data[1]).RowIsValid(i)) {
 			size = static_cast<unsigned int>(FlatVector::GetData<int32_t>(args.data[1])[i]);
 		}
-		auto blob = archive->Illustration(size);
+		auto blob = archive->Illustration(size, max_content);
 		if (blob.has_value()) {
 			result.SetValue(i, Value::BLOB_RAW(*blob));
 		} else {
