@@ -93,3 +93,6 @@ jobs:
           ext="$(readlink -f "$ext")"
           echo "extension: $ext"
           DUCKDB_BIN="$PWD/duckdb-cli/duckdb" ZIM_EXTENSION="$ext" bash test/remote/remote_search.sh
+          # #21 guard: searching a no-stemmer-language archive must not leak
+          # libzim's "No stemming ..." line to stdout (sqllogictest can't see stdout).
+          DUCKDB_BIN="$PWD/duckdb-cli/duckdb" ZIM_EXTENSION="$ext" bash test/no_stdout_pollution.sh
