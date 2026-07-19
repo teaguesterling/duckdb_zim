@@ -83,3 +83,35 @@ query I
 SELECT count(*) FROM read_zim('test/oracle/test.zim');
 ----
 6
+
+# --- issue #19: many-entry parallel scan stress (>4096 = multiple morsels) ------
+# test_parallel.zim has 12000 content entries, so the cluster-order morsel
+# dispenser hands several in-flight morsels to different threads, which read the
+# SAME pooled libzim Archive concurrently -- unlike the tiny fixtures above (one
+# morsel). Assert the scan stays complete and deterministic. Under a THREADSAN=1
+# build this run also guards against a data race in that shared concurrent read
+# (concurrent-read safety relies on the pinned libzim; see DESIGN.md).
+statement ok
+PRAGMA threads=8
+
+# complete, no dupes or drops under concurrent morsel reads
+query II
+SELECT count(*), count(DISTINCT path) FROM read_zim('test/oracle/test_parallel.zim');
+----
+12000	12000
+
+# with content materialization each morsel decompresses clusters concurrently
+query II
+SELECT count(*), count(DISTINCT path)
+FROM read_zim('test/oracle/test_parallel.zim', include_content := true);
+----
+12000	12000
+
+# parallel and serial scans agree exactly on the large archive (no morsel lost)
+query I
+SELECT (SELECT count(*) FROM (SELECT path FROM read_zim('test/oracle/test_parallel.zim')
+                              EXCEPT SELECT path FROM read_zim('test/oracle/test_parallel.zim', parallel := false)))
+     + (SELECT count(*) FROM (SELECT path FROM read_zim('test/oracle/test_parallel.zim', parallel := false)
+                              EXCEPT SELECT path FROM read_zim('test/oracle/test_parallel.zim')));
+----
+0

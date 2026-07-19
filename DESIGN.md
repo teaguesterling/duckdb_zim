@@ -480,7 +480,14 @@ class ArchivePool {
 - A future ATTACH holds a `shared_ptr` for the attachment lifetime → same warmth.
 - The `zim://` filesystem uses the same pool.
 - libzim reads are thread-safe → DuckDB parallel scan partitions path/index ranges
-  across threads.
+  across threads. **This relies on the pinned libzim's concurrent-read guarantee**
+  (currently **9.7.0**, pinned in `vcpkg_ports/libzim/vcpkg.json`): the parallel
+  scan hands cluster-order morsels to many threads that read one shared
+  `zim::Archive` concurrently (`read_zim.cpp` `NextMorsel`, `zim_access.cpp`
+  `ScanIndex`). A libzim regression here would surface as a data race with no guard
+  in this codebase, so `test/sql/zim_parallel.test` scans a 12k-entry archive
+  across threads and the CI runs it under a ThreadSanitizer build (the
+  `thread-sanitizer` job) to catch one. Revisit this note when bumping libzim.
 
 ---
 
