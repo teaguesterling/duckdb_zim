@@ -96,3 +96,46 @@ jobs:
           # #21 guard: searching a no-stemmer-language archive must not leak
           # libzim's "No stemming ..." line to stdout (sqllogictest can't see stdout).
           DUCKDB_BIN="$PWD/duckdb-cli/duckdb" ZIM_EXTENSION="$ext" bash test/no_stdout_pollution.sh
+
+  # The parallel read_zim scan reads one shared libzim Archive from many threads
+  # (see DESIGN.md). A ThreadSanitizer build of the extension runs the many-entry
+  # parallel scan test (test/sql/zim_parallel.test, >4096 entries = multiple
+  # in-flight morsels) to catch a data race in that concurrent read. Only the zim
+  # extension + DuckDB are instrumented; the vcpkg deps are not (enough to catch
+  # races in this codebase's own concurrency).
+  thread-sanitizer:
+    name: Thread sanitizer (parallel scan)
+    runs-on: ubuntu-latest
+    env:
+      GEN: ninja
+      THREADSAN: 1
+      VCPKG_TARGET_TRIPLET: x64-linux
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake build-essential ccache pkg-config \
+                                  autoconf automake autoconf-archive libtool zip unzip curl
+      - name: Setup vcpkg
+        run: |
+          mkdir local_vcpkg_installation && cd local_vcpkg_installation
+          git init
+          git remote add origin https://github.com/microsoft/vcpkg.git
+          git fetch --depth 1 origin 84bab45d415d22042bd0b9081aea57f362da3f35
+          git checkout 84bab45d415d22042bd0b9081aea57f362da3f35
+          ./bootstrap-vcpkg.sh
+          echo "VCPKG_TOOLCHAIN_PATH=$PWD/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
+      - name: Build extension with ThreadSanitizer
+        run: make release
+      - name: Run parallel-scan test under ThreadSanitizer
+        env:
+          # Suppress libzim's own (mutex-guarded but uninstrumented) internal-cache
+          # races; a race in this extension's code still fails. halt_on_error=1 so a
+          # real race aborts the job.
+          TSAN_OPTIONS: "halt_on_error=1 suppressions=${{ github.workspace }}/test/tsan.supp"
+        # setarch -R disables ASLR: modern kernels randomize enough that tsan
+        # otherwise aborts at startup with "unexpected memory mapping".
+        run: setarch "$(uname -m)" -R ./build/release/test/unittest "test/sql/zim_parallel.test"

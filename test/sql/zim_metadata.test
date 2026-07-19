@@ -56,6 +56,22 @@ image/png	1
 text/css	1
 text/html	3
 
+# Malformed Counter segments are skipped defensively; valid ones still parse
+# (issue #19). Fixture Counter byte-patched to "kept/x=42;noeq;bad/y=z":
+# 'noeq' has no '=', 'bad/y=z' has a non-numeric value -> both dropped.
+query II
+SELECT e.key, e.value
+FROM (SELECT unnest(map_entries(zim_counter('test/oracle/test_counter_malformed.zim'))) AS e)
+ORDER BY e.key;
+----
+kept/x	42
+
+# exactly one entry survives (the two malformed segments are not counted)
+query I
+SELECT count(*) FROM (SELECT unnest(map_entries(zim_counter('test/oracle/test_counter_malformed.zim'))));
+----
+1
+
 # archive-level info (stable fields only; uuid/filesize are not asserted)
 query IIIIII
 SELECT info.entry_count, info.all_entry_count, info.article_count, info.media_count,
