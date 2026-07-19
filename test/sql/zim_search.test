@@ -76,3 +76,44 @@ SELECT path, title FROM zim_search('test/oracle/test.zim', 'plants', with_snippe
 ----
 A/Chlorophyll	Chlorophyll
 A/Photosynthesis	Photosynthesis
+
+#------------------------------------------------------------------------------
+# #14: federated ignore_errors — skip un-openable archives without losing the rest
+#------------------------------------------------------------------------------
+
+# Default: one un-openable archive in a federated call aborts the whole query.
+statement error
+SELECT count(*) FROM zim_search(['test/oracle/test.zim', 'test/oracle/NOPE.zim'], 'plants');
+----
+
+# ignore_errors: the bad archive is skipped, the good archive's hits survive.
+query II
+SELECT path, title FROM zim_search(['test/oracle/test.zim', 'test/oracle/NOPE.zim'], 'plants', ignore_errors := true)
+ORDER BY path;
+----
+A/Chlorophyll	Chlorophyll
+A/Photosynthesis	Photosynthesis
+
+# Order-independent: bad archive listed first still yields the good archive's hits.
+query I
+SELECT count(*) FROM zim_search(['test/oracle/NOPE.zim', 'test/oracle/test.zim'], 'plants', ignore_errors := true);
+----
+2
+
+# A single un-openable archive still throws even with ignore_errors (nothing to salvage).
+statement error
+SELECT * FROM zim_search('test/oracle/NOPE.zim', 'plants', ignore_errors := true);
+----
+
+# Every archive failing still throws even with ignore_errors.
+statement error
+SELECT * FROM zim_search(['test/oracle/NOPE1.zim', 'test/oracle/NOPE2.zim'], 'plants', ignore_errors := true);
+----
+all 2 archive(s) failed
+
+# zim_suggest honors ignore_errors the same way (bad archive skipped, good one kept).
+query I
+SELECT count(*) >= 0
+FROM zim_suggest(['test/oracle/test.zim', 'test/oracle/NOPE.zim'], 'pho', ignore_errors := true);
+----
+true

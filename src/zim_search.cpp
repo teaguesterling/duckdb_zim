@@ -23,6 +23,7 @@
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "zim_access.hpp"
@@ -42,6 +43,11 @@ struct SearchBindData : public TableFunctionData {
 	uint32_t max_results = 25;
 	uint32_t result_offset = 0;
 	bool with_snippet = true;
+	// When true, a federated call (>1 archive) tolerates archives it can't open:
+	// as long as at least one archive succeeds, the un-openable ones are skipped
+	// (logged) instead of aborting the whole query. A single archive, or an
+	// all-archives-failed federation, still throws. Default false (abort).
+	bool ignore_errors = false;
 };
 
 // A hit plus the archive it came from.
@@ -101,6 +107,8 @@ static void ParseSearchParams(SearchBindData &bind, TableFunctionBindInput &inpu
 			bind.result_offset = NonNegativeParam(kv.second, "result_offset");
 		} else if (kv.first == "with_snippet") {
 			bind.with_snippet = kv.second.GetValue<bool>();
+		} else if (kv.first == "ignore_errors") {
+			bind.ignore_errors = kv.second.GetValue<bool>();
 		} else {
 			throw BinderException("%s: unknown parameter '%s'", fn, kv.first);
 		}
@@ -137,20 +145,76 @@ static uint64_t ResolveMaxContentSize(ClientContext &context) {
 	return zim_ext::DEFAULT_MAX_CONTENT_SIZE;
 }
 
+// Run `fetch` against each archive in bind.file_paths, tagging every hit with its
+// source file, and apply the ignore_errors policy:
+//   - Default (ignore_errors=false): any failure aborts the whole call.
+//   - ignore_errors=true: an archive that can't be opened/searched is skipped
+//     (logged), BUT only when it's a multi-archive call and at least one archive
+//     still succeeds. A single archive, or a federation where every archive fails,
+//     re-throws -- ignore_errors salvages a partial result, it never hides a total
+//     failure or a lone bad target.
+template <typename FetchFn>
+static std::vector<TaggedHit> RunFederated(ClientContext &context, const SearchBindData &bind, const char *fn,
+                                           FetchFn fetch) {
+	auto &pool = GetArchivePool(context);
+	auto *fs = &FileSystem::GetFileSystem(context);
+	const uint64_t max_local_index = ResolveMaxLocalIndex(context);
+
+	std::vector<TaggedHit> hits;
+	const size_t total = bind.file_paths.size();
+	size_t failures = 0;
+	std::string failure_notes;
+	std::exception_ptr first_error;
+
+	for (auto &fp : bind.file_paths) {
+		try {
+			auto archive = pool.Get(fp, fs, max_local_index);
+			for (auto &hit : fetch(*archive)) {
+				hits.push_back(TaggedHit {fp, std::move(hit)});
+			}
+		} catch (...) {
+			if (!bind.ignore_errors) {
+				throw; // default: abort on the first un-openable archive
+			}
+			++failures;
+			if (!first_error) {
+				first_error = std::current_exception();
+			}
+			std::string msg;
+			try {
+				std::rethrow_exception(std::current_exception());
+			} catch (const std::exception &e) {
+				msg = e.what();
+			} catch (...) {
+				msg = "unknown error";
+			}
+			if (!failure_notes.empty()) {
+				failure_notes += "\n";
+			}
+			failure_notes += fp + ": " + msg;
+			DUCKDB_LOG_WARNING(context, "%s: skipped un-openable archive '%s': %s", fn, fp, msg);
+			std::fprintf(stderr, "[zim] %s: skipped un-openable archive '%s': %s\n", fn, fp.c_str(), msg.c_str());
+		}
+	}
+
+	// ignore_errors tolerates a partial federation only; surface the error when a
+	// lone archive fails or every archive fails (nothing salvageable).
+	if (bind.ignore_errors && failures > 0 && (total <= 1 || failures == total)) {
+		if (total == 1 && first_error) {
+			std::rethrow_exception(first_error); // preserve the exact single-archive error
+		}
+		throw IOException("%s: all %s archive(s) failed:\n%s", fn, std::to_string(total), failure_notes);
+	}
+	return hits;
+}
+
 unique_ptr<GlobalTableFunctionState> SearchInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<SearchBindData>();
 	auto state = make_uniq<SearchGlobalState>();
-	auto &pool = GetArchivePool(context);
-	auto *fs = &FileSystem::GetFileSystem(context);
-	// Per archive: up to max_results hits, each tagged with its source file.
 	const uint64_t max_content = ResolveMaxContentSize(context);
-	for (auto &fp : bind.file_paths) {
-		auto archive = pool.Get(fp, fs, ResolveMaxLocalIndex(context));
-		for (auto &hit :
-		     archive->Search(bind.query, bind.result_offset, bind.max_results, bind.with_snippet, max_content)) {
-			state->hits.push_back(TaggedHit {fp, std::move(hit)});
-		}
-	}
+	state->hits = RunFederated(context, bind, "zim_search", [&](ZimArchive &archive) {
+		return archive.Search(bind.query, bind.result_offset, bind.max_results, bind.with_snippet, max_content);
+	});
 	return std::move(state);
 }
 
@@ -189,14 +253,9 @@ unique_ptr<FunctionData> SuggestBind(ClientContext &context, TableFunctionBindIn
 unique_ptr<GlobalTableFunctionState> SuggestInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<SearchBindData>();
 	auto state = make_uniq<SearchGlobalState>();
-	auto &pool = GetArchivePool(context);
-	auto *fs = &FileSystem::GetFileSystem(context);
-	for (auto &fp : bind.file_paths) {
-		auto archive = pool.Get(fp, fs, ResolveMaxLocalIndex(context));
-		for (auto &hit : archive->Suggest(bind.query, bind.result_offset, bind.max_results, bind.with_snippet)) {
-			state->hits.push_back(TaggedHit {fp, std::move(hit)});
-		}
-	}
+	state->hits = RunFederated(context, bind, "zim_suggest", [&](ZimArchive &archive) {
+		return archive.Suggest(bind.query, bind.result_offset, bind.max_results, bind.with_snippet);
+	});
 	return std::move(state);
 }
 
@@ -221,6 +280,7 @@ TableFunction MakeFn(const string &name, const LogicalType &files_type, table_fu
 	f.named_parameters["max_results"] = LogicalType::BIGINT;
 	f.named_parameters["result_offset"] = LogicalType::BIGINT;
 	f.named_parameters["with_snippet"] = LogicalType::BOOLEAN;
+	f.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
 	return f;
 }
 
