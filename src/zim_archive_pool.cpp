@@ -32,7 +32,21 @@ static std::string CanonicalKey(const std::string &file_path) {
 
 std::shared_ptr<ZimArchive> ArchivePool::Get(const std::string &file_path, FileSystem *fs,
                                              uint64_t max_local_index_bytes) {
-	const std::string key = CanonicalKey(file_path);
+	// The remote-index cap (zim_remote_search_max_local_index) is applied at open time
+	// (OpenConfig::maxLocalSearchIndexBytes) and decides copy-locally vs range-read-in-
+	// place for a remote full-text index. A handle opened under one cap keeps that cap
+	// for its lifetime, so reusing it for a query that asked for a different cap would
+	// silently ignore the new setting (issue #16). Fold the cap into the cache key for
+	// remote archives so each distinct cap gets its own handle. Local archives ignore
+	// the cap entirely, so their key stays path-only (no redundant handles).
+	std::string key = CanonicalKey(file_path);
+	if (FileSystem::IsRemoteFile(file_path)) {
+		// 0x1f (unit separator) can't occur in a path or URL, so it cleanly
+		// delimits the path from the cap suffix.
+		key += '\x1f';
+		key += "idx=";
+		key += std::to_string(max_local_index_bytes);
+	}
 	std::lock_guard<std::mutex> guard(mu_);
 
 	auto it = cache_.find(key);
@@ -45,11 +59,10 @@ std::shared_ptr<ZimArchive> ArchivePool::Get(const std::string &file_path, FileS
 	}
 
 	// Open with the caller's original path so the error message shows what they passed.
-	// NOTE: the cache key omits max_local_index_bytes; the first opener's cap sticks for
-	// the cached handle. Since Phase B (range-reading the index in place), the cap no
-	// longer gates whether a large remote index is searchable -- it only decides copy vs
-	// range-read, both of which return correct results. So a stale cached cap changes at
-	// most an internal fetch strategy, not correctness (issue #16, downgraded post-Phase-B).
+	// The cap is part of the key for remote archives (above), so a handle is never
+	// reused under a cap it wasn't opened with. Since Phase B (range-reading the index
+	// in place) a large remote index is still searchable at a low cap -- the cap only
+	// affects copy-vs-range-read (a performance choice), never correctness.
 	auto archive = ZimArchive::Open(file_path, fs, max_local_index_bytes); // may throw
 	cache_[key] = archive;
 	Pin(key, archive);
