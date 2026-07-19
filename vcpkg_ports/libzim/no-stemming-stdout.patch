@@ -1,0 +1,26 @@
+diff --git a/src/search.cpp b/src/search.cpp
+index 19d173a..125277c 100644
+--- a/src/search.cpp
++++ b/src/search.cpp
+@@ -66,7 +66,7 @@ XapianDbMetadata::XapianDbMetadata(const Xapian::Database& db, std::string defau
+         try {
+             m_stemmer = Xapian::Stem(languageLocale.getLanguage());
+         } catch (...) {
+-            std::cout << "No stemming for language '" << languageLocale.getLanguage() << "'" << std::endl;
++            // No stemmer for this language (e.g. 'zh'): leave m_stemmer default (no stemming).
+         }
+     }
+     m_stopwords = db.get_metadata("stopwords");
+diff --git a/src/suggestion.cpp b/src/suggestion.cpp
+index 3cf6db6..9cb02a8 100644
+--- a/src/suggestion.cpp
++++ b/src/suggestion.cpp
+@@ -94,7 +94,7 @@ void SuggestionDataBase::initXapianDb() {
+           m_stemmer = Xapian::Stem(languageLocale.getLanguage());
+           m_queryParser.set_stemmer(m_stemmer);
+       } catch (...) {
+-          std::cout << "No stemming for language '" << languageLocale.getLanguage() << "'" << std::endl;
++          // No stemmer for this language (e.g. 'zh'): leave m_stemmer default (no stemming).
+       }
+   }
+ 
