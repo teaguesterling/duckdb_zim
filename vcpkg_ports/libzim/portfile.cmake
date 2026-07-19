@@ -13,6 +13,12 @@ vcpkg_from_github(
         # remote HTTP/S3 archives). Proposed upstream; drop this overlay once a
         # libzim release carries it. See README.md.
         stream-reader-api.patch
+        # Local overlay only: libzim writes "No stemming for language 'X'" to
+        # std::cout when Xapian has no stemmer for the archive's language (e.g. zh),
+        # polluting the caller's stdout on every search/suggest open. Drop the print
+        # (the catch still leaves stemming disabled, which is correct). Propose
+        # upstream; drop this overlay once libzim stops printing to stdout.
+        no-stemming-stdout.patch
 )
 
 set(EXTRA_OPTIONS "")
