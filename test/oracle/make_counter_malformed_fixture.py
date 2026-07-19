@@ -63,7 +63,7 @@ def main(out="test/oracle/test_counter_malformed.zim"):
     idx = raw.find(orig_b)
     if idx < 0:
         raise SystemExit(f"Counter string '{original}' not found verbatim (was the archive compressed?)")
-    patched = raw[:idx] + malformed + raw[idx + L:]
+    patched = raw[:idx] + malformed + raw[idx + L :]
     open(out, "wb").write(patched)
 
     check = Archive(out).get_metadata("Counter").decode()

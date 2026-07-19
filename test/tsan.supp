@@ -1,0 +1,18 @@
+# ThreadSanitizer suppressions for the zim extension's parallel-scan test.
+#
+# libzim is linked WITHOUT tsan instrumentation, so tsan cannot see the mutexes
+# that already guard libzim's own internal caches, and false-reports data races
+# on their internal allocations under concurrent reads. Verified thread-safe in
+# libzim 9.7.0 source:
+#   - DirectDirentAccessor::getDirent locks m_direntCacheLock around its LRU
+#     dirent cache (src/dirent_accessor.cpp).
+#   - Cluster blob data / FileImpl use libzim's ConcurrentCache (mutex-guarded).
+#
+# These suppress races whose racy frame is INSIDE libzim (zim::*). A race in this
+# extension's own code (duckdb::zim_ext::*) is NOT matched and will still fail the
+# test -- which is the point of running it.
+race:zim::DirectDirentAccessor
+race:zim::Cluster
+race:zim::FileImpl
+race:zim::Reader
+race:zim::DirentReader
