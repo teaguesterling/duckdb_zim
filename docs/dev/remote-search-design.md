@@ -88,8 +88,35 @@ Two independent levers:
 ## Design decision
 
 Give Xapian a remote random-access block reader; keep the DB warm; let existing
-caches handle reuse. **Do not extract the whole index.** Build only the reader —
-caching is generic byte-range caching that existing layers already do.
+caches handle reuse. **Do not extract the whole index above a configurable size
+threshold** — small indexes take a one-shot local-copy fast path (see below); for
+large indexes, build only the reader (caching is generic byte-range caching that
+existing layers already do).
+
+### Small-index fast path (local copy below a threshold)
+
+> **Status: shipped.** Both paths below are implemented. The local-copy path uses
+> libzim's `OpenConfig::maxLocalSearchIndexBytes`; the range-reader ("Phase 1"
+> below) landed as the over-threshold path. The setting is
+> `zim_remote_search_max_local_index`.
+
+The "don't extract" rule is for *large* indexes (Medicine 166 MB, full English
+~2.5–3 GB). For a *small* index the calculus flips: one sequential range fetch of
+the whole blob is simpler and lower-latency than scattered 8 KB block reads over many
+round trips. So the reader gates on index size with a configurable threshold:
+
+- Setting: `zim_remote_search_max_local_index` (bytes; default **8 MB**;
+  `0` = always range-read; very large = always local-copy).
+- If `fulltext/xapian` size ≤ threshold: fetch the whole index blob in one contiguous
+  range read **through the same reader** (the index, *not* the archive), spill to a temp
+  file, and open Xapian on that fd via the existing `getDbFromAccessInfo` path. One
+  request; no glass-reader needed for this case; the temp DB is cached per-archive.
+- Else: the Phase-1 random-access glass reader below.
+
+Both honor "no whole-file download" — they fetch at most the index, never the archive.
+The threshold is the one knob trading a simpler one-shot fetch (small indexes) against
+bounded-bytes random access (large indexes). (The local-copy path shipped first, as the
+smaller change; the glass reader followed for big indexes.)
 
 ### Phase 1 — Xapian random-access glass reader (the real work)
 
