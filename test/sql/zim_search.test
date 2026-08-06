@@ -63,6 +63,52 @@ SELECT * FROM zim_search('test/oracle/test.zim', 'x', max_results := -1);
 ----
 must be >= 0
 
+# NULL is rejected with a binder error rather than tripping an internal assertion.
+# Callers that pass an optional argument through — a prepared statement parameter,
+# or an MCP tool parameter the caller omitted — hand us NULL, and GetValue on a NULL
+# Value raises INTERNAL Error, which invalidates the whole query.
+statement error
+SELECT * FROM zim_search('test/oracle/test.zim', 'x', max_results := NULL);
+----
+max_results must not be NULL
+
+statement error
+SELECT * FROM zim_search('test/oracle/test.zim', 'x', result_offset := NULL);
+----
+result_offset must not be NULL
+
+statement error
+SELECT * FROM zim_search('test/oracle/test.zim', 'x', with_snippet := NULL);
+----
+with_snippet must not be NULL
+
+statement error
+SELECT * FROM zim_search('test/oracle/test.zim', 'x', ignore_errors := NULL);
+----
+ignore_errors must not be NULL
+
+# the same guard covers zim_suggest, which shares the parameter parser.
+statement error
+SELECT * FROM zim_suggest('test/oracle/test.zim', 'x', max_results := NULL);
+----
+max_results must not be NULL
+
+# a NULL bound arriving through a prepared statement parameter is the shape that
+# an omitted optional argument actually takes.
+statement ok
+PREPARE search_capped AS SELECT * FROM zim_search('test/oracle/test.zim', 'x', max_results := $mx);
+
+statement error
+EXECUTE search_capped(mx := NULL);
+----
+max_results must not be NULL
+
+# COALESCE keeps an optional bound usable: it folds before the table function binds.
+query I
+SELECT count(*) >= 0 FROM zim_search('test/oracle/test.zim', 'plants', max_results := COALESCE(NULL, 25));
+----
+true
+
 # with_snippet := false skips snippet generation (which reads each hit's full body),
 # so the snippet column is NULL — a cheaper path, especially for remote archives.
 query I

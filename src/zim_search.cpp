@@ -65,11 +65,27 @@ struct SearchGlobalState : public GlobalTableFunctionState {
 };
 
 static uint32_t NonNegativeParam(const Value &val, const char *name) {
+	// GetValue on a NULL Value raises an INTERNAL assertion; reject it as a
+	// clean binder error instead. A NULL here typically arrives when a caller
+	// passes an omitted optional argument straight through (a prepared-statement
+	// parameter, or an MCP tool parameter the caller left out).
+	if (val.IsNull()) {
+		throw BinderException("%s must not be NULL", name);
+	}
 	auto v = val.GetValue<int64_t>();
 	if (v < 0) {
 		throw BinderException("%s must be >= 0", name);
 	}
 	return static_cast<uint32_t>(v);
+}
+
+// A BOOLEAN named parameter, rejecting NULL for the same reason as
+// NonNegativeParam (GetValue<bool> on a NULL Value trips an internal assertion).
+static bool BoolParam(const Value &val, const char *name) {
+	if (val.IsNull()) {
+		throw BinderException("%s must not be NULL", name);
+	}
+	return val.GetValue<bool>();
 }
 
 // Expand a VARCHAR / glob / LIST(VARCHAR) argument into a list of archive paths.
@@ -106,9 +122,9 @@ static void ParseSearchParams(SearchBindData &bind, TableFunctionBindInput &inpu
 		} else if (kv.first == "result_offset") {
 			bind.result_offset = NonNegativeParam(kv.second, "result_offset");
 		} else if (kv.first == "with_snippet") {
-			bind.with_snippet = kv.second.GetValue<bool>();
+			bind.with_snippet = BoolParam(kv.second, "with_snippet");
 		} else if (kv.first == "ignore_errors") {
-			bind.ignore_errors = kv.second.GetValue<bool>();
+			bind.ignore_errors = BoolParam(kv.second, "ignore_errors");
 		} else {
 			throw BinderException("%s: unknown parameter '%s'", fn, kv.first);
 		}
