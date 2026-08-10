@@ -27,6 +27,9 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "utf8proc_wrapper.hpp"
 
 #include "zim_access.hpp"
@@ -118,6 +121,12 @@ struct ReadZimGlobalState : public GlobalTableFunctionState {
 	bool lookup_by_title = false;
 	std::string lookup_key;
 
+	// Every filter DuckDB pushed down, rebuilt as one AND-ed expression over the output
+	// chunk's layout (BoundReference i == output column i == column_ids[i]). DuckDB
+	// DELETES a fully-pushed filter from the plan, so the scan must apply it itself —
+	// see the filter-pushdown note below. Null when nothing was pushed.
+	unique_ptr<Expression> filter_expression;
+
 	// --- serial (Lookup / SerialScan): sequential file/cursor state machine ---
 	idx_t file_idx = 0;
 	std::shared_ptr<ZimArchive> archive;
@@ -167,6 +176,13 @@ struct ReadZimLocalState : public LocalTableFunctionState {
 	idx_t file_idx = 0;
 	uint64_t idx = 0; // next cluster-order index to read
 	uint64_t end = 0; // end of the current morsel
+
+	// --- pushed-down filter application (only allocated when filters were pushed) ---
+	// Rows are emitted into scan_chunk and then selected into the caller's chunk, so
+	// EmitRow always writes to flat vectors regardless of how the last chunk was sliced.
+	DataChunk scan_chunk;
+	unique_ptr<ExpressionExecutor> filter_executor;
+	SelectionVector filter_sel;
 };
 
 LogicalType ContentType(const ReadZimBindData &bind) {
@@ -361,15 +377,108 @@ static void AdvanceFile(ReadZimGlobalState &g, const ReadZimBindData &bind) {
 }
 
 // --- filter pushdown -------------------------------------------------------
-// We register read_zim with filter_pushdown = true but leave filter_prune off,
-// so DuckDB still re-applies every WHERE filter above the scan. This pushdown is
-// therefore a pure read-reduction optimization: at worst a case we don't handle
-// just scans more than necessary; it can never change the result set.
+// filter_pushdown = true is NOT advisory. Once a filter lands in the scan's
+// TableFilterSet, DuckDB removes it from the plan and never re-applies it:
+//   * FilterCombiner::TryPushdownConstantFilter ends with equivalence_map.erase(),
+//     so `size > N` / `mimetype = 'x'` are not regenerated above the GET;
+//   * GenerateTableScanFilters erases any filter TryPushdownExpression reports as
+//     PUSHED_DOWN_FULLY — `col LIKE 'x%'` becomes `col >= 'x' AND col < 'y'`,
+//     `col IN (a,b,c)` on consecutive integers becomes a range, etc.
+// Anything the scan silently ignores is therefore silently *dropped* — the cause
+// of issue #29 (WHERE mimetype LIKE 'image/%' returning the whole archive,
+// NULL mimetypes included).
 //
-// Handled: `path = const` / `title = const` -> exact libzim lookup (the big win,
-// especially remote — a few KB instead of a full dirent scan); `mimetype = const`
-// or `mimetype IN (...)` -> the existing Accept-style post-filter. LIKE/prefix,
-// IN on path/title, and ranges are left for DuckDB to apply (future work).
+// So the scan applies the pushed filters itself, in two layers:
+//
+//  1. Read reduction (best-effort, must stay a SUPERSET of the true result):
+//     `path = const` / `title = const` -> exact libzim lookup (the big win,
+//     especially remote — a few KB instead of a full dirent scan); `mimetype =
+//     const` / `mimetype IN (...)` -> the Accept-style scan filter.
+//  2. Correctness (exhaustive): BuildFilterExpression turns the ENTIRE
+//     TableFilterSet back into a bound expression via TableFilter::ToExpression
+//     and ReadZimFunction evaluates it over every chunk. Layer 1 may therefore
+//     handle nothing at all without affecting the result set.
+
+// Output type of a storage column, for the BoundReferenceExpression the filters bind to.
+static LogicalType ZimColumnType(const ReadZimBindData &bind, column_t cid) {
+	switch (cid) {
+	case COL_PATH:
+	case COL_TITLE:
+	case COL_MIMETYPE:
+	case COL_REDIRECT_PATH:
+	case COL_FILE_PATH:
+		return LogicalType::VARCHAR;
+	case COL_IS_REDIRECT:
+		return LogicalType::BOOLEAN;
+	case COL_SIZE:
+		return LogicalType::UBIGINT;
+	case COL_CONTENT:
+		return ContentType(bind);
+	default:
+		return LogicalType::INVALID;
+	}
+}
+
+// Rebuild the pushed-down TableFilterSet as a single AND-ed expression over the output
+// chunk. Filters are keyed by *projected* index (PhysicalPlanGenerator's
+// CreateTableFilterSet rewrites the storage index into an index into column_ids), which
+// is exactly the output chunk's column order — filter_prune is off, so no projection_ids
+// indirection sits in between. A filter we cannot map is an internal error rather than a
+// skip: skipping is what made issue #29 silent.
+static unique_ptr<Expression> BuildFilterExpression(const ReadZimBindData &bind, const ReadZimGlobalState &g,
+                                                    TableFunctionInitInput &input) {
+	if (!input.filters || input.filters->filters.empty()) {
+		return nullptr;
+	}
+	vector<unique_ptr<Expression>> conditions;
+	for (auto &entry : input.filters->filters) {
+		const idx_t proj_idx = entry.first;
+		if (proj_idx >= g.column_ids.size()) {
+			throw InternalException("read_zim: pushed-down filter references column %llu, but only %llu columns are "
+			                        "projected",
+			                        (uint64_t)proj_idx, (uint64_t)g.column_ids.size());
+		}
+		auto type = ZimColumnType(bind, g.column_ids[proj_idx]);
+		if (type.id() == LogicalTypeId::INVALID) {
+			throw InternalException("read_zim: pushed-down filter on unknown column id %llu",
+			                        (uint64_t)g.column_ids[proj_idx]);
+		}
+		auto col_ref = make_uniq<BoundReferenceExpression>(type, proj_idx);
+		// ToExpression is total over the TableFilter hierarchy; the approximate kinds
+		// (bloom, uninitialized dynamic) return the constant TRUE, which is safe here
+		// because those are redundant with the join that produced them.
+		auto expr = entry.second->ToExpression(*col_ref);
+		if (!expr) {
+			throw InternalException("read_zim: could not rebuild a pushed-down filter as an expression");
+		}
+		conditions.push_back(std::move(expr));
+	}
+	if (conditions.size() == 1) {
+		return std::move(conditions[0]);
+	}
+	auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+	for (auto &condition : conditions) {
+		conjunction->children.push_back(std::move(condition));
+	}
+	return std::move(conjunction);
+}
+
+// Keep only the rows of `scan_chunk` that satisfy the pushed-down filters, writing the
+// survivors into `output`. Returns the surviving row count.
+static idx_t SelectFilteredRows(ClientContext &context, const ReadZimGlobalState &g, ReadZimLocalState &l,
+                                DataChunk &output) {
+	if (!l.filter_executor) {
+		l.filter_executor = make_uniq<ExpressionExecutor>(context, *g.filter_expression);
+		l.filter_sel.Initialize(STANDARD_VECTOR_SIZE);
+	}
+	const idx_t count = l.filter_executor->SelectExpression(l.scan_chunk, l.filter_sel);
+	if (count == l.scan_chunk.size()) {
+		output.Reference(l.scan_chunk);
+	} else {
+		output.Slice(l.scan_chunk, l.filter_sel, count);
+	}
+	return count;
+}
 
 // `col = <varchar const>` -> sets `out`, returns true.
 static bool FilterEqualityString(const TableFilter &filter, std::string &out) {
@@ -385,30 +494,48 @@ static bool FilterEqualityString(const TableFilter &filter, std::string &out) {
 	return true;
 }
 
-// Append the varchar constants of an equality or IN filter to `out`.
+// Append the varchar constants of an equality or IN filter to `out`. A pattern must
+// keep MimetypeAccepted a superset of the filter: the empty string is skipped because
+// MimetypePatternMatch never matches an empty mimetype, so pushing it would drop the
+// very rows `mimetype = ''` selects.
 static void CollectMimetypeConstants(const TableFilter &filter, std::vector<std::string> &out) {
 	if (filter.filter_type == TableFilterType::CONSTANT_COMPARISON) {
 		auto &cf = filter.Cast<ConstantFilter>();
 		if (cf.comparison_type == ExpressionType::COMPARE_EQUAL && !cf.constant.IsNull() &&
 		    cf.constant.type().id() == LogicalTypeId::VARCHAR) {
-			out.push_back(cf.constant.GetValue<std::string>());
+			auto value = cf.constant.GetValue<std::string>();
+			if (!value.empty()) {
+				out.push_back(std::move(value));
+			}
 		}
 	} else if (filter.filter_type == TableFilterType::IN_FILTER) {
+		std::vector<std::string> values;
 		for (auto &v : filter.Cast<InFilter>().values) {
-			if (!v.IsNull() && v.type().id() == LogicalTypeId::VARCHAR) {
-				out.push_back(v.GetValue<std::string>());
+			if (v.IsNull() || v.type().id() != LogicalTypeId::VARCHAR) {
+				return; // cannot represent this IN list; leave the scan unfiltered
 			}
+			auto value = v.GetValue<std::string>();
+			if (value.empty()) {
+				return;
+			}
+			values.push_back(std::move(value));
+		}
+		for (auto &value : values) {
+			out.push_back(std::move(value));
 		}
 	}
 }
 
+// Best-effort read reduction (layer 1 above). Correctness never depends on this: every
+// pushed filter is re-applied exactly by g.filter_expression, so each rule here only has
+// to keep the scan a superset of the true result.
 static void ApplyPushedFilters(ReadZimGlobalState &g, TableFunctionInitInput &input) {
 	if (!input.filters) {
 		return;
 	}
 	// Only a plain path-order full scan may be redirected to a lookup; a named
-	// path:=/title:=/prefix/listing keeps its mode (the WHERE filter then just
-	// rides as a DuckDB post-filter, which is already applied above the scan).
+	// path:=/title:=/prefix/listing keeps its mode (the WHERE filter is then applied
+	// on the emitted rows like any other).
 	const bool scan_is_open = !g.single_lookup && !g.scan_spec.path_prefix.has_value() &&
 	                          !g.scan_spec.title_prefix.has_value() && g.scan_spec.order == ScanOrder::ByPath;
 	// filters are keyed by *projected* (output) column index; map back to storage.
@@ -467,6 +594,10 @@ unique_ptr<GlobalTableFunctionState> ReadZimInitGlobal(ClientContext &context, T
 	state->lookup_by_title = bind.lookup_by_title;
 	state->lookup_key = bind.lookup_key;
 	ApplyPushedFilters(*state, input);
+	// ...and rebuild every pushed filter as an expression the scan evaluates on each
+	// chunk. DuckDB has already deleted these from the plan, so this is the only thing
+	// standing between a pushed-down predicate and a silently wrong result.
+	state->filter_expression = BuildFilterExpression(bind, *state, input);
 
 	if (state->mode == ScanMode::ParallelScan) {
 		// Use DuckDB's configured thread count; morsels (and their archives) are
@@ -533,15 +664,14 @@ void EmitRow(const ReadZimBindData &bind, const ReadZimGlobalState &gstate, cons
 	}
 }
 
-void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &bind = data.bind_data->Cast<ReadZimBindData>();
-	auto &gstate = data.global_state->Cast<ReadZimGlobalState>();
-
+// Fills `output` with the next batch of raw scan rows (no pushed-down filters applied)
+// and sets its cardinality. A cardinality of 0 means the scan is exhausted.
+static void ProduceChunk(const ReadZimBindData &bind, ReadZimGlobalState &gstate, ReadZimLocalState &lstate,
+                         DataChunk &output) {
 	// --- parallel path-order scan: each thread drains cluster-order morsels. ---
 	// libzim's Archive is threadsafe, so the morsels read the shared pooled handle
 	// concurrently. Row order is not guaranteed (parallel scans never are).
 	if (gstate.mode == ScanMode::ParallelScan) {
-		auto &lstate = data.local_state->Cast<ReadZimLocalState>();
 		idx_t count = 0;
 		while (count < STANDARD_VECTOR_SIZE) {
 			if (lstate.idx >= lstate.end) {
@@ -604,6 +734,36 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 	output.SetCardinality(count);
 }
 
+void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind = data.bind_data->Cast<ReadZimBindData>();
+	auto &gstate = data.global_state->Cast<ReadZimGlobalState>();
+	auto &lstate = data.local_state->Cast<ReadZimLocalState>();
+
+	if (!gstate.filter_expression) {
+		ProduceChunk(bind, gstate, lstate, output);
+		return;
+	}
+
+	// Filters were pushed down: scan into the local chunk and select from it. An
+	// entirely filtered-out batch must NOT be returned — a zero-row chunk is how a
+	// table function reports end-of-scan — so keep scanning until something survives
+	// or the scan really is exhausted.
+	if (lstate.scan_chunk.ColumnCount() == 0) {
+		lstate.scan_chunk.Initialize(Allocator::Get(context), output.GetTypes());
+	}
+	for (;;) {
+		lstate.scan_chunk.Reset();
+		ProduceChunk(bind, gstate, lstate, lstate.scan_chunk);
+		if (lstate.scan_chunk.size() == 0) {
+			output.SetCardinality(0);
+			return;
+		}
+		if (SelectFilteredRows(context, gstate, lstate, output) > 0) {
+			return;
+		}
+	}
+}
+
 // Rewrites `FROM 'archive.zim'` into read_zim('archive.zim').
 static unique_ptr<TableRef> ReadZimReplacementScan(ClientContext &context, ReplacementScanInput &input,
                                                    optional_ptr<ReplacementScanData> data) {
@@ -637,9 +797,13 @@ void RegisterReadZim(ExtensionLoader &loader) {
 		f.named_parameters["title_prefix"] = LogicalType::VARCHAR;
 		f.named_parameters["listing"] = LogicalType::VARCHAR;
 		f.projection_pushdown = true;
-		// Push WHERE path/title = const down to an exact libzim lookup, and WHERE
-		// mimetype down to the post-filter. filter_prune stays off, so DuckDB still
-		// re-applies every filter — pushdown is a pure read-reduction optimization.
+		// Accepting pushdown means OWNING every pushed filter: DuckDB deletes them from
+		// the plan and never re-applies them (issue #29). ReadZimFunction evaluates the
+		// whole TableFilterSet on each chunk; ApplyPushedFilters additionally turns
+		// `path/title = const` into an exact libzim lookup and `mimetype = const` /
+		// `mimetype IN (...)` into a scan-level skip, purely to read less.
+		// filter_prune stays off, so a filtered column is always emitted by the scan and
+		// the filter indices line up with the output chunk one-to-one.
 		f.filter_pushdown = true;
 		return f;
 	};

@@ -134,3 +134,158 @@ query I
 SELECT count(*) FROM read_zim('test/oracle/test.zim', path := 'A/Photosynthesis') WHERE mimetype = 'image/png';
 ----
 0
+
+# ============================================================================
+# Regression: issue #29 — a pushed-down filter the scan does not implement was
+# silently DROPPED, not re-applied by DuckDB.
+#
+# DuckDB deletes a filter from the plan once it lands in the scan's TableFilterSet
+# (FilterCombiner::TryPushdownConstantFilter erases the equivalence entry;
+# GenerateTableScanFilters erases anything reported PUSHED_DOWN_FULLY). So
+# `WHERE mimetype LIKE 'image/%'` — lowered to `mimetype >= 'image/' AND
+# mimetype < 'image0'` — returned the ENTIRE archive, redirects with a NULL
+# mimetype included, which no correct evaluation of LIKE can produce.
+#
+# test.zim: 3 text/html, 1 text/css, 1 image/png, 1 redirect (NULL mimetype).
+# ============================================================================
+
+# --- the reported symptom: LIKE on mimetype ---
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE mimetype LIKE 'image/%';
+----
+1
+
+# a NULL mimetype can never survive LIKE — this is what regressed
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE mimetype LIKE 'image/%' AND mimetype IS NULL;
+----
+0
+
+query TT
+SELECT path, mimetype FROM read_zim('test/oracle/test.zim') WHERE mimetype LIKE 'image/%';
+----
+I/logo.png	image/png
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE mimetype LIKE 'text/%';
+----
+4
+
+# same predicate against the un-pushed reference (`|| ''` defeats pushdown)
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE mimetype LIKE 'image/%')
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE mimetype || '' LIKE 'image/%')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE mimetype || '' LIKE 'image/%')
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim') WHERE mimetype LIKE 'image/%')
+);
+----
+0
+
+# --- the flaw was never mimetype-specific: every column pushes down ---
+
+# path: LIKE 'A/%' becomes a >=/< range filter
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE path LIKE 'A/%';
+----
+4
+
+# the surviving row sorts last in path order — a filter that only matches at the
+# end of the scan must not be cut short by an all-filtered-out intermediate chunk
+query T
+SELECT path FROM read_zim('test/oracle/test.zim') WHERE path LIKE 'style%';
+----
+style.css
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE title LIKE 'C%';
+----
+2
+
+# redirect_path is NULL on every non-redirect entry
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE redirect_path LIKE 'A/%';
+----
+1
+
+# size: a plain range, and a consecutive IN list (lowered to a range)
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE size > 50;
+----
+2
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE size IN (42, 43, 44);
+----
+1
+
+# is_redirect was already correct (NOT x is not pushable) — keep it that way
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE NOT is_redirect;
+----
+5
+
+# --- the issue's motivating query: an article index ---
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE NOT is_redirect AND mimetype LIKE 'text/html%';
+----
+3
+
+# --- the filter column need not be projected ---
+query T
+SELECT path FROM read_zim('test/oracle/test.zim') WHERE mimetype LIKE 'image/%';
+----
+I/logo.png
+
+# --- every scan mode applies the filter, not just the parallel path scan ---
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', parallel := false) WHERE mimetype LIKE 'image/%';
+----
+1
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', listing := 'title') WHERE mimetype LIKE 'text/%';
+----
+3
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', path_prefix := 'A/') WHERE title LIKE 'C%';
+----
+2
+
+# exact-lookup mode (pushed `path = const`) also honours the other filters
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE path = 'A/Photosynth' AND mimetype LIKE 'text/%';
+----
+0
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', path := 'A/Photosynth') WHERE mimetype LIKE 'image/%';
+----
+0
+
+# --- the appended file_path column filters too ---
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', include_filepath := true) WHERE file_path LIKE '%does-not-exist%';
+----
+0
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', include_filepath := true) WHERE file_path LIKE '%test.zim';
+----
+6
+
+# --- a multi-file scan keeps filtering across the file boundary ---
+query I
+SELECT count(*) FROM read_zim(['test/oracle/test.zim', 'test/oracle/test_zimit.zim'])
+WHERE mimetype LIKE 'text/css%';
+----
+2
