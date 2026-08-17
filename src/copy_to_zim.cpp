@@ -604,6 +604,20 @@ void ZimCopyInitializeOperator(GlobalFunctionData &gstate, const PhysicalOperato
 		    "planned, but a partition can fragment into several archives and MAIN_PATH cannot survive "
 		    "partitioning, so it needs handling this version does not have.");
 	}
+	// PER_THREAD_OUTPUT is consumed by the same binder pass and reaches us the same
+	// way. It must be refused rather than ignored: PhysicalCopyToFile creates one
+	// GlobalFunctionData -- one ZimWriter -- PER THREAD and finalizes each
+	// separately, so it would silently produce data_0.zim, data_1.zim, ... each with
+	// its own seen_paths (duplicate detection defeated ACROSS files), its own
+	// MAIN_PATH validation, and a duplicate copy of the metadata. That is precisely
+	// the fragmentation §3.3 refuses PARTITION_BY for, with no key to explain it.
+	if (copy_op.per_thread_output) {
+		throw NotImplementedException(
+		    "COPY TO (FORMAT zim): PER_THREAD_OUTPUT is not supported. It would write one archive per "
+		    "thread, each with its own duplicate-path detection, its own MAIN_PATH validation and its own "
+		    "copy of the metadata -- an arbitrary split of one corpus across files, which this format has "
+		    "no way to express. Write a single archive instead.");
+	}
 }
 
 } // namespace

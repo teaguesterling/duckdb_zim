@@ -412,13 +412,40 @@ TO '__TEST_DIR__/parts' (FORMAT zim, PARTITION_BY (lang));
 ----
 PARTITION_BY is not supported yet
 
-# initialize_operator fires after copy_to_initialize_global, so the partition's
-# output file already exists on disk when the throw happens -- confirm the
-# global state's destructor (Task 2) still unlinks it, leaving no .zim behind
-# anywhere under the partition directory. zim_check() is deliberately not used
+# initialize_operator fires after copy_to_initialize_global, so a ZimWriter was
+# already constructed when the throw happened. Assert the end state anyway: no
+# .zim survives anywhere under the partition directory.
+#
+# What actually removes it is libzim, not our destructor -- design §7.2, as
+# corrected. libzim writes to "<target>.tmp" and renames to the target name only
+# at the end of a successful finishZimCreation(), so the file on disk here is
+# `data_0.zim.tmp` and ~Creator removes it; the global state's unlink finds
+# nothing at `data_0.zim` to remove. This assertion is kept because it pins the
+# end state regardless of which mechanism delivers it, and would catch a future
+# change that finalizes on an error path. zim_check() is deliberately not used
 # here (see the identical reasoning above the "aborted" and "dup" glob checks).
 query I
 SELECT count(*) FROM glob('__TEST_DIR__/parts/**/*.zim');
+----
+0
+
+# PER_THREAD_OUTPUT reaches us the same way PARTITION_BY does, and must be
+# refused for the same reason. physical_copy_to_file.cpp creates one
+# GlobalFunctionData -- one ZimWriter -- PER THREAD and finalizes each
+# separately, so accepting it would write data_0.zim, data_1.zim, ... each with
+# its own seen_paths (duplicate detection defeated ACROSS files), its own
+# MAIN_PATH validation, and a duplicate copy of the metadata: exactly the
+# fragmentation §3.3 refuses PARTITION_BY for, with no key to explain it.
+# Measured before the fix: this wrote __TEST_DIR__/pto/data_0.zim and reported
+# success.
+statement error
+COPY (SELECT 'A/' || i AS path, 'y' AS content FROM range(5) t(i))
+TO '__TEST_DIR__/pto' (FORMAT zim, PER_THREAD_OUTPUT true);
+----
+PER_THREAD_OUTPUT is not supported
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/pto/**/*.zim');
 ----
 0
 
