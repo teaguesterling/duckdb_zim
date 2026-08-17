@@ -1293,12 +1293,16 @@ TO '__TEST_DIR__/typo.zim' (FORMAT zim);
 ----
 unknown column 'titel'
 
-# --- the two redirect spellings must not both be supplied -------------------
+# --- v2 columns are refused as deferred, not as typos -----------------------
+# entry_kind is a v2 column. In v1 it cannot be accepted at all, so the error
+# says "not supported yet" rather than "unknown column" -- a deferral must read
+# as a deferral. The mutual-exclusion check against is_redirect belongs to v2,
+# when entry_kind becomes a column that CAN be supplied.
 statement error
 COPY (SELECT 'A/x' AS path, 'y' AS content, false AS is_redirect, 'item' AS entry_kind)
 TO '__TEST_DIR__/bothspellings.zim' (FORMAT zim);
 ----
-specify only one of
+not supported yet
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -1378,11 +1382,10 @@ Replace the column-resolution block in `ZimCopyBind`:
 	}
 ```
 
-> `entry_kind` appears in `DEFERRED_COLUMNS`, which already satisfies the
-> "specify only one of" test case above — but the message says "not supported yet" rather
-> than "specify only one of". Change that test's expected substring to
-> `not supported yet` and keep the mutual-exclusion check for v2 when `entry_kind` becomes
-> real. Do not add a check for a column that cannot yet be accepted.
+> `entry_kind` is in `DEFERRED_COLUMNS`, so the "v2 columns are refused as deferred" test
+> above is satisfied by that branch alone. Do **not** add a mutual-exclusion check between
+> `is_redirect` and `entry_kind` — a column that cannot be accepted at all cannot conflict
+> with anything. That check belongs to v2, when `entry_kind` becomes real.
 
 - [ ] **Step 4: Use the redirect columns in the sink**
 
@@ -1490,48 +1493,82 @@ FILE_SIZE_BYTES
 Expected: FAIL — `PARTITION_BY` is handled by DuckDB before our bind sees it, so the first
 case likely succeeds and writes a directory of archives.
 
-- [ ] **Step 3: Add the rejections**
+> **Read this before writing code — the controller verified it against the pinned DuckDB,
+> and an earlier draft of this task was wrong.**
+>
+> `bind_copy.cpp:122-123` does `stmt.info->options.clear()` and then re-adds only the
+> options it does **not** recognise. Every DuckDB-level option — `partition_by`,
+> `file_size_bytes`, `use_tmp_file`, `overwrite`, `filename_pattern`, `file_extension`,
+> `per_thread_output` — is consumed there and **never reaches `copy_to_bind`**. So an
+> option-loop branch for any of them is dead code. Do not write one.
 
-Add to the option loop in `ZimCopyBind`, before the final `else`:
+- [ ] **Step 3: Reject `FILE_SIZE_BYTES` by leaving `rotate_files` unset**
+
+DuckDB already does this for us, and does it better. `bind_copy.cpp:166-168`:
 
 ```cpp
-		} else if (key == "partition_by") {
-			throw BinderException(
-			    "COPY TO (FORMAT zim): PARTITION_BY is not supported yet. It is planned -- writing one "
-			    "archive per key works, but a partition can fragment into several archives and "
-			    "MAIN_PATH cannot survive partitioning, so it needs handling this version does not have.");
-		} else if (key == "file_size_bytes") {
-			throw BinderException(
-			    "COPY TO (FORMAT zim): FILE_SIZE_BYTES is not supported. A ZIM cannot be split "
-			    "mid-write and remain a valid archive.");
+		} else if (loption == "file_size_bytes") {
+			…
+			if (!function.rotate_files) {
+				throw NotImplementedException("FILE_SIZE_BYTES not implemented for FORMAT \"%s\"", …);
+			}
 ```
 
-Add the rotation guard beside the other function pointers:
+So the correct action is to **do nothing**: leave `function.rotate_files` unset (it is
+`nullptr` by default) and DuckDB raises a clear, format-named error.
+
+Setting it to a function returning `false` — which an earlier draft of this plan
+instructed — would be actively harmful: it makes `!function.rotate_files` false, so
+DuckDB *skips* its own rejection and proceeds into rotation logic that then refuses to
+rotate. Do not add `ZimCopyRotateFiles`. Confirm no `rotate_files` assignment exists in
+`RegisterCopyToZim`.
+
+- [ ] **Step 4: Reject `PARTITION_BY` via `copy_to_initialize_operator`**
+
+Because the option never reaches our bind, the rejection needs a hook that can see the
+physical operator. `copy_to_initialize_operator` receives the `PhysicalOperator`, which for
+this path is a `PhysicalCopyToFile` carrying `partition_columns`.
+
+Add the include at the top of `src/copy_to_zim.cpp`:
 
 ```cpp
-bool ZimCopyRotateFiles(FunctionData &bind_data, const optional_idx &file_size_bytes) {
-	return false;
+#include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
+```
+
+Add the hook beside the other functions in the anonymous namespace:
+
+```cpp
+// PARTITION_BY is consumed by DuckDB's binder and never reaches copy_to_bind, so the
+// rejection has to happen where the physical operator is visible. Writing one archive per
+// key is planned, but a partition can fragment into several archives past
+// partitioned_write_max_open_files, and MAIN_PATH cannot survive partitioning -- neither is
+// handled in this version, so refuse rather than produce a surprising result.
+void ZimCopyInitializeOperator(GlobalFunctionData &gstate, const PhysicalOperator &op) {
+	auto &copy_op = op.Cast<PhysicalCopyToFile>();
+	if (!copy_op.partition_columns.empty()) {
+		throw NotImplementedException(
+		    "COPY TO (FORMAT zim): PARTITION_BY is not supported yet. Writing one archive per key is "
+		    "planned, but a partition can fragment into several archives and MAIN_PATH cannot survive "
+		    "partitioning, so it needs handling this version does not have.");
+	}
 }
 ```
 
 and in `RegisterCopyToZim`:
 
 ```cpp
-	function.rotate_files = ZimCopyRotateFiles;
+	function.initialize_operator = ZimCopyInitializeOperator;
 ```
 
-- [ ] **Step 4: Verify `PARTITION_BY` actually reaches our bind**
+Note this fires *after* `copy_to_initialize_global`, so the output file already exists when
+it throws — the global state's destructor (Task 2) unlinks it. Confirm that with the test:
+after the `PARTITION_BY` failure, the output directory must not contain a `.zim`.
 
-If the test still fails because DuckDB consumes `partition_by` before `copy_to_bind` runs
-(see `duckdb/src/planner/binder/statement/bind_copy.cpp` around line 113, where it is parsed
-into `partition_cols`), then the option never appears in `input.info.options`. In that case
-detect it differently: `CopyFunctionBindInput::info` carries the parsed statement, so check
-whether DuckDB exposes the partition columns there; if it does not, the rejection must move
-to `copy_to_initialize_global`, which receives the *partitioned* file path (containing a
-`=` hive segment). Prefer the bind-time rejection if it is reachable — a bind error is
-cheaper and clearer than a runtime one.
-
-Record which mechanism you used in a comment, because the next person will wonder.
+If `PhysicalCopyToFile` turns out not to be includable from an extension (a link error on
+`partition_columns`, or the header not being installed), fall back to detecting a hive
+segment in the path passed to `copy_to_initialize_global`: a path containing `=` in its
+last directory component means partitioned output. Record in a comment which mechanism you
+used and why, because the next person will wonder.
 
 - [ ] **Step 5: Run the tests**
 
