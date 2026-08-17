@@ -20,7 +20,7 @@ void RegisterZimMetadata(ExtensionLoader &loader);
 void RegisterZimScalars(ExtensionLoader &loader);
 void RegisterZimFilesystem(ExtensionLoader &loader); // phase 2 (zim://)
 void RegisterZimSearch(ExtensionLoader &loader);     // phase 3 (xapian FTS)
-void RegisterCopyToZim(ExtensionLoader &loader);     // phase 4 (COPY TO)
+void RegisterCopyToZim(ExtensionLoader &loader);     // phase 5 (COPY TO)
 
 static void LoadInternal(ExtensionLoader &loader) {
 	// The archive pool lives in each DatabaseInstance's ObjectCache (see

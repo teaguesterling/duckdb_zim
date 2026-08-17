@@ -52,10 +52,13 @@ struct ZimWriterConfig {
 
 // RAII wrapper around zim::writer::Creator.
 //
-// Construction starts the archive (the output file is created immediately).
-// Finish() completes it. If the object is destroyed WITHOUT a successful
-// Finish(), the partial output is left on disk -- deleting it is the caller's
-// job, because only the caller knows the path policy. See copy_to_zim.cpp.
+// Construction starts the archive. libzim writes to "<out_path>.tmp" and renames
+// it to out_path only at the END of a successful finishZimCreation()
+// (creator.cpp:453), so destroying this object WITHOUT a successful Finish()
+// leaves nothing at out_path -- and ~Creator removes the .tmp sibling itself.
+// The caller (copy_to_zim.cpp) still unlinks out_path on the error path, as
+// defense in depth rather than as the guarantee. See
+// docs/dev/copy-to-zim-design.md §7.2.
 class ZimWriter {
 public:
 	ZimWriter(const std::string &out_path, const ZimWriterConfig &config);

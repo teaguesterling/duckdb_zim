@@ -28,10 +28,11 @@ zim::Compression ParseCompression(const std::string &name) {
 	if (name == "none") {
 		return zim::Compression::None;
 	}
-	if (name == "lzma") {
-		throw std::runtime_error("compression 'lzma' is not supported by this libzim build (9.7.0 only "
-		                         "exposes 'zstd' and 'none'); expected zstd or none");
-	}
+	// No separate 'lzma' branch: ZimCopyBind rejects that name (with the explanation
+	// a user needs) before any string reaches here, so a second lzma-specific
+	// message would be an unreachable duplicate of one user-visible error. The
+	// catch-all below stays as a boundary safety net for this file, which is the
+	// libzim boundary.
 	throw std::runtime_error("unknown compression '" + name + "'; expected zstd or none");
 }
 
