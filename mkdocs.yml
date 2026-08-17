@@ -26,6 +26,7 @@ nav:
   - Reading archives: reading.md
   - The zim:// filesystem: filesystem.md
   - Search & suggestions: search.md
+  - Writing archives: writing.md
   - Function reference: reference.md
   - Recipes: recipes.md
   - Design notes: design.md

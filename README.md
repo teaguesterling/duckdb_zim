@@ -7,11 +7,13 @@ Query an archive's entries, pull article content, read metadata, and compose wit
 rest of the DuckDB extension ecosystem (notably [`webbed`](https://github.com/teaguesterling/duckdb_webbed)
 for the HTML that ZIM articles are made of).
 
-> **Status: phases 1–3 (v0.2.0).** Content scan, lookups, listing, metadata, the
-> `zim://` filesystem, full-text search + title suggestions (`zim_search` / `zim_suggest`,
-> federated across archives), and utilities (`zim_illustration` / `zim_random` /
-> `zim_check`) are implemented. With v0.2.0 the reader is **feature-complete**
-> (`ATTACH` was evaluated and dropped — see [Roadmap](#roadmap)).
+> **Status: phases 1–3 (v0.2.0), plus a writer.** Content scan, lookups, listing, metadata,
+> the `zim://` filesystem, full-text search + title suggestions (`zim_search` /
+> `zim_suggest`, federated across archives), and utilities (`zim_illustration` /
+> `zim_random` / `zim_check`) are implemented, and the reader is **feature-complete**
+> (`ATTACH` was evaluated and dropped — see [Roadmap](#roadmap)). The reader is no longer
+> the whole story: `COPY (query) TO 'out.zim' (FORMAT zim)` writes archives too — see
+> [Writing](#writing).
 
 > **License: GPL-2.0-or-later.** libzim is GPL, so this extension is too. That is
 > intentional and separate from the MIT-licensed `markdown`/`yaml`/`webbed` family;
@@ -266,6 +268,42 @@ SELECT zim_get_text('nhs.uk_en_medicines_2025-12.zim', 'www.nhs.uk/medicines/ins
 
 ---
 
+## Writing
+
+`COPY (query) TO 'out.zim' (FORMAT zim [, options])` turns any query's rows into a new ZIM
+archive. Columns are resolved by name (`path` and `content` required; `title`, `mimetype`,
+`is_redirect`/`redirect_path`, `front_article`, `compress` optional), and options cover
+metadata (`TITLE`, `LANGUAGE`, `DESCRIPTION`, …), `MAIN_PATH`, `INDEX` (Xapian fulltext),
+`COMPRESSION` (`'zstd'` \| `'none'`), and `ON_CONFLICT` (`'error'` \| `'first'`) for
+duplicate paths.
+
+```sql
+-- a searchable archive from a table
+COPY (SELECT path, title, mimetype, content FROM articles)
+TO 'out.zim' (FORMAT zim, TITLE 'My Archive', LANGUAGE 'eng', INDEX true);
+
+-- copy an existing archive
+COPY (SELECT * FROM read_zim('in.zim', include_content := true))
+TO 'copy.zim' (FORMAT zim);
+```
+
+> **Read content as `BLOB`, never `content_as_varchar := true`, when copying an archive.**
+> `content_as_varchar` returns `NULL` for any entry whose bytes aren't valid UTF-8 — every
+> image, font, and other binary file — so piping that into `COPY` writes those entries
+> **empty**, silently. `content` is `BLOB` by default, as in the example above; just don't
+> add `content_as_varchar := true` to the `read_zim()` call that feeds a `COPY`. This is the
+> single easiest way to lose data with this feature.
+
+> **Writing never overwrites.** If the output path exists, `COPY` fails rather than
+> clobbering it (unlike `parquet`/`csv`, which overwrite by default) — a failed write can
+> still leave an archive that opens and passes `zim_check()`, so silent partial overwrite
+> would be the worst combination. Remove the file yourself first if you mean to replace it.
+
+See `docs/writing.md` for the full column/option reference, including the redirect and
+`MAIN_PATH` validation, `ON_CONFLICT` semantics, and the alias round-trip caveat.
+
+---
+
 ## Integration with other extensions
 
 ZIM articles are **HTML** (mwoffliner / zimwriterfs / zimit all emit `text/html`), so the
@@ -449,6 +487,7 @@ work, so it's excluded from CI for now.
 | 3.6 (v0.3) | **remote archives** — read S3/HTTP ZIMs by byte-range via `httpfs` (bundles a libzim `IRandomAccessReader` patch); fulltext search stays local-only | **implemented** |
 | 3.7 | **filter pushdown** — `WHERE path/title = …` → libzim exact lookup, `WHERE mimetype` → post-filter (idiomatic SQL gets the remote-cheap path) | **implemented** |
 | 4 | `ATTACH 'x.zim' AS … (TYPE zim)` | **won't do** — see below |
+| 5 | **writer** — `COPY (query) TO 'out.zim' (FORMAT zim)`: items + metadata + optional Xapian index, inline content only | **implemented** |
 
 **v0.2.0 is considered feature-complete.** `ATTACH` was the last planned phase and has
 been dropped: a ZIM is a *dataset* (one logical relation + metadata + a search index),
