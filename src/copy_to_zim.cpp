@@ -27,6 +27,10 @@ struct ZimColumns {
 	int64_t content = -1;
 	int64_t title = -1;
 	int64_t mimetype = -1;
+	int64_t is_redirect = -1;
+	int64_t redirect_path = -1;
+	int64_t front_article = -1;
+	int64_t compress = -1;
 };
 
 // How to handle a duplicate 'path' seen by the sink. 'last' is deliberately not a
@@ -118,6 +122,39 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 	bind->cols.content = FindColumn(names, "content");
 	bind->cols.title = FindColumn(names, "title");
 	bind->cols.mimetype = FindColumn(names, "mimetype");
+	bind->cols.is_redirect = FindColumn(names, "is_redirect");
+	bind->cols.redirect_path = FindColumn(names, "redirect_path");
+	bind->cols.front_article = FindColumn(names, "front_article");
+	bind->cols.compress = FindColumn(names, "compress");
+
+	// Columns read_zim emits that carry no meaning for the writer. Accepting them
+	// is what makes COPY (FROM read_zim(x)) TO y work (design §6.1); `size` is
+	// derived by libzim and `file_path` is provenance.
+	static const char *IGNORED_COLUMNS[] = {"size", "file_path"};
+	// v2 columns: named so the deferral reads as a deferral, not as a typo.
+	static const char *DEFERRED_COLUMNS[] = {"content_path", "entry_kind", "target", "source_archive", "source_entry"};
+
+	for (idx_t i = 0; i < names.size(); i++) {
+		auto &n = names[i];
+		bool known = false;
+		for (auto *k :
+		     {"path", "content", "title", "mimetype", "is_redirect", "redirect_path", "front_article", "compress"}) {
+			known |= StringUtil::CIEquals(n, k);
+		}
+		for (auto *k : IGNORED_COLUMNS) {
+			known |= StringUtil::CIEquals(n, k);
+		}
+		for (auto *k : DEFERRED_COLUMNS) {
+			if (StringUtil::CIEquals(n, k)) {
+				throw BinderException("COPY TO (FORMAT zim): column '%s' is not supported yet (planned for the next "
+				                      "version, which adds content locators, aliases and redirect kinds)",
+				                      n);
+			}
+		}
+		if (!known) {
+			throw BinderException("COPY TO (FORMAT zim): unknown column '%s'", n);
+		}
+	}
 
 	if (bind->cols.path < 0) {
 		throw BinderException("COPY TO (FORMAT zim): the input must have a 'path' column");
@@ -325,10 +362,38 @@ void ZimCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		if (!GetStringCell(input, bind.cols.title, row, entry.title)) {
 			entry.title = entry.path;
 		}
-		if (!GetStringCell(input, bind.cols.mimetype, row, entry.mimetype)) {
+		GetStringCell(input, bind.cols.mimetype, row, entry.mimetype);
+		GetStringCell(input, bind.cols.content, row, entry.content);
+
+		if (bind.cols.is_redirect >= 0) {
+			auto &vec = input.data[static_cast<idx_t>(bind.cols.is_redirect)];
+			if (FlatVector::Validity(vec).RowIsValid(row) && FlatVector::GetData<bool>(vec)[row]) {
+				entry.is_redirect = true;
+				if (!GetStringCell(input, bind.cols.redirect_path, row, entry.redirect_path)) {
+					throw InvalidInputException(
+					    "COPY TO (FORMAT zim): entry '%s' has is_redirect = true but no redirect_path", entry.path);
+				}
+			}
+		}
+		if (bind.cols.front_article >= 0) {
+			auto &vec = input.data[static_cast<idx_t>(bind.cols.front_article)];
+			if (FlatVector::Validity(vec).RowIsValid(row)) {
+				entry.has_front_article = true;
+				entry.front_article = FlatVector::GetData<bool>(vec)[row];
+			}
+		}
+		if (bind.cols.compress >= 0) {
+			auto &vec = input.data[static_cast<idx_t>(bind.cols.compress)];
+			if (FlatVector::Validity(vec).RowIsValid(row)) {
+				entry.has_compress = true;
+				entry.compress = FlatVector::GetData<bool>(vec)[row];
+			}
+		}
+
+		// A redirect has no mimetype and no content of its own -- skip the default.
+		if (!entry.is_redirect && entry.mimetype.empty()) {
 			entry.mimetype = bind.default_mimetype;
 		}
-		GetStringCell(input, bind.cols.content, row, entry.content);
 
 		if (!gstate.seen_paths.insert(entry.path).second) {
 			if (bind.on_conflict == ZimConflictPolicy::KEEP_FIRST) {

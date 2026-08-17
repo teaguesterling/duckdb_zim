@@ -8,8 +8,13 @@ statement ok
 PRAGMA enable_verification
 
 # --- the input must carry the required columns ------------------------------
+# Uses only known column names (content, title) so this isolates "path is
+# missing" from "an unrecognized column was rejected" -- the latter is a
+# separate assertion below (an unknown column like the old 'notpath' here now
+# also errors, but with "unknown column", since Task 6 added a strict
+# known-column check that runs before the required-column check).
 statement error
-COPY (SELECT 'x' AS notpath, 'y' AS content) TO '__TEST_DIR__/e1.zim' (FORMAT zim);
+COPY (SELECT 'x' AS title, 'y' AS content) TO '__TEST_DIR__/e1.zim' (FORMAT zim);
 ----
 must have a 'path' column
 
@@ -150,3 +155,22 @@ COPY (SELECT 'A/x' AS path, 'y' AS content)
 TO '__TEST_DIR__/badcomp.zim' (FORMAT zim, COMPRESSION 'gzip');
 ----
 COMPRESSION must be
+
+# --- a genuinely unknown column is still an error ---------------------------
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content, 'z' AS titel)
+TO '__TEST_DIR__/typo.zim' (FORMAT zim);
+----
+unknown column 'titel'
+
+# --- v2 columns are refused as deferred, not as typos -----------------------
+# entry_kind is a v2 column. In v1 it cannot be accepted at all, so the error
+# says "not supported yet" rather than "unknown column" -- a deferral must read
+# as a deferral. There is deliberately no mutual-exclusion check against
+# is_redirect here: a column that cannot be supplied at all cannot conflict
+# with anything, so such a check would be unreachable in v1.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content, false AS is_redirect, 'item' AS entry_kind)
+TO '__TEST_DIR__/bothspellings.zim' (FORMAT zim);
+----
+not supported yet

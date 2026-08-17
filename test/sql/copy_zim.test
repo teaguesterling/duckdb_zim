@@ -141,3 +141,55 @@ query I
 SELECT (zim_info('__TEST_DIR__/unindexed.zim')).has_fulltext_index;
 ----
 false
+
+# --- the naive round trip binds and succeeds --------------------------------
+# NOTE: the plan's draft used content_as_varchar := true for the round-trip
+# source. That is wrong, not just for the comparison below but for the COPY
+# itself: content_as_varchar returns SQL NULL for any content that is not
+# valid UTF-8 (src/read_zim.cpp's IsValidUtf8 guard), and test.zim's I/logo.png
+# is a binary (non-UTF-8) fake PNG. Piping that NULL through COPY silently
+# writes an EMPTY item instead of the image's 16 bytes -- a real, silent data
+# loss in the copy, not just a test artifact. Read content as BLOB (the
+# default) instead, which preserves it byte for byte.
+statement ok
+COPY (SELECT * FROM read_zim('test/oracle/test.zim', include_content := true))
+TO '__TEST_DIR__/roundtrip.zim' (FORMAT zim);
+
+# same entry count, and the redirect survived as a redirect
+query I
+SELECT (SELECT count(*) FROM read_zim('__TEST_DIR__/roundtrip.zim'))
+     = (SELECT count(*) FROM read_zim('test/oracle/test.zim'));
+----
+true
+
+# Measured directly (do not trust a plan's guessed value): the fixture's only
+# redirect is A/Photosynth -> A/Photosynthesis, not A/Calcium.
+query II
+SELECT is_redirect, redirect_path
+FROM read_zim('__TEST_DIR__/roundtrip.zim')
+WHERE is_redirect
+ORDER BY path;
+----
+true	A/Photosynthesis
+
+# content matches entry for entry -- BLOB comparison, for the same reason the
+# COPY above avoids content_as_varchar: I/logo.png's bytes are not valid UTF-8,
+# so a VARCHAR comparison would compare two NULLs (trivially "equal", proving
+# nothing) instead of actually checking the bytes.
+query I
+SELECT count(*)
+FROM read_zim('test/oracle/test.zim', include_content := true) a
+JOIN read_zim('__TEST_DIR__/roundtrip.zim', include_content := true) b
+  USING (path)
+WHERE a.content IS DISTINCT FROM b.content;
+----
+0
+
+# the archive-level counters agree too -- a content-only assertion cannot fail
+# where the round trip is not an identity (design §8). Measured: test.zim has
+# no aliases, so entry_count is a true identity here (6 == 6).
+query I
+SELECT (SELECT (zim_info('__TEST_DIR__/roundtrip.zim')).entry_count)
+     = (SELECT (zim_info('test/oracle/test.zim')).entry_count);
+----
+true
