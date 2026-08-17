@@ -61,7 +61,7 @@ COPY <query-or-table> TO '<path>.zim' (FORMAT zim [, option …]);
 | `MAIN_PATH` | VARCHAR | — | landing page; **must match an item in the input** (§7.3) |
 | `INDEX` | BOOLEAN | `false` | build a Xapian fulltext index |
 | `INDEX_LANGUAGE` | VARCHAR | `LANGUAGE` | stemming language for the index |
-| `COMPRESSION` | VARCHAR | `zstd` | `zstd` \| `lzma` \| `none` |
+| `COMPRESSION` | VARCHAR | `zstd` | `zstd` \| `none` — see below |
 | `CLUSTER_SIZE` | BIGINT | libzim default | target uncompressed cluster size in bytes |
 | `WORKERS` | BIGINT | `4` | libzim's internal worker count |
 | `ON_CONFLICT` | VARCHAR | `error` | duplicate-path policy: `error` \| `first`. `last` is parsed but rejected at bind time with an explanatory error (§7.1) |
@@ -69,6 +69,25 @@ COPY <query-or-table> TO '<path>.zim' (FORMAT zim [, option …]);
 Named metadata options are sugar for `METADATA`; `TITLE 'x'` and `METADATA {'Title':'x'}`
 are the same thing. Specifying both for one key is an error rather than last-wins,
 matching how the reader already rejects conflicting `read_zim` parameters.
+
+**`COMPRESSION` offers only `zstd` and `none`, not the three this document first claimed.**
+libzim 9.7.0 has removed LZMA entirely — `zim/zim.h` declares
+
+```c
+  enum class Compression
+  {
+    None = 1,
+    // intermediate values correspond to compression
+    // methods that are no longer supported
+    Zstd = 5
+  };
+```
+
+so there is no enumerator to reference. An `lzma` request must be rejected at bind time
+with a message that says the format dropped it, rather than silently falling back to zstd —
+a caller who asked for a specific compression and got a different one has been lied to.
+(Found during implementation; the original three-value list here was written from the
+`configCompression` signature without checking the enum.)
 
 **No metadata is required.** Measured: an archive with no metadata at all is written
 successfully by libzim and *served* by kiwix-serve 3.8.2 (HTTP 200, viewer renders). So

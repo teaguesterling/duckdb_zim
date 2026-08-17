@@ -1127,8 +1127,17 @@ Add to the option loop in `ZimCopyBind`:
 			bind->config.index_language = value.ToString();
 		} else if (key == "compression") {
 			auto comp = StringUtil::Lower(value.ToString());
-			if (comp != "zstd" && comp != "lzma" && comp != "none") {
-				throw BinderException("COPY TO (FORMAT zim): COMPRESSION must be 'zstd', 'lzma' or 'none'");
+			// libzim 9.7.0 removed LZMA: zim/zim.h declares only { None = 1, Zstd = 5 },
+			// with a comment that the intermediate values are no longer supported. Reject
+			// 'lzma' by name rather than silently substituting zstd -- a caller who asked
+			// for a specific compression and got a different one has been lied to.
+			if (comp == "lzma") {
+				throw BinderException(
+				    "COPY TO (FORMAT zim): COMPRESSION 'lzma' is not available -- libzim 9.7.0 removed "
+				    "LZMA support from the ZIM format. Use 'zstd' (the default) or 'none'.");
+			}
+			if (comp != "zstd" && comp != "none") {
+				throw BinderException("COPY TO (FORMAT zim): COMPRESSION must be 'zstd' or 'none'");
 			}
 			bind->config.compression = comp;
 		} else if (key == "cluster_size") {
