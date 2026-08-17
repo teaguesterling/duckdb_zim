@@ -17,6 +17,7 @@ namespace duckdb {
 using zim_ext::ZimWriteEntry;
 using zim_ext::ZimWriter;
 using zim_ext::ZimWriterConfig;
+using zim_ext::ZimWriterHasFulltextIndexing;
 
 namespace {
 
@@ -180,6 +181,15 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 				throw BinderException("COPY TO (FORMAT zim): ON_CONFLICT must be 'error' or 'first'");
 			}
 		} else if (METADATA_OPTIONS.count(key)) {
+			// Same VARCHAR guard as the METADATA map branch below: value.ToString() is a
+			// formatted cast that \x-escapes bytes >= 0x80 on a BLOB (CastFromBlob). Named
+			// metadata options are text by contract, but nothing stops a caller from passing
+			// a BLOB literal, so reject that explicitly rather than silently corrupting it.
+			if (value.type().id() != LogicalTypeId::VARCHAR) {
+				throw BinderException("COPY TO (FORMAT zim): %s must be VARCHAR, not %s -- ToString() escapes "
+				                      "binary content instead of passing it through",
+				                      StringUtil::Upper(option.first), value.type().ToString());
+			}
 			SetMetadata(bind->config, METADATA_OPTIONS.at(key), value.ToString());
 		} else if (key == "metadata") {
 			if (value.type().id() != LogicalTypeId::MAP) {
@@ -217,9 +227,57 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 			bind->config.illustration = StringValue::Get(value);
 		} else if (key == "main_path") {
 			bind->config.main_path = value.ToString();
+		} else if (key == "index") {
+			bind->config.index = BooleanValue::Get(value.DefaultCastAs(LogicalType::BOOLEAN));
+		} else if (key == "index_language") {
+			bind->config.index_language = value.ToString();
+		} else if (key == "compression") {
+			auto comp = StringUtil::Lower(value.ToString());
+			// libzim 9.7.0 removed LZMA: zim/zim.h declares only { None = 1, Zstd = 5 },
+			// with a comment that the intermediate values are no longer supported. Reject
+			// 'lzma' by name rather than silently substituting zstd -- a caller who asked
+			// for a specific compression and got a different one has been lied to.
+			if (comp == "lzma") {
+				throw BinderException(
+				    "COPY TO (FORMAT zim): COMPRESSION 'lzma' is not available -- libzim 9.7.0 removed "
+				    "LZMA support from the ZIM format. Use 'zstd' (the default) or 'none'.");
+			}
+			if (comp != "zstd" && comp != "none") {
+				throw BinderException("COPY TO (FORMAT zim): COMPRESSION must be 'zstd' or 'none'");
+			}
+			bind->config.compression = comp;
+		} else if (key == "cluster_size") {
+			bind->config.cluster_size = value.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
+		} else if (key == "workers") {
+			auto n = value.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
+			if (n == 0) {
+				throw BinderException("COPY TO (FORMAT zim): WORKERS must be at least 1");
+			}
+			bind->config.workers = static_cast<uint32_t>(n);
 		} else {
 			throw BinderException("COPY TO (FORMAT zim): unknown option '%s'", option.first);
 		}
+	}
+
+	// Indexing is off unless requested (design §3.1). A requested index with no
+	// language is an error, not a silent no-op -- an unsearchable archive that was
+	// asked to be searchable is the silent-failure shape this design keeps
+	// guarding against.
+	if (bind->config.index && bind->config.index_language.empty()) {
+		// Default the index language from LANGUAGE metadata when it was given.
+		auto lang = bind->config.metadata.find("Language");
+		if (lang != bind->config.metadata.end()) {
+			bind->config.index_language = lang->second;
+		}
+	}
+	if (bind->config.index && bind->config.index_language.empty()) {
+		throw BinderException("COPY TO (FORMAT zim): INDEX requires a language for stemming. Pass LANGUAGE 'eng' "
+		                      "(which also sets the Language metadata) or INDEX_LANGUAGE 'eng'.");
+	}
+	if (bind->config.index && !ZimWriterHasFulltextIndexing()) {
+		throw BinderException("COPY TO (FORMAT zim): INDEX true was requested, but this build has no Xapian support "
+		                      "(WebAssembly builds are search-less), so no fulltext index can be written. Omit INDEX "
+		                      "to write an archive without one.");
 	}
 
 	return std::move(bind);

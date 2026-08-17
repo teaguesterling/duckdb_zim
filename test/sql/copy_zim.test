@@ -115,3 +115,29 @@ query I
 SELECT octet_length(zim_illustration('__TEST_DIR__/illustration.zim'))
 ----
 27
+
+# --- fulltext index ---------------------------------------------------------
+
+statement ok
+COPY (SELECT * FROM (VALUES ('A/Photo', 'Photosynthesis', 'text/html',
+                             '<html><body>Photosynthesis converts light into sugar.</body></html>'),
+                            ('A/Water', 'Water', 'text/html',
+                             '<html><body>Water is essential to plants.</body></html>'))
+        t(path, title, mimetype, content))
+TO '__TEST_DIR__/indexed.zim' (FORMAT zim, LANGUAGE 'eng', INDEX true);
+
+query I
+SELECT count(*) > 0 FROM zim_search('__TEST_DIR__/indexed.zim', 'photosynthesis');
+----
+true
+
+# without INDEX, no fulltext index is built
+statement ok
+COPY (SELECT 'A/Photo' AS path, 'text/html' AS mimetype,
+             '<html><body>Photosynthesis</body></html>' AS content)
+TO '__TEST_DIR__/unindexed.zim' (FORMAT zim, LANGUAGE 'eng');
+
+query I
+SELECT (zim_info('__TEST_DIR__/unindexed.zim')).has_fulltext_index;
+----
+false

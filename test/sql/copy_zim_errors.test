@@ -137,3 +137,16 @@ query I
 SELECT count(*) FROM glob('__TEST_DIR__/badmetablob.zim');
 ----
 0
+
+# --- INDEX needs a language -------------------------------------------------
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/noidxlang.zim' (FORMAT zim, INDEX true);
+----
+INDEX requires a language
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/badcomp.zim' (FORMAT zim, COMPRESSION 'gzip');
+----
+COMPRESSION must be

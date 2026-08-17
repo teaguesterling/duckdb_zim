@@ -40,7 +40,7 @@ struct ZimWriteEntry {
 
 // Archive-level settings, all optional. Defaults match libzim's own.
 struct ZimWriterConfig {
-	std::string compression = "zstd"; // zstd | lzma | none
+	std::string compression = "zstd"; // zstd | none (libzim 9.7.0 removed LZMA from the format)
 	uint64_t cluster_size = 0;        // 0 = libzim default
 	uint32_t workers = 4;
 	bool index = false;
@@ -75,6 +75,11 @@ private:
 	struct Impl;
 	std::unique_ptr<Impl> impl;
 };
+
+// True when libzim was built with Xapian, i.e. this build can write a fulltext
+// index. False on WebAssembly, which is search-less. Lets the DuckDB binding
+// layer reject INDEX at bind time without including a libzim header.
+bool ZimWriterHasFulltextIndexing();
 
 } // namespace zim_ext
 } // namespace duckdb

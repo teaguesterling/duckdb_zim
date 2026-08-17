@@ -76,6 +76,14 @@ void ZimWriter::AddItem(const ZimWriteEntry &entry) {
 	    zim::writer::StringItem::create(entry.path, entry.mimetype, entry.title, hints, entry.content));
 }
 
+bool ZimWriterHasFulltextIndexing() {
+#ifdef LIBZIM_WITH_XAPIAN
+	return true;
+#else
+	return false;
+#endif
+}
+
 void ZimWriter::Finish() {
 	for (auto &kv : impl->config.metadata) {
 		impl->creator.addMetadata(kv.first, kv.second);
