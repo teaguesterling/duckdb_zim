@@ -536,15 +536,38 @@ So a `MAIN_PATH` naming a page the query never produced would silently produce a
 archive with no landing page. **Validate it in `copy_to_finalize`** against the set of
 paths actually written, and error.
 
-### 7.4 Dangling redirects are silently removed (v2)
+### 7.4 Dangling redirects are silently removed — so v1 rejects them
 
 Measured: `addRedirection()` to a nonexistent target completes without error. libzim
 detects and *removes* invalid redirections at `finishZimCreation()`, announcing each only
 via the stdout chatter §7.5 exists to suppress.
 
-Suppressing that output would therefore destroy the only signal that entries were dropped.
-The two removal messages must be resurfaced as a DuckDB warning or a rejected-row count.
-**Silently dropping entries is strictly worse than the pollution.**
+Suppressing that output would therefore destroy the only signal that entries were dropped,
+and **silently dropping entries is strictly worse than the pollution.**
+
+> **This was scoped to v2 on a premise that stopped being true, and the two halves nearly
+> met badly.** The reasoning was "v1 cannot write redirects, so this is unreachable." That
+> held until v1 gained the writer-tolerance of `read_zim`'s `is_redirect` / `redirect_path`
+> columns (§6.1) — which is exactly what makes the round trip work, and which also made
+> dangling redirects reachable. Had §7.5's patch landed on top of that without anyone
+> noticing, entries would have vanished from archives with no signal anywhere: two
+> individually-correct changes producing a silent data loss neither one introduced.
+
+**v1 therefore validates redirect targets rather than deferring.** `copy_to_finalize`
+checks every non-empty `redirect_path` against the set of paths actually written, before
+`finishZimCreation()`, and errors naming the offending redirect and its missing target.
+This mirrors §7.3's identical treatment of `MAIN_PATH`, costs one set, and needs no
+ordering discipline from the caller — finalize runs after every row has been seen, so a
+redirect declared before its target is fine.
+
+Consequence worth stating: the two removal `INFO()` sites are now **unreachable from SQL by
+construction**, because the archive is rejected before libzim can drop anything. That the
+patch covers them is confirmed by reading the patched source rather than by triggering
+them — and being unable to trigger them is the better state, not a test gap.
+
+If a future version wants to *accept* dangling redirects (mirroring libzim's own tolerance),
+the removals must come back as a DuckDB warning or a rejected-row count first. Accepting
+them silently is not an option this design will take.
 
 ### 7.5 libzim writes to stdout, and `configVerbose(false)` does not stop it
 
@@ -567,8 +590,11 @@ Set entry indices
 ```
 
 The other two are the redirection-removal messages of §7.4, which only fire when a redirect
-is actually dangling — meaning **a patch tested only against a well-formed archive would
-never exercise them.** A test with a deliberately dangling redirect is required.
+is actually dangling. Because §7.4's validation now rejects such an archive before libzim
+sees it, those two sites are **unreachable from SQL**. That the patch silences them is
+verified by reading the patched source — and it is verifiable at all only because the patch
+targets the `INFO` macro *definition* rather than its six call sites, so one hunk covers
+every site including the ones no test can reach.
 
 In a DuckDB CLI this is output corruption; in an MCP stdio server sharing stdout with
 JSON-RPC it is protocol corruption. The fix is a patch in the existing overlay port
@@ -665,8 +691,9 @@ on `read_zim`), so it is **v2 or later**. v1 documents the alias non-identity.
 ## 10. Scope
 
 **v1** — items only, inline content only. Columns `path`, `content`, `title`, `mimetype`,
-`front_article`, `compress`; all options in §3.1; §7.1, §7.2, §7.3, §7.5 handled; §7.4 not
-reachable without redirects. **Writer tolerance (§6.1) is v1**, because it is what makes the
+`front_article`, `compress`; all options in §3.1; §7.1 through §7.5 all handled — including
+§7.4, which was originally deferred on a premise that writer tolerance then invalidated.
+**Writer tolerance (§6.1) is v1**, because it is what makes the
 naive round trip work and the conformance test exist at all; `is_redirect` maps to a
 redirect entry even though `entry_kind` is not yet a column the user can write.
 `content_path` and `PARTITION_BY` are rejected with "not yet supported" rather than
@@ -712,7 +739,8 @@ Every item below is a regression test, not a manual check.
 | `INDEX true` | `zim_search` finds an entry in the written archive |
 | `INDEX true` without a language | clear error |
 | `INDEX true` on WASM | clear error — Xapian is absent, must not silently no-op |
-| stdout cleanliness | a write emits **nothing** on stdout, including one with a dangling redirect (§7.4, §7.5) |
+| stdout cleanliness | a successful write emits **nothing** on stdout; the test must also assert the write actually happened, or the assertion is vacuous (§7.5) |
+| dangling redirect | rejected naming the offending redirect and its missing target, with **no output file surviving** (§7.4) |
 | libzim private-API property | the §8.1 dedup/alias property holds on the pinned version |
 
 v2 adds:
