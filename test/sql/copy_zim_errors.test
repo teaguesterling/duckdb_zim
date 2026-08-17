@@ -174,3 +174,35 @@ COPY (SELECT 'A/x' AS path, 'y' AS content, false AS is_redirect, 'item' AS entr
 TO '__TEST_DIR__/bothspellings.zim' (FORMAT zim);
 ----
 not supported yet
+
+# --- options that must be refused, not ignored ------------------------------
+# PARTITION_BY is consumed by DuckDB's own binder before copy_to_bind ever sees
+# it (bind_copy.cpp clears stmt.info->options after extracting it), so the
+# rejection has to happen in initialize_operator, which is the only hook that
+# sees the PhysicalCopyToFile carrying partition_columns.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content, 'en' AS lang)
+TO '__TEST_DIR__/parts' (FORMAT zim, PARTITION_BY (lang));
+----
+PARTITION_BY is not supported yet
+
+# initialize_operator fires after copy_to_initialize_global, so the partition's
+# output file already exists on disk when the throw happens -- confirm the
+# global state's destructor (Task 2) still unlinks it, leaving no .zim behind
+# anywhere under the partition directory. zim_check() is deliberately not used
+# here (see the identical reasoning above the "aborted" and "dup" glob checks).
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/parts/**/*.zim');
+----
+0
+
+# FILE_SIZE_BYTES is also consumed by DuckDB's binder before copy_to_bind, but
+# DuckDB itself rejects it for any format that leaves CopyFunction::rotate_files
+# unset (nullptr) -- which this extension deliberately does. No code here
+# implements the rejection; this test exists to confirm DuckDB's default
+# behavior actually still fires the way this extension depends on.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/rot.zim' (FORMAT zim, FILE_SIZE_BYTES 1000);
+----
+FILE_SIZE_BYTES

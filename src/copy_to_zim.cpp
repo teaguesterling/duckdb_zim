@@ -5,6 +5,7 @@
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -434,6 +435,27 @@ CopyFunctionExecutionMode ZimCopyExecutionMode(bool preserve_insertion_order, bo
 	return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
 }
 
+// PARTITION_BY is consumed by DuckDB's binder (bind_copy.cpp clears
+// stmt.info->options after extracting it) and never reaches copy_to_bind, so the
+// rejection has to happen where the physical operator is visible. This is the
+// PhysicalCopyToFile mechanism (not the hive-segment-in-path fallback the task
+// plan allowed for): PhysicalCopyToFile and its partition_columns field are
+// includable from an extension build against this vendored duckdb, so the more
+// precise check was used. Writing one archive per key is planned, but a
+// partition can fragment into several archives past
+// partitioned_write_max_open_files, and MAIN_PATH cannot survive partitioning --
+// neither is handled in this version, so refuse rather than produce a
+// surprising result.
+void ZimCopyInitializeOperator(GlobalFunctionData &gstate, const PhysicalOperator &op) {
+	auto &copy_op = op.Cast<PhysicalCopyToFile>();
+	if (!copy_op.partition_columns.empty()) {
+		throw NotImplementedException(
+		    "COPY TO (FORMAT zim): PARTITION_BY is not supported yet. Writing one archive per key is "
+		    "planned, but a partition can fragment into several archives and MAIN_PATH cannot survive "
+		    "partitioning, so it needs handling this version does not have.");
+	}
+}
+
 } // namespace
 
 void RegisterCopyToZim(ExtensionLoader &loader) {
@@ -445,6 +467,13 @@ void RegisterCopyToZim(ExtensionLoader &loader) {
 	function.copy_to_combine = ZimCopyCombine;
 	function.copy_to_finalize = ZimCopyFinalize;
 	function.execution_mode = ZimCopyExecutionMode;
+	function.initialize_operator = ZimCopyInitializeOperator;
+	// function.rotate_files is deliberately left unset (nullptr). DuckDB's own
+	// bind_copy.cpp rejects FILE_SIZE_BYTES with a clear, format-named
+	// NotImplementedException whenever rotate_files is unset -- assigning a stub
+	// here (even one that always returns false) would make that check pass and
+	// let execution fall through into rotation logic that then fails differently
+	// and worse. Do not add a ZimCopyRotateFiles function.
 	function.extension = "zim";
 	loader.RegisterFunction(function);
 }
