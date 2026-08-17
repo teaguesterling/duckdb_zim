@@ -28,17 +28,24 @@ struct ZimColumns {
 	int64_t mimetype = -1;
 };
 
+// How to handle a duplicate 'path' seen by the sink. 'last' is deliberately not a
+// member here -- it would require buffering every row, so it is rejected at bind
+// time instead (see ZimCopyBind) rather than represented as a runtime policy.
+enum class ZimConflictPolicy { ERROR_ON_DUPLICATE, KEEP_FIRST };
+
 struct ZimCopyBindData : public FunctionData {
 	ZimColumns cols;
 	ZimWriterConfig config;
 	// Default mimetype, derived from the content column's SQL type at bind time.
 	string default_mimetype = "text/plain";
+	ZimConflictPolicy on_conflict = ZimConflictPolicy::ERROR_ON_DUPLICATE;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<ZimCopyBindData>();
 		result->cols = cols;
 		result->config = config;
 		result->default_mimetype = default_mimetype;
+		result->on_conflict = on_conflict;
 		return std::move(result);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -111,15 +118,14 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 	// it can never be a valid output path.
 	//
 	// This check must run here, at bind time, against input.info.file_path -- NOT
-	// later against the file_path handed to ZimCopyInitGlobal, even though the
-	// task-2 implementation plan says to put it there. Verified empirically that
-	// the plan's placement does not work: when the target already exists, DuckDB's
-	// planner (bind_copy.cpp) defaults use_tmp_file to true, and physical planning
-	// (plan_copy_to_file.cpp) then rewrites the copy operator's file_path to
-	// "tmp_<name>" *before* copy_to_initialize_global ever sees it -- so that path
-	// (almost) never itself pre-exists, and an existence check there would (almost)
-	// never fire. Do not "fix" this back to InitGlobal; see task-2-report.md for
-	// the full trace (grep for "Deviation").
+	// later against the file_path handed to ZimCopyInitGlobal, even though an
+	// earlier draft of the implementation plan said to put it there. Verified
+	// empirically that placement does not work: when the target already exists,
+	// DuckDB's planner (bind_copy.cpp) defaults use_tmp_file to true, and physical
+	// planning (plan_copy_to_file.cpp) then rewrites the copy operator's file_path
+	// to "tmp_<name>" *before* copy_to_initialize_global ever sees it -- so that
+	// path (almost) never itself pre-exists, and an existence check there would
+	// (almost) never fire. Do not "fix" this back to InitGlobal.
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (fs.FileExists(input.info.file_path)) {
 		throw InvalidInputException("COPY TO (FORMAT zim): output '%s' already exists; refusing to overwrite. "
@@ -133,6 +139,36 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 	bind->default_mimetype = sql_types[static_cast<idx_t>(bind->cols.content)].id() == LogicalTypeId::BLOB
 	                             ? "application/octet-stream"
 	                             : "text/plain";
+
+	// DuckDB's binder consumes every DuckDB-level COPY option (partition_by,
+	// overwrite, etc.) before we get here, and strips FORMAT too -- so
+	// input.info.options holds only options unrecognised at that level. This loop
+	// is the single entry point later tasks extend with more `else if` branches.
+	for (auto &option : input.info.options) {
+		auto key = StringUtil::Lower(option.first);
+		if (option.second.size() != 1) {
+			throw BinderException("COPY TO (FORMAT zim): option '%s' takes exactly one value", option.first);
+		}
+		auto &value = option.second[0];
+		if (key == "on_conflict") {
+			auto policy = StringUtil::Lower(value.ToString());
+			if (policy == "error") {
+				bind->on_conflict = ZimConflictPolicy::ERROR_ON_DUPLICATE;
+			} else if (policy == "first") {
+				bind->on_conflict = ZimConflictPolicy::KEEP_FIRST;
+			} else if (policy == "last") {
+				throw BinderException(
+				    "COPY TO (FORMAT zim): ON_CONFLICT 'last' would require buffering every row before "
+				    "writing any, because a later duplicate can only win if nothing has been written yet. "
+				    "Deduplicate in SQL instead, or use 'first'.");
+			} else {
+				throw BinderException("COPY TO (FORMAT zim): ON_CONFLICT must be 'error' or 'first'");
+			}
+		} else {
+			throw BinderException("COPY TO (FORMAT zim): unknown option '%s'", option.first);
+		}
+	}
+
 	return std::move(bind);
 }
 
@@ -182,7 +218,16 @@ void ZimCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 			entry.mimetype = bind.default_mimetype;
 		}
 		GetStringCell(input, bind.cols.content, row, entry.content);
-		gstate.seen_paths.insert(entry.path);
+
+		if (!gstate.seen_paths.insert(entry.path).second) {
+			if (bind.on_conflict == ZimConflictPolicy::KEEP_FIRST) {
+				continue;
+			}
+			throw InvalidInputException(
+			    "COPY TO (FORMAT zim): duplicate path '%s'. Entry paths must be unique within an "
+			    "archive; deduplicate in SQL, or pass ON_CONFLICT 'first'.",
+			    entry.path);
+		}
 		gstate.writer->AddItem(entry);
 	}
 }

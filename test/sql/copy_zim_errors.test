@@ -62,3 +62,45 @@ query I
 SELECT count(*) FROM glob('__TEST_DIR__/aborted.zim');
 ----
 0
+
+# --- duplicate paths --------------------------------------------------------
+statement error
+COPY (SELECT * FROM (VALUES ('A/Dup', 'first'), ('A/Dup', 'second')) t(path, content))
+TO '__TEST_DIR__/dup.zim' (FORMAT zim);
+----
+duplicate path 'A/Dup'
+
+# and it left nothing behind. zim_check() is not usable here: on this branch it
+# raises InvalidInputException for an unopenable archive rather than returning
+# false (see the identical reasoning above the "aborted" glob() check), so a
+# missing file cannot be distinguished from a present-but-corrupt one through
+# it. Assert absence directly instead.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/dup.zim');
+----
+0
+
+# ON_CONFLICT 'first' keeps the first occurrence
+statement ok
+COPY (SELECT * FROM (VALUES ('A/Dup', 'first'), ('A/Dup', 'second')) t(path, content))
+TO '__TEST_DIR__/dupfirst.zim' (FORMAT zim, ON_CONFLICT 'first');
+
+query II
+SELECT path, content
+FROM read_zim('__TEST_DIR__/dupfirst.zim',
+              include_content := true, content_as_varchar := true);
+----
+A/Dup	first
+
+# 'last' cannot be done streaming and is rejected at bind time, not silently buffered
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/duplast.zim' (FORMAT zim, ON_CONFLICT 'last');
+----
+ON_CONFLICT 'last' would require buffering every row
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/dupbad.zim' (FORMAT zim, ON_CONFLICT 'sideways');
+----
+ON_CONFLICT must be 'error' or 'first'
