@@ -185,13 +185,36 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 			if (value.type().id() != LogicalTypeId::MAP) {
 				throw BinderException("COPY TO (FORMAT zim): METADATA must be a MAP(VARCHAR, VARCHAR)");
 			}
+			// Value's own values.ToString() is a formatted cast, not a raw extraction: on
+			// a BLOB it goes through CastFromBlob and \x-escapes every byte >= 0x80. That
+			// is silently wrong for binary metadata, so the map's value type must be
+			// VARCHAR -- checked once here, since a MAP's value type is homogeneous across
+			// every entry.
+			if (MapType::ValueType(value.type()).id() != LogicalTypeId::VARCHAR) {
+				throw BinderException(
+				    "COPY TO (FORMAT zim): METADATA values must be VARCHAR, not %s -- ToString() escapes "
+				    "binary content instead of passing it through",
+				    MapType::ValueType(value.type()).ToString());
+			}
 			auto &entries = MapValue::GetChildren(value);
 			for (auto &entry : entries) {
 				auto &kv = StructValue::GetChildren(entry);
 				SetMetadata(bind->config, kv[0].ToString(), kv[1].ToString());
 			}
 		} else if (key == "illustration") {
-			bind->config.illustration = value.ToString();
+			// Raw bytes, not value.ToString(): ToString() on a BLOB goes through
+			// CastFromBlob and \x-escapes every byte >= 0x80, which corrupts a real PNG
+			// (binary, non-ASCII-heavy). StringValue::Get returns the underlying bytes
+			// with no cast -- the same thing GetStringCell does for row data below, just
+			// for a bound Value instead of a DataChunk cell. It requires PhysicalType::
+			// VARCHAR (true for both VARCHAR and BLOB; see LogicalType::GetInternalType),
+			// so reject anything else explicitly rather than relying on its debug-only
+			// assertion.
+			if (value.type().id() != LogicalTypeId::VARCHAR && value.type().id() != LogicalTypeId::BLOB) {
+				throw BinderException("COPY TO (FORMAT zim): ILLUSTRATION must be VARCHAR or BLOB, not %s",
+				                      value.type().ToString());
+			}
+			bind->config.illustration = StringValue::Get(value);
 		} else if (key == "main_path") {
 			bind->config.main_path = value.ToString();
 		} else {

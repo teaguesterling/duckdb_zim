@@ -95,3 +95,23 @@ query I
 SELECT zim_metadata('__TEST_DIR__/meta2.zim', 'Source');
 ----
 nowhere
+
+# --- illustration option -----------------------------------------------------
+# The payload below starts with 0x89 (>= 0x80) on purpose: Value::ToString() on a
+# BLOB escapes every byte >= 0x80 as a 4-character \xHH sequence (CastFromBlob).
+# A pure-ASCII payload would pass even with that bug present, so it would be a
+# worthless test -- assert byte-for-byte equality, not just that COPY succeeded.
+statement ok
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/illustration.zim'
+   (FORMAT zim, ILLUSTRATION '\x89PNG\x0D\x0A\x1A\x0A fake48illustration'::BLOB);
+
+query I
+SELECT zim_illustration('__TEST_DIR__/illustration.zim') = '\x89PNG\x0D\x0A\x1A\x0A fake48illustration'::BLOB
+----
+true
+
+query I
+SELECT octet_length(zim_illustration('__TEST_DIR__/illustration.zim'))
+----
+27

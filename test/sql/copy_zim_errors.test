@@ -124,3 +124,16 @@ TO '__TEST_DIR__/dupmeta.zim'
    (FORMAT zim, TITLE 'One', METADATA MAP {'Title': 'Two'});
 ----
 metadata key 'Title' given twice
+
+# METADATA values must be VARCHAR -- a BLOB entry would otherwise be silently
+# \x-escaped by ToString(), corrupting binary content the same way ILLUSTRATION did.
+statement error
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/badmetablob.zim' (FORMAT zim, METADATA MAP {'Title': '\x89PNG'::BLOB});
+----
+METADATA values must be VARCHAR
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/badmetablob.zim');
+----
+0
