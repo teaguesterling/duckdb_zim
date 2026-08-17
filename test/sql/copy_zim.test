@@ -1,0 +1,63 @@
+# name: test/sql/copy_zim.test
+# description: COPY ... TO ... (FORMAT zim) -- writing archives
+# group: [sql]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# --- minimal write: two items round-trip through read_zim -------------------
+statement ok
+COPY (SELECT * FROM (VALUES ('A/One', 'One', 'text/html', 'first'),
+                            ('A/Two', 'Two', 'text/html', 'second'))
+        t(path, title, mimetype, content))
+TO '__TEST_DIR__/minimal.zim' (FORMAT zim);
+
+query III
+SELECT path, title, mimetype
+FROM read_zim('__TEST_DIR__/minimal.zim')
+ORDER BY path;
+----
+A/One	One	text/html
+A/Two	Two	text/html
+
+query I
+SELECT content
+FROM read_zim('__TEST_DIR__/minimal.zim', path := 'A/One',
+              include_content := true, content_as_varchar := true);
+----
+first
+
+# title defaults to path when the column is absent
+statement ok
+COPY (SELECT 'A/NoTitle' AS path, 'x' AS content)
+TO '__TEST_DIR__/notitle.zim' (FORMAT zim);
+
+query II
+SELECT path, title FROM read_zim('__TEST_DIR__/notitle.zim');
+----
+A/NoTitle	A/NoTitle
+
+# --- mimetype defaults from the CONTENT COLUMN'S TYPE -----------------------
+# Not cosmetic: libzim writes "WARNING: mimetype missing for <path>" to stderr
+# once PER ROW, so a 15,000-entry archive with no mimetype is 15,000 lines of
+# stderr. Deriving the default from the SQL type is the advantage DuckDB's type
+# system gives us -- text and bytes are distinguishable here.
+statement ok
+COPY (SELECT 'A/Text' AS path, 'plain words' AS content)
+TO '__TEST_DIR__/deftext.zim' (FORMAT zim);
+
+query I
+SELECT mimetype FROM read_zim('__TEST_DIR__/deftext.zim');
+----
+text/plain
+
+statement ok
+COPY (SELECT 'A/Bytes' AS path, '\x00\x01\x02'::BLOB AS content)
+TO '__TEST_DIR__/defblob.zim' (FORMAT zim);
+
+query I
+SELECT mimetype FROM read_zim('__TEST_DIR__/defblob.zim');
+----
+application/octet-stream
