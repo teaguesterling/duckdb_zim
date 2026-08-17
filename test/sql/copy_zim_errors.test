@@ -54,8 +54,11 @@ SELECT count(*) FROM read_zim('__TEST_DIR__/aborted.zim');
 ----
 failed to open ZIM
 
-# and the predicate agrees
+# and no file exists at all under that name -- not "exists but fails zim_check",
+# genuinely absent. glob() on a non-matching path returns zero rows rather than
+# raising, so this asserts absence directly instead of going through zim_check,
+# which conflates "file is absent" with "file is present but corrupt".
 query I
-SELECT zim_check('__TEST_DIR__/aborted.zim');
+SELECT count(*) FROM glob('__TEST_DIR__/aborted.zim');
 ----
-false
+0

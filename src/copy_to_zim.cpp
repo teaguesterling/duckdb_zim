@@ -111,12 +111,15 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 	// it can never be a valid output path.
 	//
 	// This check must run here, at bind time, against input.info.file_path -- NOT
-	// later against the file_path handed to ZimCopyInitGlobal. When the target
-	// already exists, DuckDB's planner (bind_copy.cpp) defaults use_tmp_file to
-	// true and physical planning (plan_copy_to_file.cpp) then rewrites the copy
-	// operator's file_path to "tmp_<name>" *before* copy_to_initialize_global ever
-	// sees it, so that path never exists and an existence check there would never
-	// fire. Confirmed empirically: see task-2-report.md.
+	// later against the file_path handed to ZimCopyInitGlobal, even though the
+	// task-2 implementation plan says to put it there. Verified empirically that
+	// the plan's placement does not work: when the target already exists, DuckDB's
+	// planner (bind_copy.cpp) defaults use_tmp_file to true, and physical planning
+	// (plan_copy_to_file.cpp) then rewrites the copy operator's file_path to
+	// "tmp_<name>" *before* copy_to_initialize_global ever sees it -- so that path
+	// (almost) never itself pre-exists, and an existence check there would (almost)
+	// never fire. Do not "fix" this back to InitGlobal; see task-2-report.md for
+	// the full trace (grep for "Deviation").
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (fs.FileExists(input.info.file_path)) {
 		throw InvalidInputException("COPY TO (FORMAT zim): output '%s' already exists; refusing to overwrite. "
