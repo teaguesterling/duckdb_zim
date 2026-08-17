@@ -130,6 +130,17 @@ with `has_main_entry = false` and no error, and `addRedirection()` to an unknown
 silently dropped at `finishZimCreation()`. Both would produce a working-looking archive
 that quietly lost information, so `COPY` rejects them instead, naming the offending path.
 
+A redirect must also *terminate*. `redirect_path` may point at another redirect — a chain
+of any depth is fine — but the chain has to end at an entry that isn't a redirect. libzim
+removes every redirect in a chain that never reaches a real entry, as silently as it drops
+a dangling one, so `COPY` rejects a cycle instead and prints it:
+
+```
+COPY TO (FORMAT zim): redirect 'A/X' is part of a redirect cycle ('A/X' -> 'A/Y' -> 'A/X').
+```
+
+A row that redirects to itself is the same error with a one-step cycle.
+
 ## Writing never overwrites
 
 If the output path already exists, `COPY` fails — a deliberate deviation from `parquet` /

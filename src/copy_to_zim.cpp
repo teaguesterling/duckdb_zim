@@ -11,6 +11,7 @@
 
 #include "zim_writer.hpp"
 
+#include <algorithm>
 #include <map>
 #include <set>
 
@@ -92,12 +93,14 @@ struct ZimCopyGlobalState : public GlobalFunctionData {
 	string out_path;
 	unique_ptr<ZimWriter> writer;
 	std::set<string> seen_paths;
-	// Every non-empty redirect_path seen by the sink, mapped to the path of the
-	// redirect entry that named it (kept for the error message; only the first
-	// is kept if several redirects share a target). Validated against seen_paths
-	// in ZimCopyFinalize -- see the comment there and docs/dev/copy-to-zim-design.md
-	// §7.4 for why libzim cannot be trusted to catch this itself.
-	std::map<string, string> redirect_targets;
+	// Every redirect entry the sink accepted: its own path -> the non-empty
+	// redirect_path it named. Keyed by the REDIRECT's path, not the target's, so
+	// the map doubles as "is this path itself a redirect?" -- which is what makes
+	// the transitive walk in ZimCopyFinalize possible. Paths are unique (the dedup
+	// check runs first), so no entry is ever lost to a collision here. See
+	// ZimCopyFinalize and docs/dev/copy-to-zim-design.md §7.4 for why libzim cannot
+	// be trusted to catch either dangling or looping redirects itself.
+	std::map<string, string> redirects;
 	bool finished = false;
 };
 
@@ -486,11 +489,12 @@ void ZimCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 					throw InvalidInputException(
 					    "COPY TO (FORMAT zim): entry '%s' has is_redirect = true but no redirect_path", entry.path);
 				}
-				// Record the target for the dangling-redirect check in ZimCopyFinalize.
-				// emplace() keeps whichever redirect was seen first if several share a
-				// target; either is fine, since it is only used to name the error. This
-				// is below the dedup check on purpose (see the comment there).
-				gstate.redirect_targets.emplace(entry.redirect_path, entry.path);
+				// Record this redirect for the dangling/cycle checks in ZimCopyFinalize.
+				// Keyed by this entry's own path, which the dedup check above has already
+				// established is unique -- so this records every redirect, not just the
+				// first to name a given target. This is below the dedup check on purpose
+				// (see the comment there).
+				gstate.redirects.emplace(entry.path, entry.redirect_path);
 			}
 		}
 
@@ -558,13 +562,66 @@ void ZimCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	// actually written, same as MAIN_PATH above, so this is a clear SQL error
 	// instead of a vanished entry. Order does not matter: this runs after every
 	// row has been seen, so a redirect declared before its target is fine.
-	for (auto &kv : gstate.redirect_targets) {
-		auto &target = kv.first;
-		auto &source_path = kv.second;
+	for (auto &kv : gstate.redirects) {
+		auto &source_path = kv.first;
+		auto &target = kv.second;
 		if (!gstate.seen_paths.count(target)) {
 			throw InvalidInputException(
 			    "COPY TO (FORMAT zim): redirect '%s' -> '%s' does not match any entry in the input", source_path,
 			    target);
+		}
+	}
+
+	// Pointing at a path that exists is NOT enough: libzim runs
+	// removeLoopsAndBlindChainsOfRedirects() (creator.cpp:851) right after
+	// detectDanglingRedirects(), and it markRemoved()s every redirect in a chain
+	// that does not terminate at a real item -- a cycle, or a chain of redirects
+	// all of which are themselves removed. That drop is as silent as the dangling
+	// one, and for the same reason: its only announcement was an INFO() print the
+	// stdout patch deletes. Measured before this check: writing an item plus
+	// 'A/X' -> 'A/Y' and 'A/Y' -> 'A/X' produced an archive containing only the
+	// item, with no error and no warning -- two input rows gone.
+	//
+	// Every redirect must therefore resolve TRANSITIVELY to a path that is not
+	// itself a redirect. The loop below is not unbounded: `on_chain` makes each walk
+	// visit any given redirect at most once (so a walk is at most redirects.size()
+	// steps before it either terminates or is reported as a cycle), and `terminates`
+	// memoizes proven-good redirects so the total work stays linear in the number of
+	// redirects however deeply they are chained. A legitimately long chain is
+	// accepted, not rejected on an arbitrary hop limit.
+	std::set<string> terminates; // redirects already proven to end at a real item
+	for (auto &start : gstate.redirects) {
+		vector<string> chain; // redirects walked on this pass, in order
+		std::set<string> on_chain;
+		string current = start.first;
+		while (true) {
+			if (terminates.count(current)) {
+				break; // this tail was already proven good
+			}
+			auto next = gstate.redirects.find(current);
+			if (next == gstate.redirects.end()) {
+				break; // a real item: the chain terminates here
+			}
+			if (!on_chain.insert(current).second) {
+				// Back on a path this same walk already visited -- report the cycle
+				// itself, not the arbitrary entry the outer loop happened to start from.
+				string cycle;
+				for (auto it = std::find(chain.begin(), chain.end(), current); it != chain.end(); ++it) {
+					cycle += "'" + *it + "' -> ";
+				}
+				cycle += "'" + current + "'";
+				throw InvalidInputException(
+				    "COPY TO (FORMAT zim): redirect '%s' is part of a redirect cycle (%s). A redirect chain "
+				    "must end at an entry that is not itself a redirect; libzim removes every redirect in a "
+				    "cycle, dropping those rows from the archive with no error.",
+				    current, cycle);
+			}
+			chain.push_back(current);
+			current = next->second;
+		}
+		// Everything walked to get here reaches a real item, so record the whole tail.
+		for (auto &path : chain) {
+			terminates.insert(path);
 		}
 	}
 

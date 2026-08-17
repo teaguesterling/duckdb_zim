@@ -650,6 +650,34 @@ This mirrors §7.3's identical treatment of `MAIN_PATH`, costs one set, and need
 ordering discipline from the caller — finalize runs after every row has been seen, so a
 redirect declared before its target is fine.
 
+**Existing is not the same as terminating: the check must be transitive.** Found in review,
+after the above had shipped. `detectDanglingRedirects()` is not the only removal pass —
+`finishZimCreation()` calls `removeLoopsAndBlindChainsOfRedirects()` (`creator.cpp:851`)
+immediately after it, and *that* pass `markRemoved()`s every redirect in a chain which does
+not terminate at a real item. A "target exists" check does not see it, because in a cycle
+every target does exist. Measured against the shipped check: writing `A/One` (item),
+`A/X → A/Y` and `A/Y → A/X` produced an archive containing only `A/One`. Two input rows
+gone, no error, no warning — the same silent-loss shape this whole section exists to
+prevent, one level deeper. The `no-writer-stdout.patch` removes that pass's `INFO()` print
+too, so there was no fallback signal.
+
+So the rule is: **every redirect must resolve transitively to a path that is in the input
+and is not itself a redirect.** `copy_to_finalize` walks the chains and rejects two cases
+distinctly — a chain that ends at a path never written (the dangling check above, unchanged
+message) and a chain that closes on itself (a cycle, reported with the cycle spelled out).
+A self-redirect `A/X → A/X` is the one-node cycle and the only case the dangling check
+"passed" for entirely wrong reasons.
+
+Two implementation notes worth keeping:
+
+- the sink's map is keyed by the **redirect's own path**, not by its target. That is what
+  makes "is this target itself a redirect?" answerable, and paths are unique by then (the
+  duplicate check runs first), so no redirect is lost to a key collision.
+- the walk is bounded without an arbitrary hop limit. A per-walk visited set makes any one
+  walk at most *n* steps before it terminates or is reported as a cycle, and a memo of
+  already-proven redirects keeps the total linear. A deep but valid chain is **accepted** —
+  rejecting on a hop count would trade one silent-loss bug for a false refusal.
+
 Consequence worth stating: the two removal `INFO()` sites are now **unreachable from SQL by
 construction**, because the archive is rejected before libzim can drop anything. That the
 patch covers them is confirmed by reading the patched source rather than by triggering

@@ -264,6 +264,78 @@ SELECT count(*) FROM glob('__TEST_DIR__/badredirect.zim');
 ----
 0
 
+# --- a redirect chain must TERMINATE at a real entry ------------------------
+# Pointing at a path that exists is not enough. libzim runs
+# removeLoopsAndBlindChainsOfRedirects() (creator.cpp:851) immediately after
+# detectDanglingRedirects(), and it markRemoved()s every redirect in a chain that
+# never reaches a real item. That drop is exactly as silent as the dangling-target
+# one -- its only announcement was an INFO() print the stdout patch deletes.
+#
+# Measured before the fix: this wrote an archive containing ONLY A/Home. Two input
+# rows vanished, no error, no warning.
+statement error
+COPY (SELECT * FROM (VALUES
+        ('A/Home', 'hi', false, NULL),
+        ('A/X', NULL, true, 'A/Y'),
+        ('A/Y', NULL, true, 'A/X'))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/loop.zim' (FORMAT zim);
+----
+is part of a redirect cycle
+
+# the message names the cycle itself, not just one arbitrary member of it
+statement error
+COPY (SELECT * FROM (VALUES
+        ('A/Home', 'hi', false, NULL),
+        ('A/X', NULL, true, 'A/Y'),
+        ('A/Y', NULL, true, 'A/X'))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/loop2.zim' (FORMAT zim);
+----
+'A/X' -> 'A/Y' -> 'A/X'
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/loop.zim');
+----
+0
+
+# a self-redirect is the one-node case of the same cycle. Its target IS in
+# seen_paths, so the dangling check passes it -- only the transitive walk catches
+# it. Measured before the fix: A/X was silently dropped.
+statement error
+COPY (SELECT * FROM (VALUES
+        ('A/Home', 'hi', false, NULL),
+        ('A/X', NULL, true, 'A/X'))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/selfredirect.zim' (FORMAT zim);
+----
+'A/X' -> 'A/X'
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/selfredirect.zim');
+----
+0
+
+# ...but a multi-hop chain that DOES terminate at an item is valid and must keep
+# working. libzim resolves it; the check must not reject depth for its own sake.
+statement ok
+COPY (SELECT * FROM (VALUES
+        ('A/Real', 'hi', false, NULL),
+        ('A/B', NULL, true, 'A/Real'),
+        ('A/C', NULL, true, 'A/B'),
+        ('A/D', NULL, true, 'A/C'))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/redirectchain.zim' (FORMAT zim);
+
+query II
+SELECT path, redirect_path
+FROM read_zim('__TEST_DIR__/redirectchain.zim')
+WHERE is_redirect ORDER BY path;
+----
+A/B	A/Real
+A/C	A/B
+A/D	A/C
+
 # a redirect declared before its target in the same COPY is fine -- finalize
 # runs only after every row has been seen, so declaration order cannot matter.
 statement ok

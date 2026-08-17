@@ -96,6 +96,13 @@ bool ZimWriterHasFulltextIndexing() {
 // announcement of the removal (the two INFO() call sites this task's overlay
 // patch also silences) is no longer available as a fallback signal. See
 // docs/dev/copy-to-zim-design.md §7.4.
+//
+// detectDanglingRedirects() is not the only removal pass:
+// removeLoopsAndBlindChainsOfRedirects() (creator.cpp:851) runs right after it
+// and removes every redirect in a chain that does not terminate at a real item,
+// just as silently. "Target exists" does not cover that -- in a cycle every
+// target exists -- so ZimCopyFinalize walks redirect chains TRANSITIVELY and
+// rejects a cycle before libzim can drop anything.
 void ZimWriter::Finish() {
 	for (auto &kv : impl->config.metadata) {
 		impl->creator.addMetadata(kv.first, kv.second);
