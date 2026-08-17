@@ -193,3 +193,129 @@ SELECT (SELECT (zim_info('__TEST_DIR__/roundtrip.zim')).entry_count)
      = (SELECT (zim_info('test/oracle/test.zim')).entry_count);
 ----
 true
+
+# zim_counter() is the second assertable counter: it histograms USER entries by
+# mimetype, which is exactly what COPY carries. Measured, both sides:
+# {image/png=1, text/css=1, text/html=3}.
+query I
+SELECT zim_counter('__TEST_DIR__/roundtrip.zim') = zim_counter('test/oracle/test.zim');
+----
+true
+
+# all_entry_count is the third counter §8 asked for, and it is NOT an identity --
+# measured 16 (source) vs 9 (copy). This is not a defect and not fixable from the
+# writer: a ZIM->ZIM COPY carries no metadata, no illustration and no main entry,
+# because those come only from OPTIONS and the input schema has no column for
+# them. The seven-entry gap here is exactly the five metadata entries the source
+# carries beyond Counter (Creator, Date, Description, Language, Title) plus the
+# two Xapian entries of its fulltext index, which the copy did not request. So
+# assert the DIRECTION -- the copy is a strict subset of the source's full entry
+# list -- rather than equality, which cannot hold.
+query I
+SELECT (SELECT (zim_info('__TEST_DIR__/roundtrip.zim')).all_entry_count)
+     < (SELECT (zim_info('test/oracle/test.zim')).all_entry_count);
+----
+true
+
+# ...and assert the CAUSE directly, so the inequality above cannot silently start
+# holding for some unrelated reason: user metadata and the main entry are dropped.
+query III
+SELECT list_contains(zim_metadata_keys('test/oracle/test.zim'), 'Title'),
+       list_contains(zim_metadata_keys('__TEST_DIR__/roundtrip.zim'), 'Title'),
+       zim_main_entry('__TEST_DIR__/roundtrip.zim') IS NULL;
+----
+true	false	true
+
+# --- options with no reader surface still have to bind and write -------------
+# WORKERS, CLUSTER_SIZE and COMPRESSION change how libzim lays out the archive,
+# not what an archive reports, so nothing can assert their effect through the
+# reader. A round trip through them is the strongest available check: it proves
+# the values reach libzim's config* calls without being rejected and that the
+# resulting archive is still readable byte for byte.
+statement ok
+COPY (SELECT 'A/Opt' AS path, 'hello world' AS content)
+TO '__TEST_DIR__/opts.zim'
+   (FORMAT zim, WORKERS 2, CLUSTER_SIZE 1048576, COMPRESSION 'none');
+
+query II
+SELECT path, content
+FROM read_zim('__TEST_DIR__/opts.zim',
+              include_content := true, content_as_varchar := true);
+----
+A/Opt	hello world
+
+# front_article / compress are libzim Hints. libzim consumes them when laying out
+# clusters and the ZIM format preserves no readable trace of either, so -- as with
+# WORKERS above -- a bind-and-round-trip smoke test is the best available check.
+# Both are tri-state in ZimWriteEntry (absent = let libzim decide), so this also
+# covers the has_* plumbing for a true and a false value.
+statement ok
+COPY (SELECT * FROM (VALUES ('A/Front', 'x', true,  true),
+                            ('A/Back',  'y', false, false))
+        t(path, content, front_article, compress))
+TO '__TEST_DIR__/hints.zim' (FORMAT zim);
+
+query II
+SELECT path, content
+FROM read_zim('__TEST_DIR__/hints.zim',
+              include_content := true, content_as_varchar := true)
+ORDER BY path;
+----
+A/Back	y
+A/Front	x
+
+# --- INDEX_LANGUAGE independently of LANGUAGE -------------------------------
+# INDEX_LANGUAGE sets the stemming language ONLY; unlike LANGUAGE it writes no
+# Language metadata. Assert both halves, or this cannot be told apart from the
+# LANGUAGE-derived default the indexed.zim case above exercises.
+statement ok
+COPY (SELECT 'A/Photo' AS path, 'text/html' AS mimetype,
+             '<html><body>Photosynthesis converts light into sugar.</body></html>' AS content)
+TO '__TEST_DIR__/idxlang.zim' (FORMAT zim, INDEX true, INDEX_LANGUAGE 'eng');
+
+query I
+SELECT count(*) > 0 FROM zim_search('__TEST_DIR__/idxlang.zim', 'photosynthesis');
+----
+true
+
+query I
+SELECT list_contains(zim_metadata_keys('__TEST_DIR__/idxlang.zim'), 'Language');
+----
+false
+
+# --- a zero-row input writes a valid, empty archive -------------------------
+# Not an error: an empty result set is a legitimate corpus of zero entries, and
+# libzim finalizes it happily. The failure mode this guards against is finalize
+# assuming at least one row was seen.
+statement ok
+COPY (SELECT 'A/x' AS path, 'y' AS content WHERE false)
+TO '__TEST_DIR__/empty.zim' (FORMAT zim);
+
+query I
+SELECT count(*) FROM read_zim('__TEST_DIR__/empty.zim');
+----
+0
+
+query I
+SELECT zim_check('__TEST_DIR__/empty.zim');
+----
+true
+
+# --- a skipped duplicate must not register a redirect target ----------------
+# The second row here is dropped by ON_CONFLICT 'first' before it is written, so
+# its dangling redirect_path ('A/Nope') must never be validated: it belongs to an
+# entry that does not exist in the output. Recording the target above the dedup
+# check made this COPY fail with "redirect 'A/x' -> 'A/Nope' does not match any
+# entry", rejecting the whole archive over a row deliberately never written.
+statement ok
+COPY (SELECT * FROM (VALUES ('A/x', 'c',  false, NULL),
+                            ('A/x', NULL, true,  'A/Nope'))
+        t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/skipredirect.zim' (FORMAT zim, ON_CONFLICT 'first');
+
+query III
+SELECT path, content, is_redirect
+FROM read_zim('__TEST_DIR__/skipredirect.zim',
+              include_content := true, content_as_varchar := true);
+----
+A/x	c	false

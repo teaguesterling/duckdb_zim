@@ -65,10 +65,16 @@ struct ZimCopyGlobalState : public GlobalFunctionData {
 	}
 
 	~ZimCopyGlobalState() override {
-		// The central guarantee: a COPY that did not reach finalize must leave no
-		// output behind. A partial ZIM is NOT litter -- it opens, checksums, and
-		// passes zim_check(), so leaving it would present a truncated corpus as a
-		// healthy archive. See docs/dev/copy-to-zim-design.md §7.2.
+		// Defense in depth, NOT the load-bearing mechanism -- see
+		// docs/dev/copy-to-zim-design.md §7.2, which was corrected on this point.
+		// libzim writes to "<target>.tmp" and renames to the target name only at the
+		// END of finishZimCreation() (creator.cpp:453), and this code never finalizes
+		// while unwinding -- so no reachable abort leaves a file at the target name for
+		// this unlink to find. THAT is the actual guarantee: a truncated-but-finalized
+		// archive would open, checksum and pass zim_check() exactly like a complete one,
+		// so it must never be produced in the first place; no post-hoc check can spot
+		// it. The unlink below costs nothing and stays correct if a future libzim drops
+		// the rename, or if a future code path creates the target early.
 		if (finished) {
 			return;
 		}
@@ -139,8 +145,12 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 	// is what makes COPY (FROM read_zim(x)) TO y work (design §6.1); `size` is
 	// derived by libzim and `file_path` is provenance.
 	static const char *IGNORED_COLUMNS[] = {"size", "file_path"};
-	// v2 columns: named so the deferral reads as a deferral, not as a typo.
-	static const char *DEFERRED_COLUMNS[] = {"content_path", "entry_kind", "target", "source_archive", "source_entry"};
+	// v2 columns: named so the deferral reads as a deferral, not as a typo. Only
+	// columns design §10 actually plans belong here. `source_archive`/`source_entry`
+	// were the four-column alternative §4.2 explicitly REJECTED in favour of the
+	// single `zim://` locator, so naming them here would promise a v2 that will not
+	// exist -- they are unknown columns, and fail as such.
+	static const char *DEFERRED_COLUMNS[] = {"content_path", "entry_kind", "target"};
 
 	for (idx_t i = 0; i < names.size(); i++) {
 		auto &n = names[i];
@@ -171,12 +181,44 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 		throw BinderException("COPY TO (FORMAT zim): the input must have a 'content' column");
 	}
 
+	// Validate the SQL type of every column the sink actually reads, here, where
+	// sql_types is in hand. Without this the mismatch is caught by
+	// FlatVector::GetData<string_t>/<bool> in the sink, which throws an
+	// InternalException -- mid-write, after the archive has been started, and with
+	// no SQL-level explanation, because DuckDB invalidates the database on
+	// ExceptionType::INTERNAL (client_context.cpp). Design §4.1 tabulates the
+	// intended type for every column; this enforces that table.
+	auto require_type = [&](int64_t col, const char *col_name, bool allow_blob, bool want_boolean) {
+		if (col < 0) {
+			return;
+		}
+		auto &type = sql_types[static_cast<idx_t>(col)];
+		bool ok = want_boolean
+		              ? type.id() == LogicalTypeId::BOOLEAN
+		              : (type.id() == LogicalTypeId::VARCHAR || (allow_blob && type.id() == LogicalTypeId::BLOB));
+		if (!ok) {
+			throw BinderException("COPY TO (FORMAT zim): column '%s' must be %s, not %s. Cast it in the query.",
+			                      col_name, want_boolean ? "BOOLEAN" : (allow_blob ? "VARCHAR or BLOB" : "VARCHAR"),
+			                      type.ToString());
+		}
+	};
+	require_type(bind->cols.path, "path", false, false);
+	require_type(bind->cols.content, "content", true, false);
+	require_type(bind->cols.title, "title", false, false);
+	require_type(bind->cols.mimetype, "mimetype", false, false);
+	require_type(bind->cols.redirect_path, "redirect_path", false, false);
+	require_type(bind->cols.is_redirect, "is_redirect", false, true);
+	require_type(bind->cols.front_article, "front_article", false, true);
+	require_type(bind->cols.compress, "compress", false, true);
+
 	// Deliberate deviation from parquet/csv, which clobber by default. A ZIM is
-	// often the only copy of a corpus that took hours to build, and a failed write
-	// leaves a valid-looking archive (§7.2) -- clobber-by-default plus
-	// silent-partial-success destroys data and then reports health. Refusing also
-	// subsumes the self-reference hazard: a source archive necessarily exists, so
-	// it can never be a valid output path.
+	// often the only copy of a corpus that took hours to build, and the format
+	// records no "this is incomplete" marker -- a truncated-but-finalized archive
+	// opens, checksums and passes zim_check() exactly like a complete one (§7.2).
+	// Clobbering would therefore destroy the known-good copy before anything can
+	// establish that the replacement is whole. Refusing also subsumes the
+	// self-reference hazard: a source archive necessarily exists, so it can never be
+	// a valid output path.
 	//
 	// This check must run here, at bind time, against input.info.file_path -- NOT
 	// later against the file_path handed to ZimCopyInitGlobal, even though an
@@ -189,9 +231,18 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 	// (almost) never fire. Do not "fix" this back to InitGlobal.
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (fs.FileExists(input.info.file_path)) {
-		throw InvalidInputException("COPY TO (FORMAT zim): output '%s' already exists; refusing to overwrite. "
-		                            "A ZIM is written once -- remove the file first if you mean to replace it.",
-		                            input.info.file_path);
+		// The message names OVERWRITE and friends explicitly because DuckDB's binder
+		// accepts them for every format and consumes them before copy_to_bind runs, so
+		// this refusal fires even when the caller asked for exactly this -- and "remove
+		// the file first" then reads as an instruction to do by hand what they just
+		// requested. They are inert here, and the message has to say so (§3.4 keeps
+		// refusal as the behaviour; only the wording changes).
+		throw InvalidInputException(
+		    "COPY TO (FORMAT zim): output '%s' already exists; refusing to overwrite. A ZIM is written "
+		    "once -- remove the file first if you mean to replace it. OVERWRITE, OVERWRITE_OR_IGNORE and "
+		    "APPEND are not supported for this format: DuckDB accepts them at the COPY level, but they "
+		    "have no effect on a zim target and do not lift this refusal.",
+		    input.info.file_path);
 	}
 
 	// Derive the mimetype default from the content column's SQL type. libzim writes
@@ -211,6 +262,23 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 			throw BinderException("COPY TO (FORMAT zim): option '%s' takes exactly one value", option.first);
 		}
 		auto &value = option.second[0];
+		// A NULL Value must never reach the branches below. StringValue::Get and
+		// GetValue<uint64_t>() throw InternalException on one (value.cpp), which
+		// invalidates the database rather than reporting a SQL error; BooleanValue::Get
+		// reaches GetValueUnsafe<bool>, which reads value_.boolean behind only a
+		// D_ASSERT -- an uninitialized read in a release build, so `INDEX <null>` would
+		// resolve to garbage; and ToString() returns the literal string "NULL", so
+		// `MAIN_PATH <null>` would ask for an entry named "NULL". Same bug class as
+		// issue #28 on the read side (see NonNegativeParam/BoolParam in zim_search.cpp).
+		//
+		// DuckDB's own binder rejects a directly-spelled NULL first
+		// (bind_copy.cpp BindCopyOption), but it does that check BEFORE unpacking an
+		// unnamed struct into several option values -- so `WORKERS row(NULL)` reaches
+		// here with a NULL Value today. This guard is the backstop that does not depend
+		// on which spellings DuckDB happens to filter.
+		if (value.IsNull()) {
+			throw BinderException("COPY TO (FORMAT zim): %s must not be NULL", StringUtil::Upper(option.first));
+		}
 		if (key == "on_conflict") {
 			auto policy = StringUtil::Lower(value.ToString());
 			if (policy == "error") {
@@ -254,6 +322,14 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 			auto &entries = MapValue::GetChildren(value);
 			for (auto &entry : entries) {
 				auto &kv = StructValue::GetChildren(entry);
+				// The option-level NULL guard above cannot see inside the map: the map
+				// Value itself is non-NULL while an individual value is NULL, and
+				// ToString() then writes the literal string "NULL" as that key's
+				// metadata. (Map KEYS cannot be NULL -- DuckDB rejects that itself.)
+				if (kv[1].IsNull()) {
+					throw BinderException("COPY TO (FORMAT zim): METADATA value for key '%s' must not be NULL",
+					                      kv[0].ToString());
+				}
 				SetMetadata(bind->config, kv[0].ToString(), kv[1].ToString());
 			}
 		} else if (key == "illustration") {
@@ -292,11 +368,25 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 			}
 			bind->config.compression = comp;
 		} else if (key == "cluster_size") {
-			bind->config.cluster_size = value.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
-		} else if (key == "workers") {
+			// 0 is the sentinel ZimWriterConfig uses internally for "leave libzim's
+			// default alone", so accepting a literal CLUSTER_SIZE 0 would silently
+			// ignore the option instead of honouring it. There is no meaningful
+			// zero-byte cluster target either way; reject it and say what to do instead.
 			auto n = value.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
 			if (n == 0) {
-				throw BinderException("COPY TO (FORMAT zim): WORKERS must be at least 1");
+				throw BinderException("COPY TO (FORMAT zim): CLUSTER_SIZE must be at least 1 byte. Omit the "
+				                      "option entirely to use libzim's own default.");
+			}
+			bind->config.cluster_size = n;
+		} else if (key == "workers") {
+			// The upper bound is a sanity check, not a libzim limit: each worker is a
+			// thread, so a fat-fingered WORKERS 1000000 would try to spawn a million of
+			// them inside libzim rather than fail with a SQL error.
+			static constexpr uint64_t MAX_WORKERS = 256;
+			auto n = value.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
+			if (n == 0 || n > MAX_WORKERS) {
+				throw BinderException("COPY TO (FORMAT zim): WORKERS must be between 1 and %llu",
+				                      static_cast<unsigned long long>(MAX_WORKERS));
 			}
 			bind->config.workers = static_cast<uint32_t>(n);
 		} else {
@@ -367,11 +457,26 @@ void ZimCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		if (!GetStringCell(input, bind.cols.path, row, entry.path)) {
 			throw InvalidInputException("COPY TO (FORMAT zim): 'path' must not be NULL");
 		}
+
+		// Duplicate detection runs FIRST -- before any other per-row validation, and
+		// before anything about this row is recorded in the global state. A row that
+		// ON_CONFLICT 'first' skips is never written, so it must not register a
+		// redirect target either: doing that made ZimCopyFinalize reject the whole
+		// COPY over an entry that was deliberately dropped.
+		if (!gstate.seen_paths.insert(entry.path).second) {
+			if (bind.on_conflict == ZimConflictPolicy::KEEP_FIRST) {
+				continue;
+			}
+			throw InvalidInputException(
+			    "COPY TO (FORMAT zim): duplicate path '%s'. Entry paths must be unique within an "
+			    "archive; deduplicate in SQL, or pass ON_CONFLICT 'first'.",
+			    entry.path);
+		}
+
 		if (!GetStringCell(input, bind.cols.title, row, entry.title)) {
 			entry.title = entry.path;
 		}
 		GetStringCell(input, bind.cols.mimetype, row, entry.mimetype);
-		GetStringCell(input, bind.cols.content, row, entry.content);
 
 		if (bind.cols.is_redirect >= 0) {
 			auto &vec = input.data[static_cast<idx_t>(bind.cols.is_redirect)];
@@ -383,10 +488,28 @@ void ZimCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 				}
 				// Record the target for the dangling-redirect check in ZimCopyFinalize.
 				// emplace() keeps whichever redirect was seen first if several share a
-				// target; either is fine, since it is only used to name the error.
+				// target; either is fine, since it is only used to name the error. This
+				// is below the dedup check on purpose (see the comment there).
 				gstate.redirect_targets.emplace(entry.redirect_path, entry.path);
 			}
 		}
+
+		// Content is read after is_redirect is known, because whether NULL is legal
+		// depends on it. A redirect has no content of its own; anything else with NULL
+		// content would be written as an EMPTY entry -- silently, with no error and no
+		// size difference a content-comparison test could catch. That is the exact
+		// failure docs/writing.md calls "the single easiest way to lose data with this
+		// feature" (it is what feeding a COPY from content_as_varchar := true does to
+		// every non-UTF-8 entry), so it is an error naming the row, per design §4.2.
+		if (!GetStringCell(input, bind.cols.content, row, entry.content) && !entry.is_redirect) {
+			throw InvalidInputException(
+			    "COPY TO (FORMAT zim): entry '%s' has NULL content. Only a redirect row (is_redirect = true) "
+			    "may have NULL content -- writing it as an empty entry would lose the data silently. If the "
+			    "source is read_zim(), drop content_as_varchar := true and read content as BLOB: it returns "
+			    "NULL for every entry whose bytes are not valid UTF-8.",
+			    entry.path);
+		}
+
 		if (bind.cols.front_article >= 0) {
 			auto &vec = input.data[static_cast<idx_t>(bind.cols.front_article)];
 			if (FlatVector::Validity(vec).RowIsValid(row)) {
@@ -407,15 +530,6 @@ void ZimCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 			entry.mimetype = bind.default_mimetype;
 		}
 
-		if (!gstate.seen_paths.insert(entry.path).second) {
-			if (bind.on_conflict == ZimConflictPolicy::KEEP_FIRST) {
-				continue;
-			}
-			throw InvalidInputException(
-			    "COPY TO (FORMAT zim): duplicate path '%s'. Entry paths must be unique within an "
-			    "archive; deduplicate in SQL, or pass ON_CONFLICT 'first'.",
-			    entry.path);
-		}
 		gstate.writer->AddItem(entry);
 	}
 }
@@ -455,8 +569,13 @@ void ZimCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	}
 
 	gstate.writer->Finish();
-	gstate.writer.reset();
+	// Set `finished` the instant Finish() returns, BEFORE reset(). Once
+	// finishZimCreation() has returned, the archive on disk is complete, so nothing
+	// after this point may lead to it being unlinked. ~Creator is effectively
+	// noexcept, so a throw from reset() is not reachable -- but ordering it this way
+	// costs nothing and removes the question.
 	gstate.finished = true; // suppresses the destructor's unlink
+	gstate.writer.reset();
 }
 
 // A single Creator is not documented as safe for concurrent addItem(), and entry
