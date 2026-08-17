@@ -206,6 +206,36 @@ relative paths make unreliable.
 An explicit `OVERWRITE true` opt-in is the right shape if it is ever wanted. Nothing needs
 it today, and the default must never be destruction.
 
+**The target is not the only file the write claims: `<target>.tmp` is refused too.** Added
+in review. libzim builds the entire archive at `<target>.tmp` and renames it into place at
+the end (§7.2), and it opens that file with
+
+```c
+  int flag = O_RDWR | O_CREAT | O_TRUNC;   // creator.cpp:599 — note: no O_EXCL
+```
+
+so a pre-existing `.tmp` is silently truncated. Measured: a file at `a.zim.tmp` was
+clobbered by `COPY … TO 'a.zim'`, which reported success. Two writers aimed at one target
+therefore interleave into a single buffer, and whichever finishes last renames the result
+over the target — producing a corrupt archive that still opens, checksums and passes
+`zim_check()`, which is precisely the combination the rest of this section exists to
+prevent. Bind now refuses when `<target>.tmp` exists, with a message that says a write is
+in progress or was interrupted, and names the file to remove.
+
+**Residual race — known limitation, not solved.** That refusal is TOCTOU and is honestly
+only a narrowing. The whole planning phase separates the bind-time check from
+`startZimCreation()`, so two concurrent `COPY … TO 'a.zim' (FORMAT zim)` statements can
+both pass it and then both create `a.zim.tmp`. **Concurrent `COPY` to one zim target is not
+safe, and this design does not make it safe.** The check catches the cases worth catching
+in practice — the leftovers of a crashed write, and a concurrent write far enough ahead to
+have created its `.tmp` — and nothing more.
+
+Closing the race properly requires `O_EXCL` (or a lock) inside libzim's
+`CreatorData::setup`, which is out of scope here. The same overlay-patch mechanism that
+`vcpkg_ports/libzim/no-writer-stdout.patch` uses could carry it, and that is the shape the
+fix should take if this ever matters enough; a DuckDB-side lock would only cover writers in
+one process, which is the case that already fails least often.
+
 ## 4. Input schema
 
 Columns are resolved **by name**, case-insensitively. Unknown columns are an error, not

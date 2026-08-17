@@ -248,6 +248,33 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 		    input.info.file_path);
 	}
 
+	// The target is not the only file this write claims. libzim writes the whole
+	// archive to "<target>.tmp" and renames it into place at the end, and it opens
+	// that file with O_CREAT|O_TRUNC and NO O_EXCL (creator.cpp:602) -- so a second
+	// writer aimed at the same target silently truncates and interleaves into the
+	// first one's buffer, and whichever finishes last renames the result over the
+	// target. The product is a corrupt archive that (§7.2) still opens, checksums and
+	// passes zim_check(). Refusing when the ".tmp" is already there turns the common
+	// case of that -- a concurrent write, or the leftovers of a crashed one -- into an
+	// error a user can act on.
+	//
+	// KNOWN LIMITATION, deliberately not claimed as a fix: this is TOCTOU. The whole
+	// planning phase separates it from startZimCreation(), so two COPYs can both pass
+	// it and then both create the ".tmp". Closing the race for real needs O_EXCL
+	// inside libzim, which is out of scope here. This narrows the window and reports
+	// the leftovers; it does not make concurrent COPY to one target safe. See
+	// docs/dev/copy-to-zim-design.md §3.4.
+	auto tmp_path = input.info.file_path + ".tmp";
+	if (fs.FileExists(tmp_path)) {
+		throw InvalidInputException(
+		    "COPY TO (FORMAT zim): '%s' already exists, so a write to '%s' is either in progress in another "
+		    "connection or was interrupted partway through. libzim builds the archive there and renames it "
+		    "into place at the end, and it does not lock the file -- continuing would interleave two writes "
+		    "into one buffer and produce a corrupt archive. Wait for the other write, or remove '%s' if "
+		    "nothing is writing it.",
+		    tmp_path, input.info.file_path, tmp_path);
+	}
+
 	// Derive the mimetype default from the content column's SQL type. libzim writes
 	// "WARNING: mimetype missing for <path>" to stderr once per row, so defaulting
 	// (rather than passing NULL through) is what keeps a large archive's stderr usable.

@@ -163,6 +163,17 @@ This also means a source archive can never be a valid `COPY` target — a query 
 `a.zim` can't accidentally truncate it by writing back to `'a.zim'`, because `a.zim`
 already exists.
 
+`COPY` refuses if `<target>.tmp` exists as well. libzim builds the whole archive there and
+renames it into place at the end, without locking it, so that file means either another
+connection is writing this target right now or a previous write was interrupted. Wait for
+the other write, or remove the `.tmp` if nothing is using it.
+
+!!! warning "Two `COPY`s to one target is still not safe"
+    That check is best-effort, not a lock. Two `COPY` statements aimed at the same target
+    can both pass it and then both write into the same `.tmp`, producing a corrupt archive
+    that still passes `zim_check()`. Nothing in DuckDB or libzim prevents this today —
+    don't write the same archive from two places at once.
+
 On any error partway through a write — a cast failure mid-stream, a duplicate path, a NULL
 `content`, an invalid `MAIN_PATH` or redirect target — no file is left at the output path.
 libzim writes to a `.tmp` sibling and only renames it into place once the archive is

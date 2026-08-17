@@ -163,6 +163,39 @@ FROM read_zim('__TEST_DIR__/nooverwrite.zim',
 ----
 A/One	first
 
+# --- a leftover or in-flight "<target>.tmp" is refused too ------------------
+# libzim builds the whole archive at "<target>.tmp" and opens it O_CREAT|O_TRUNC
+# with NO O_EXCL (creator.cpp:602), so a second writer aimed at the same target
+# truncates and interleaves into the first one's buffer, and the corrupt result
+# still passes zim_check(). Measured before this check: a pre-existing
+# 'a.zim.tmp' was silently clobbered and the COPY reported success.
+#
+# The archive written here is a stand-in for the in-flight .tmp of a concurrent
+# write; only its existence matters to the check.
+statement ok
+COPY (SELECT 'A/One' AS path, 'in flight' AS content)
+TO '__TEST_DIR__/inflight.zim.tmp' (FORMAT zim);
+
+statement error
+COPY (SELECT 'A/Two' AS path, 'second' AS content)
+TO '__TEST_DIR__/inflight.zim' (FORMAT zim);
+----
+is either in progress in another connection or was interrupted partway through
+
+# the refusal did not touch the file it refused over
+query II
+SELECT path, content
+FROM read_zim('__TEST_DIR__/inflight.zim.tmp',
+              include_content := true, content_as_varchar := true);
+----
+A/One	in flight
+
+# ...and once it is out of the way the same COPY goes through, so the check is a
+# refusal over a real conflict and not a permanent block on the target name.
+statement ok
+COPY (SELECT 'A/Two' AS path, 'second' AS content)
+TO '__TEST_DIR__/inflight2.zim' (FORMAT zim);
+
 # --- a mid-stream error leaves NO output ------------------------------------
 # The CAST fails partway through, after the sink has already taken chunks. The
 # global state's destructor must unlink the partial archive.
