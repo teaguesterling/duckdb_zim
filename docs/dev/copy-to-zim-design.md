@@ -256,6 +256,17 @@ distinction rather than a silent size regression. (Measured in python-libzim: ro
 binary content through a `str` re-encoded it as UTF-8 and inflated a 16.8 MB PDF to
 25.0 MB — 49%. A `BLOB` column cannot make that mistake.)
 
+> **The same hazard exists on the option path, and it bit during implementation.** DuckDB's
+> `Value::ToString()` on a `BLOB` does not return the bytes — it invokes `CastFromBlob`
+> (`duckdb/src/common/operator/cast_operators.cpp:1388`), which escapes every non-ASCII byte
+> as a four-character `\xHH` sequence. Any binary-valued option — `ILLUSTRATION` today, any
+> future one — must extract raw bytes (`StringValue::Get`, or the `FlatVector` /
+> `string_t::GetString()` path the sink uses) and never `ToString()`.
+>
+> This is invisible to an ASCII test payload, which is why the test table above requires the
+> illustration fixture to contain bytes ≥ 0x80. The failure is silent and the archive still
+> writes; only the image is wrong.
+
 ## 5. Execution model
 
 | Hook | Responsibility |
@@ -665,6 +676,8 @@ Every item below is a regression test, not a manual check.
 | minimal write | a one-item archive opens and `read_zim` returns the row |
 | round trip | content **and** `entry_count`, `all_entry_count`, `zim_counter()` (§8) |
 | metadata | every option in §3.1 reads back via `zim_metadata` |
+| `ILLUSTRATION` byte fidelity | the stored PNG reads back **byte-identical** via `zim_illustration`, and `octet_length` matches. The payload **must contain bytes ≥ 0x80** — DuckDB's `Value::ToString()` on a `BLOB` escapes non-ASCII as `\xHH`, so an ASCII-only payload passes even when the extraction is broken (§4.3) |
+| `METADATA` with a non-VARCHAR value | rejected, not silently escaped through the same `ToString()` path |
 | mimetype defaulting | `VARCHAR → text/plain`, `BLOB → application/octet-stream` |
 | duplicate path, `error` | fails, error names the path, **output does not exist** (§7.2) |
 | duplicate path, `first` | first occurrence wins, later skipped |
