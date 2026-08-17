@@ -1,0 +1,61 @@
+# name: test/sql/copy_zim_errors.test
+# description: COPY ... TO ... (FORMAT zim) -- refusals and cleanup
+# group: [sql]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# --- the input must carry the required columns ------------------------------
+statement error
+COPY (SELECT 'x' AS notpath, 'y' AS content) TO '__TEST_DIR__/e1.zim' (FORMAT zim);
+----
+must have a 'path' column
+
+statement error
+COPY (SELECT 'x' AS path) TO '__TEST_DIR__/e2.zim' (FORMAT zim);
+----
+must have a 'content' column
+
+# --- refusing to overwrite --------------------------------------------------
+statement ok
+COPY (SELECT 'A/One' AS path, 'first' AS content)
+TO '__TEST_DIR__/nooverwrite.zim' (FORMAT zim);
+
+statement error
+COPY (SELECT 'A/Two' AS path, 'second' AS content)
+TO '__TEST_DIR__/nooverwrite.zim' (FORMAT zim);
+----
+already exists
+
+# the original survives untouched -- the refusal must not have damaged it
+query II
+SELECT path, content
+FROM read_zim('__TEST_DIR__/nooverwrite.zim',
+              include_content := true, content_as_varchar := true);
+----
+A/One	first
+
+# --- a mid-stream error leaves NO output ------------------------------------
+# The CAST fails partway through, after the sink has already taken chunks. The
+# global state's destructor must unlink the partial archive.
+statement error
+COPY (SELECT 'A/' || i AS path,
+             (CASE WHEN i < 5000 THEN '1' ELSE 'not-a-number' END)::INTEGER::VARCHAR AS content
+      FROM range(10000) t(i))
+TO '__TEST_DIR__/aborted.zim' (FORMAT zim);
+----
+Conversion Error
+
+# If the file still existed this would succeed and return rows; it must fail to open.
+statement error
+SELECT count(*) FROM read_zim('__TEST_DIR__/aborted.zim');
+----
+failed to open ZIM
+
+# and the predicate agrees
+query I
+SELECT zim_check('__TEST_DIR__/aborted.zim');
+----
+false

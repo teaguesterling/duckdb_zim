@@ -103,6 +103,27 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 		throw BinderException("COPY TO (FORMAT zim): the input must have a 'content' column");
 	}
 
+	// Deliberate deviation from parquet/csv, which clobber by default. A ZIM is
+	// often the only copy of a corpus that took hours to build, and a failed write
+	// leaves a valid-looking archive (§7.2) -- clobber-by-default plus
+	// silent-partial-success destroys data and then reports health. Refusing also
+	// subsumes the self-reference hazard: a source archive necessarily exists, so
+	// it can never be a valid output path.
+	//
+	// This check must run here, at bind time, against input.info.file_path -- NOT
+	// later against the file_path handed to ZimCopyInitGlobal. When the target
+	// already exists, DuckDB's planner (bind_copy.cpp) defaults use_tmp_file to
+	// true and physical planning (plan_copy_to_file.cpp) then rewrites the copy
+	// operator's file_path to "tmp_<name>" *before* copy_to_initialize_global ever
+	// sees it, so that path never exists and an existence check there would never
+	// fire. Confirmed empirically: see task-2-report.md.
+	auto &fs = FileSystem::GetFileSystem(context);
+	if (fs.FileExists(input.info.file_path)) {
+		throw InvalidInputException("COPY TO (FORMAT zim): output '%s' already exists; refusing to overwrite. "
+		                            "A ZIM is written once -- remove the file first if you mean to replace it.",
+		                            input.info.file_path);
+	}
+
 	// Derive the mimetype default from the content column's SQL type. libzim writes
 	// "WARNING: mimetype missing for <path>" to stderr once per row, so defaulting
 	// (rather than passing NULL through) is what keeps a large archive's stderr usable.
@@ -119,6 +140,9 @@ unique_ptr<LocalFunctionData> ZimCopyInitLocal(ExecutionContext &context, Functi
 unique_ptr<GlobalFunctionData> ZimCopyInitGlobal(ClientContext &context, FunctionData &bind_data,
                                                  const string &file_path) {
 	auto &bind = bind_data.Cast<ZimCopyBindData>();
+
+	// The "already exists" refusal lives in ZimCopyBind, not here -- see the
+	// comment there for why this file_path is the wrong value to check against.
 	auto state = make_uniq<ZimCopyGlobalState>(context, file_path);
 	state->writer = make_uniq<ZimWriter>(file_path, bind.config);
 	return std::move(state);
