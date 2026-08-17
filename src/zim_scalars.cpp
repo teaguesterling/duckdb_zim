@@ -166,37 +166,12 @@ void Random(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 }
 
-// zim_check(file) -> BOOLEAN : libzim archive integrity check.
-//
-// Returns FALSE for an archive that cannot be OPENED, rather than raising.
-//
-// This is the one function in the family whose whole purpose is to answer "is
-// this archive usable?", so it has to be answerable without aborting the query.
-// Raising left callers with no way to ask at all: DuckDB's TRY() intercepts
-// conversion and range errors, not the InvalidInputException thrown from the
-// open path, so `TRY(zim_check(f))` propagates the error just the same.
-//
-// The concrete case is a shelf scanned from a directory where one file is
-// truncated or is not a ZIM. Without this, a query over that shelf can only
-// abort entirely, or use zim_search(ignore_errors := true) -- which skips the
-// bad archive silently, so the caller gets fewer results and no way to learn
-// that a corpus was dropped.
-//
-// Only the OPEN is guarded. An archive that opens but fails its integrity check
-// already returns false, and anything CheckIntegrity() itself throws still
-// propagates -- that is a real fault, not an unreadable file.
+// zim_check(file) -> BOOLEAN : libzim archive integrity check
 void Check(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		std::shared_ptr<ZimArchive> archive;
-		try {
-			archive = Open(state, args.data[0], i);
-		} catch (const std::exception &) {
-			// Unopenable: not a ZIM, truncated, missing, or unreadable.
-			result.SetValue(i, Value::BOOLEAN(false));
-			continue;
-		}
+		auto archive = Open(state, args.data[0], i);
 		result.SetValue(i, Value::BOOLEAN(archive->CheckIntegrity()));
 	}
 }
