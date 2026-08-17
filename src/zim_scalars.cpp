@@ -185,17 +185,6 @@ void Random(DataChunk &args, ExpressionState &state, Vector &result) {
 // Only the OPEN is guarded. An archive that opens but fails its integrity check
 // already returns false, and anything CheckIntegrity() itself throws still
 // propagates -- that is a real fault, not an unreadable file.
-//
-// CAVEAT, and it limits what this function can be believed to mean: it verifies
-// internal CONSISTENCY, not COMPLETENESS. An archive whose writer died part-way
-// through is self-consistent -- it opens, its checksum validates, and this
-// returns true -- while containing only the entries written before the failure.
-// Confirmed empirically: a libzim Creator aborted mid-write by a duplicate-path
-// error leaves a file that both libzim and read_zim open happily, with a valid
-// checksum, holding a strict prefix of the intended entries. The ZIM format does
-// not record an expected entry count, so no open-and-verify check can detect it.
-// Callers needing completeness must compare zim_info().entry_count against an
-// external expectation.
 void Check(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());

@@ -192,9 +192,7 @@ zim_redirect_target(file, path) -- VARCHAR, NULL if not a redirect
 zim_mimetype(file, path)        -- VARCHAR
 zim_main_entry(file)            -- VARCHAR, redirect-resolved landing path
 zim_random(file)                -- VARCHAR, a random entry's path
-zim_check(file)                 -- BOOLEAN, openable + internally consistent; false (not an
-                                --   error) if unopenable, so it works as a shelf predicate.
-                                --   Checks consistency, not completeness -- see docs/reference.md
+zim_check(file)                 -- BOOLEAN, libzim archive integrity check
 zim_illustration(file[, size])  -- BLOB, the cover image / favicon (default 48px), NULL if none
 ```
 
