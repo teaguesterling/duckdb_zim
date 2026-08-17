@@ -598,6 +598,20 @@ A "content matches" assertion passes in exactly that case. **The round-trip test
 assert `entry_count`, `all_entry_count` and `zim_counter()` alongside content**, or it is a
 check that cannot fail where the round trip is not an identity.
 
+> **Read the source as `BLOB`, never with `content_as_varchar := true`.** This looks like a
+> convenience and is actually silent data loss. `content_as_varchar` returns `NULL` for any
+> entry whose bytes are not valid UTF-8 — which is every image, font and media file in a real
+> archive — so a copy driven by it writes **empty content** for exactly those entries, and a
+> content-comparison test still passes because `NULL = NULL` on both sides.
+>
+> Found during implementation: the round-trip test as originally specified read the fixture
+> with `content_as_varchar := true`, and the fixture's binary `I/logo.png` would have been
+> copied as an empty entry with the test reporting success. The rule generalises beyond the
+> test — **any** ZIM→ZIM copy must move content as `BLOB`. The `NULL`-not-mangled behaviour is
+> correct for *reading* text (it is what keeps `zim_get_text` honest); it is catastrophic for
+> *copying*, because the copy has no way to tell "this entry was empty" from "this entry was
+> binary and I dropped it".
+
 ### 8.1 Aliases can be preserved — via a private API
 
 An alias shares its target's stored data, so two entries with the same
@@ -675,6 +689,7 @@ Every item below is a regression test, not a manual check.
 |---|---|
 | minimal write | a one-item archive opens and `read_zim` returns the row |
 | round trip | content **and** `entry_count`, `all_entry_count`, `zim_counter()` (§8) |
+| round trip of a **binary** entry | content compared as `BLOB`; must fail if binary entries are dropped. Reading the source with `content_as_varchar := true` silently NULLs non-UTF-8 entries and the comparison still passes (§8) |
 | metadata | every option in §3.1 reads back via `zim_metadata` |
 | `ILLUSTRATION` byte fidelity | the stored PNG reads back **byte-identical** via `zim_illustration`, and `octet_length` matches. The payload **must contain bytes ≥ 0x80** — DuckDB's `Value::ToString()` on a `BLOB` escapes non-ASCII as `\xHH`, so an ASCII-only payload passes even when the extraction is broken (§4.3) |
 | `METADATA` with a non-VARCHAR value | rejected, not silently escaped through the same `ToString()` path |
