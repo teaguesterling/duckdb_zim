@@ -205,8 +205,10 @@ modes live in two columns:
 
 Rejected alternatives, for the record: four columns (`content`, `content_path`,
 `source_archive`, `source_entry`) is more explicit but has strictly more illegal states to
-validate; a `content_mode` enum plus one payload column is uniform on paper but forces the
-source pair into a packed string and collapses BLOB vs VARCHAR.
+validate; a per-row *mode-enum column* plus one payload column is uniform on paper but
+forces the source pair into a packed string and collapses BLOB vs VARCHAR. (Not to be
+confused with the reader's `content_mode` **parameter** in §6.2 — that is a per-query
+setting on the read side, not a per-row column on the write side.)
 
 > **The surface reuses the `zim://` grammar; the implementation must not reuse the VFS.**
 > The registered `zim://` filesystem materialises each entry into RAM on open (issue #27),
@@ -296,13 +298,22 @@ strictly less expressive, so the mapping is one-way: reader → `item`/`redirect
 Content is the dimension that actually differs between reading *to look at* and reading
 *to write back*, so that is what the parameter names — not the destination.
 
-`read_zim(files, …, content_mode := 'inline' | 'reference' | 'smart')`
+`include_content` conflates two independent questions. Splitting them is what makes `smart`
+definable rather than a vibe:
+
+| dimension | parameter | question |
+|---|---|---|
+| **how** content is delivered | `content_mode` | inline bytes, a lazy reference, or both? |
+| **which** entries get content | `include_content_types` | which entries, by type and size? |
+
+#### `content_mode` — how
 
 | Mode | Content columns emitted | Reads content? | Use |
 |---|---|---|---|
-| `inline` (default) | `content` | per `include_content` | today's behaviour, unchanged |
+| `none` (default) | `content`, always NULL | **no** | listing scans — today's default |
+| `inline` | `content` | for the selected entries | today's `include_content := true` |
 | `reference` | `content_path` | **no** | subset / augment — lazy by construction |
-| `smart` | `content` **and** `content_path` | for the selected subset only | mixed corpora |
+| `smart` | `content` **and** `content_path` | for the selected entries only | mixed corpora |
 
 `reference` emits `zim://<archive>/<path>` per row, so a subset needs no string
 concatenation and materialises nothing:
@@ -314,11 +325,77 @@ TO 'subset.zim' (FORMAT zim);
 ```
 
 `smart` emits both columns with **exactly one non-NULL per row** — which is precisely the
-writer's rule from §4.2, so the two halves meet without an adapter. It is the augment case:
-convert the text, reference everything else.
+writer's rule from §4.2, so the two halves meet without an adapter. Selected entries get
+inline bytes; everything else gets a reference. It is the augment case: convert the text,
+reference the binaries, materialise nothing you did not ask for.
 
-`inline` remains the default. The reader is released; changing the shape of an existing
-query's result is not something a new feature gets to do.
+#### `include_content_types` — which
+
+Polymorphic, in the same spirit as `content_path`'s scheme dispatch: the simple cases stay
+short, and the expressive case needs no second parameter.
+
+| Value | Meaning |
+|---|---|
+| `BOOLEAN` | `true` = all entries, `false` = none |
+| `VARCHAR` | one Accept-style mimetype pattern (`'text/html'`, `'image/*'`, `'*/*'`) |
+| `LIST(VARCHAR)` | any of several patterns |
+| `LIST(STRUCT(mimetype VARCHAR, min_size BIGINT, max_size BIGINT))` | patterns with size bounds |
+
+```sql
+-- text inline, everything else referenced and never materialised
+read_zim(x, content_mode := 'smart', include_content_types := 'text/*');
+
+-- inline small text and small PDFs; reference big ones
+read_zim(x, content_mode := 'smart',
+            include_content_types := [{'mimetype': 'text/*',        'max_size': 1048576},
+                                      {'mimetype': 'application/pdf','max_size':   65536}]);
+```
+
+`min_size` / `max_size` are inclusive bounds in bytes; `NULL` means unbounded. They are
+`BIGINT` rather than `INT` because a ZIM entry can exceed 2 GB, and `NULL`-able because
+DuckDB types a `LIST(STRUCT)` uniformly — every element must carry the same keys, so an
+unused bound is written as `NULL` rather than omitted.
+
+Folding size into the selector, rather than adding a separate `content_inline_max_size`,
+means there is no second knob that can disagree with the first, and per-type thresholds
+become expressible — which a single global threshold cannot do.
+
+**Default**: absent, `include_content_types` selects *all* entries, so `content_mode :=
+'inline'` inlines everything (matching today's `include_content := true`). For
+`content_mode := 'smart'` with no selector, the default is **textual mimetypes inline,
+everything else referenced**, reusing the `LooksLikeText()` predicate already in
+`src/zim_scalars.cpp`. That is a heuristic, and it is the one place in this design where a
+default guesses at intent — say so in the docs rather than letting it be discovered.
+
+#### Deprecation and defaults
+
+`include_content` remains as a **deprecated alias**, mapped mechanically. It is published in
+community extensions, so removing it would break working queries:
+
+| today | becomes |
+|---|---|
+| `include_content := false` | `content_mode := 'none'` *(the default)* |
+| `include_content := true` | `content_mode := 'inline'` |
+| `include_content := 'text/html'` | `content_mode := 'inline', include_content_types := 'text/html'` |
+
+Combining `include_content` with either new parameter is an error rather than last-wins,
+consistent with §3.1 and with how the reader already rejects conflicting `read_zim`
+parameters.
+
+`content_mode := 'none'` is the default, preserving today's behaviour exactly: the reader is
+released, and changing the shape or cost of an existing query's result is not something a
+new feature gets to do.
+
+`content_as_varchar` stays a **separate** parameter. It is a *type* decision (BLOB vs
+VARCHAR) orthogonal to both dimensions above; folding it in would make `content_mode` a
+cross-product enum.
+
+> **Do not confuse `include_content_types` with the existing `mimetype` parameter.** They
+> both take Accept-style patterns and they do different things: `mimetype` filters **which
+> rows appear**; `include_content_types` filters **which of those rows carry content**. A
+> row excluded by `mimetype` is absent; a row excluded by `include_content_types` is present
+> with NULL content. This is a genuine footgun and the reference docs must show both in one
+> example.
 
 Redirect rows carry no content in any mode: both content columns are NULL and
 `is_redirect`/`redirect_path` describe the entry.
@@ -524,7 +601,8 @@ redirect entry even though `entry_kind` is not yet a column the user can write.
 "unknown", so the deferral reads as deferral.
 
 **v2, immediately following** — `content_path` in both its forms (local file, and the
-`zim://` locator driving the subset/augment use cases), the reader's `content_mode` (§6.2),
+`zim://` locator driving the subset/augment use cases), the reader's `content_mode` /
+`include_content_types` rework (§6.2),
 `entry_kind`/`target`, §7.4, and `PARTITION_BY` (§3.3). The v1 column contract is unchanged
 by all of this: v2 only adds columns, never renames or retypes one.
 
@@ -570,6 +648,13 @@ v2 adds:
 | `content_mode := 'reference'` | emits `content_path`, not `content`; **reads no content at all** (§6.2) |
 | `content_mode := 'smart'` | emits both columns, exactly one non-NULL per row (§6.2) |
 | `content_mode` default | absent parameter emits today's schema unchanged — no existing query shifts (§6.2) |
+| `include_content_types` scalar / list | mimetype patterns select which rows carry content (§6.2) |
+| `include_content_types` struct form | `min_size`/`max_size` bounds honoured; `NULL` means unbounded (§6.2) |
+| per-type thresholds | two struct rules with different `max_size` each apply to their own type |
+| `smart` with no selector | textual mimetypes inline, everything else referenced (§6.2) |
+| `include_content` alias | all three old spellings still work and map as documented (§6.2) |
+| old + new spelling together | error, not last-wins (§6.2) |
+| `mimetype` vs `include_content_types` | a row excluded by `mimetype` is **absent**; one excluded by `include_content_types` is **present with NULL content** (§6.2) |
 | redirect row in every mode | both content columns NULL (§6.2) |
 | `zim://` to a missing entry | clear error naming the URI |
 | non-local scheme in `content_path` | rejected (§4.2), not silently buffered |
