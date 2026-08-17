@@ -42,6 +42,48 @@ SELECT zim_check('test/oracle/test.zim');
 ----
 true
 
+# An archive that cannot be OPENED answers false rather than raising. zim_check is
+# the one function whose purpose is to answer "is this archive usable?", so it has
+# to be answerable without aborting the query. Note TRY() is not a substitute: it
+# intercepts conversion and range errors, not the InvalidInputException raised from
+# the open path.
+
+# present, readable, but not a ZIM at all
+query I
+SELECT zim_check('test/oracle/make_fixture.py');
+----
+false
+
+# missing file
+query I
+SELECT zim_check('/no/such/archive.zim');
+----
+false
+
+# NULL in, NULL out -- the guard must not turn a NULL into false
+query I
+SELECT zim_check(NULL);
+----
+NULL
+
+# The motivating case: a shelf where one file is unusable must still be queryable
+# as a whole, with the bad entry identifiable rather than aborting the scan.
+query II
+SELECT f, zim_check(f) AS readable
+FROM (VALUES ('test/oracle/test.zim'), ('test/oracle/make_fixture.py')) t(f)
+ORDER BY f;
+----
+test/oracle/make_fixture.py	false
+test/oracle/test.zim	true
+
+# and the predicate is usable in a WHERE clause over that shelf
+query I
+SELECT count(*)
+FROM (VALUES ('test/oracle/test.zim'), ('/no/such/archive.zim')) t(f)
+WHERE zim_check(f);
+----
+1
+
 # --- zim_random: returns a real entry --------------------------------------
 # The path is random, but it is always an entry that exists in the archive.
 query I
