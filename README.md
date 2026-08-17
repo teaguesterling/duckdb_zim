@@ -289,15 +289,23 @@ TO 'copy.zim' (FORMAT zim);
 
 > **Read content as `BLOB`, never `content_as_varchar := true`, when copying an archive.**
 > `content_as_varchar` returns `NULL` for any entry whose bytes aren't valid UTF-8 — every
-> image, font, and other binary file — so piping that into `COPY` writes those entries
-> **empty**, silently. `content` is `BLOB` by default, as in the example above; just don't
-> add `content_as_varchar := true` to the `read_zim()` call that feeds a `COPY`. This is the
-> single easiest way to lose data with this feature.
+> image, font, and other binary file. `COPY` refuses a `NULL` `content` on a non-redirect
+> row, naming the entry, so this fails loudly instead of writing those entries empty.
+> `content` is `BLOB` by default, as in the example above; just don't add
+> `content_as_varchar := true` to the `read_zim()` call that feeds a `COPY`.
+
+> **A whole-archive copy carries entries, not archive-level state.** `Title`, `Language`,
+> the illustration, the main page and the fulltext index have no column in the input
+> relation — they come only from options, so `copy.zim` above has none of them. Pass the
+> ones you want as options (`TITLE …, LANGUAGE …, MAIN_PATH …, INDEX true`).
 
 > **Writing never overwrites.** If the output path exists, `COPY` fails rather than
-> clobbering it (unlike `parquet`/`csv`, which overwrite by default) — a failed write can
-> still leave an archive that opens and passes `zim_check()`, so silent partial overwrite
-> would be the worst combination. Remove the file yourself first if you mean to replace it.
+> clobbering it (unlike `parquet`/`csv`, which overwrite by default) — the ZIM format can't
+> record "this is incomplete", so a truncated archive that got finalized passes
+> `zim_check()` like any other, and clobbering would destroy the known-good copy before
+> anything could establish the replacement was whole. `OVERWRITE` and friends are consumed
+> by DuckDB before the zim writer is bound and have no effect here. Remove the file yourself
+> first if you mean to replace it.
 
 See `docs/writing.md` for the full column/option reference, including the redirect and
 `MAIN_PATH` validation, `ON_CONFLICT` semantics, and the alias round-trip caveat.

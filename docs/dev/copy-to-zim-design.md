@@ -101,8 +101,21 @@ rather than staying silent.
 - `FILE_SIZE_BYTES` / file rotation — `copy_rotate_files` returns `false`. A ZIM cannot be
   split mid-write and remain valid.
 - `USE_TMP_FILE` — the Creator owns its own output path.
+- `PER_THREAD_OUTPUT` — `physical_copy_to_file.cpp` creates one `GlobalFunctionData`, hence
+  one `Creator`, **per thread**, and finalizes each separately. Accepting it would produce
+  `data_0.zim`, `data_1.zim`, … each with its own duplicate-path set (so duplicate detection
+  is defeated *across* files), its own `MAIN_PATH` validation, and a duplicate copy of the
+  metadata — §3.3's fragmentation hazard with no partition key to even explain it. DuckDB's
+  binder consumes this option before `copy_to_bind`, so it is rejected in
+  `initialize_operator` alongside `PARTITION_BY`.
+- `OVERWRITE` / `OVERWRITE_OR_IGNORE` / `APPEND` — DuckDB's binder accepts these for every
+  format and consumes them before `copy_to_bind`, so this function cannot see them and
+  cannot reject them. They are inert: §3.4's refusal fires regardless. Since the refusal
+  then fires *at* a caller who asked for exactly this, its message names all three and says
+  they are unsupported — otherwise "remove the file first" reads as an instruction to do by
+  hand what they just asked for.
 
-Silently accepting either would produce output that does not match what was asked for,
+Silently accepting any of these would produce output that does not match what was asked for,
 which is the failure family this design is most concerned with.
 
 ### 3.3 `PARTITION_BY` — supported, in v2
@@ -189,12 +202,31 @@ ignored — a typo'd `titel` should not silently produce untitled entries.
 | `target` | VARCHAR | no | target path for `redirect`/`alias` — **v2** |
 | `front_article` | BOOLEAN | no | libzim `FRONT_ARTICLE` hint |
 | `compress` | BOOLEAN | no | libzim `COMPRESS` hint |
+| `is_redirect` | BOOLEAN | no | writer tolerance for the reader's spelling (§6.1) — `true` writes a redirect |
+| `redirect_path` | VARCHAR | when `is_redirect` | the redirect's target (§6.1, §7.4) |
 | `content_path` | VARCHAR | no | content *locator* — a file path or a `zim://` URI (§4.2) — **v2** |
+
+**This table is enforced at bind time**, from the `sql_types` `copy_to_bind` already
+receives, with an error naming the column and both types. It is not decoration: the sink
+reads these vectors through `FlatVector::GetData<string_t>` / `<bool>`, which on a mismatch
+throws an `InternalException` — *mid-write*, after the archive has been started, and
+invalidating the database rather than reporting a SQL error (`client_context.cpp` treats
+`ExceptionType::INTERNAL` as unrecoverable). `content` accepts `VARCHAR` or `BLOB`, since
+that distinction is load-bearing for §4.3; every other string-ish column is `VARCHAR` only,
+and the three hint/flag columns are `BOOLEAN` only.
 
 ### 4.2 Content: two columns, three modes
 
 Content arrives one of two ways, and **exactly one of `content` / `content_path` must be
 non-NULL** per row. Supplying both, or neither, is an error naming the row's `path`.
+
+In v1, where `content_path` does not exist yet, that rule reduces to: **`content` must be
+non-NULL on any row that is not a redirect**, and it is enforced with an error naming the
+row's `path`. A redirect has no content of its own, so NULL there is legal. Getting this
+wrong is not a cosmetic omission — a discarded NULL writes the entry as *empty*, with no
+error, no warning, and no size signal a content-comparison test could catch. It is exactly
+what feeding a `COPY` from `content_as_varchar := true` does to every non-UTF-8 entry (§8),
+which is the single easiest way to lose data with this feature.
 
 | Column | Holds | Meaning |
 |---|---|---|
@@ -271,20 +303,37 @@ binary content through a `str` re-encoded it as UTF-8 and inflated a 16.8 MB PDF
 
 | Hook | Responsibility |
 |---|---|
-| `copy_to_bind` | validate options; resolve column indices by name; reject unknown columns and conflicting modes |
+| `copy_to_bind` | **fail if the output exists (§3.4)**; validate options (including rejecting a NULL option value); resolve column indices by name; reject unknown columns and conflicting modes; **check every column's SQL type against §4.1** |
 | `execution_mode` | always `REGULAR_COPY_TO_FILE` — **serial**; libzim parallelises internally via `configNbWorkers` |
-| `copy_to_initialize_global` | fail if the output exists (§3.4); construct `Creator`; `config*()`; `startZimCreation()`; write metadata and illustration |
-| `copy_to_sink` | for each row: validate, materialise content into owned storage, `addItem()` |
-| `copy_to_finalize` | `setMainPath()`; `finishZimCreation()`; mark the global state *finished* |
-| `~GlobalState` | if not *finished*, unlink the output (§7.2) |
+| `initialize_operator` | reject `PARTITION_BY` and `PER_THREAD_OUTPUT` — both are consumed by DuckDB's binder before `copy_to_bind`, so this is the only hook that can see them (§3.2, §3.3) |
+| `copy_to_initialize_global` | construct `Creator`; `config*()`; `startZimCreation()` |
+| `copy_to_sink` | for each row: dedup, validate, materialise content into owned storage, `addItem()` |
+| `copy_to_finalize` | validate `MAIN_PATH` and every redirect target (§7.3, §7.4); write metadata and illustration; `setMainPath()`; `finishZimCreation()`; mark the global state *finished* |
+| `~GlobalState` | if not *finished*, unlink the output — defense in depth (§7.2) |
 
 The sink is serial because a single `Creator` is not documented as safe for concurrent
 `addItem()`, and because entry ordering affects nothing we need. Parallelism comes from
 libzim's own workers, which is where it belongs.
 
-Metadata is written at global-init rather than finalize because `addMetadata()` is
-confirmed to work any time after `startZimCreation()`, and writing it early means a failed
-content stream cannot produce an archive with content but no identity.
+**The output-exists check is in `copy_to_bind`, not `copy_to_initialize_global`.** This
+table originally placed it in global-init; that placement does not work, and the code
+carries a comment saying so. When the target already exists, DuckDB's planner defaults
+`use_tmp_file` to true and physical planning rewrites the copy operator's `file_path` to
+`tmp_<name>` *before* `copy_to_initialize_global` ever sees it — so the path that hook
+receives (almost) never pre-exists, and the check there would (almost) never fire. Bind
+sees `info.file_path`, the path the user actually wrote, which is the value the rule is
+about. Bind is also simply the right altitude: refusing to overwrite is a property of the
+statement, and it should fail before any file is touched.
+
+**Metadata and the illustration are written in `Finish()`, i.e. at finalize**, not at
+global-init as this section originally specified. The original argument was that writing
+identity early means "a failed content stream cannot produce an archive with content but no
+identity" — but that scenario does not exist: an aborted `COPY` never finalizes, so libzim
+never renames its `.tmp` to the target name and *no archive is produced at all* (§7.2).
+There is nothing for early metadata to protect. Writing it at finalize instead keeps every
+piece of archive-level state — metadata, illustration, `MAIN_PATH` — applied in one place,
+immediately after the validation that guards it, which is why `ZimWriter` owns a copy of the
+config rather than consuming it at construction.
 
 ## 6. Interaction with the reader
 
@@ -614,29 +663,60 @@ the set varies, never as a target.
 natural conformance test, and a 10-entry real-Wikipedia round trip has been measured
 byte-identical, 10/10.
 
-**It is not an identity for aliases**, and the way it fails is quiet. An alias read back
+**It is not an identity for archive-level state, and that is the common case** — far more
+common than the alias case below, which needs an alias to be present at all. A ZIM→ZIM
+`COPY` carries **no metadata, no illustration and no main entry**: those come only from
+options, and the input schema has no column for any of them. Nor does it carry a fulltext
+index unless `INDEX` was asked for. Measured on `test/oracle/test.zim`:
+
+| counter | source | copy | identity? |
+|---|---|---|---|
+| `entry_count` | 6 | 6 | **yes** — user entries are what `COPY` carries |
+| `zim_counter()` | `{image/png=1, text/css=1, text/html=3}` | same | **yes** — a mimetype histogram of user entries |
+| `all_entry_count` | 16 | 9 | **no** |
+
+The seven-entry gap is exactly accounted for: five metadata entries the source carries
+beyond `Counter` (`Creator`, `Date`, `Description`, `Language`, `Title`) plus the two Xapian
+entries of the source's fulltext index, which the copy did not request. `zim_metadata_keys`
+on the copy returns `[Counter]` alone, and `zim_main_entry` returns `NULL` where the source
+returns `A/Photosynthesis`.
+
+This is not a defect and nothing in the writer can fix it — the information is not in the
+input relation. It means the round-trip test must assert `entry_count` and `zim_counter()`,
+and assert the *direction* of `all_entry_count` (copy ⊆ source) rather than equality. A
+caller who wants the metadata back passes it as options; that is the design, and
+`docs/writing.md` says so where the whole-archive copy example lives.
+
+**It is also not an identity for aliases**, and the way that fails is quiet. An alias read back
 through `read_zim` is indistinguishable from a normal item — same `is_redirect = false`,
 same mimetype, same size, `redirect_path` NULL — so writing it back produces a full
 duplicate item rather than an alias. The archive stays semantically equivalent to a reader
 but gains a second copy of the data and a Counter that differs.
 
 A "content matches" assertion passes in exactly that case. **The round-trip test must
-assert `entry_count`, `all_entry_count` and `zim_counter()` alongside content**, or it is a
-check that cannot fail where the round trip is not an identity.
+assert the archive-level counters alongside content**, or it is a check that cannot fail
+where the round trip is not an identity — but it must assert what is actually assertable:
+`entry_count` and `zim_counter()` as equalities, and `all_entry_count` as an inequality,
+per the table above. Demanding equality on all three (as this section originally did) is
+unsatisfiable, and a mandate that cannot be met is worse than none: it gets quietly dropped,
+which is what happened — the test asserted `entry_count` alone.
 
-> **Read the source as `BLOB`, never with `content_as_varchar := true`.** This looks like a
-> convenience and is actually silent data loss. `content_as_varchar` returns `NULL` for any
-> entry whose bytes are not valid UTF-8 — which is every image, font and media file in a real
-> archive — so a copy driven by it writes **empty content** for exactly those entries, and a
-> content-comparison test still passes because `NULL = NULL` on both sides.
+> **Read the source as `BLOB`, never with `content_as_varchar := true`.**
+> `content_as_varchar` returns `NULL` for any entry whose bytes are not valid UTF-8 — which
+> is every image, font and media file in a real archive.
 >
 > Found during implementation: the round-trip test as originally specified read the fixture
 > with `content_as_varchar := true`, and the fixture's binary `I/logo.png` would have been
-> copied as an empty entry with the test reporting success. The rule generalises beyond the
-> test — **any** ZIM→ZIM copy must move content as `BLOB`. The `NULL`-not-mangled behaviour is
-> correct for *reading* text (it is what keeps `zim_get_text` honest); it is catastrophic for
-> *copying*, because the copy has no way to tell "this entry was empty" from "this entry was
-> binary and I dropped it".
+> copied as an **empty entry with the test reporting success** — the copy wrote nothing and
+> the comparison passed, because `NULL = NULL` on both sides. That was silent data loss.
+>
+> **The sink now rejects NULL `content` on a non-redirect row** (§4.2), so this specific
+> mistake fails loudly, naming the entry, instead of producing a quietly hollowed-out
+> archive. The rule still stands — **any** ZIM→ZIM copy must move content as `BLOB` — but it
+> is now enforced rather than merely documented. The `NULL`-not-mangled behaviour is correct
+> for *reading* text (it is what keeps `zim_get_text` honest); it is only for *copying* that
+> it must be refused, because the copy has no way to tell "this entry was empty" from "this
+> entry was binary and I dropped it".
 
 ### 8.1 Aliases can be preserved — via a private API
 
@@ -715,7 +795,7 @@ Every item below is a regression test, not a manual check.
 | Test | Asserts |
 |---|---|
 | minimal write | a one-item archive opens and `read_zim` returns the row |
-| round trip | content **and** `entry_count`, `all_entry_count`, `zim_counter()` (§8) |
+| round trip | content **and** `entry_count` = , `zim_counter()` = , `all_entry_count` < , plus the *cause* of that inequality (metadata keys and main entry dropped) — see §8's table for why equality on all three is unsatisfiable |
 | round trip of a **binary** entry | content compared as `BLOB`; must fail if binary entries are dropped. Reading the source with `content_as_varchar := true` silently NULLs non-UTF-8 entries and the comparison still passes (§8) |
 | metadata | every option in §3.1 reads back via `zim_metadata` |
 | `ILLUSTRATION` byte fidelity | the stored PNG reads back **byte-identical** via `zim_illustration`, and `octet_length` matches. The payload **must contain bytes ≥ 0x80** — DuckDB's `Value::ToString()` on a `BLOB` escapes non-ASCII as `\xHH`, so an ASCII-only payload passes even when the extraction is broken (§4.3) |
@@ -729,6 +809,18 @@ Every item below is a regression test, not a manual check.
 | error path never finalizes | no code path calls `finishZimCreation()` while unwinding — the actual §7.2 guarantee |
 | invalid `MAIN_PATH` | errors rather than writing a mainless archive (§7.3) |
 | `FILE_SIZE_BYTES` | rejected, not ignored (§3.2) |
+| `PER_THREAD_OUTPUT` | rejected, not ignored — it would silently write one archive per thread, each with its own dedup set and metadata (§3.3), and **no `.zim` survives** |
+| a NULL option value | rejected naming the option, for *every* option. Must be spelled `row(NULL)`: DuckDB's binder rejects a bare `NULL` itself, before unpacking unnamed structs, so a bare-`NULL` test passes even with the guard deleted |
+| a NULL value inside `METADATA` | rejected — the option-level guard cannot see inside the map, and `ToString()` would write the literal string `"NULL"` |
+| wrong column SQL type | rejected at **bind** naming the column and both types — not an `InternalException` from the sink mid-write (§4.1) |
+| NULL `content`, non-redirect row | error naming the row's `path`; **not** a silently-empty entry (§4.2) |
+| NULL `content`, redirect row | accepted — a redirect has no content of its own |
+| duplicate skipped by `first` + dangling redirect | **succeeds**: a row that is never written must not register a redirect target for finalize to reject |
+| zero-row input | writes a valid, empty archive — finalize must not assume a row was seen |
+| `WORKERS` / `CLUSTER_SIZE` / `COMPRESSION 'none'` | bind and round-trip (no reader surface exists for any of them); `0` rejected for both numeric options, and `WORKERS` bounded above |
+| `COMPRESSION 'lzma'` | its own message ("no longer in the format"), distinct from the generic list |
+| `INDEX_LANGUAGE` alone | indexes and stems, and writes **no** `Language` metadata — otherwise indistinguishable from the `LANGUAGE`-derived default |
+| `front_article` / `compress` | bind and round-trip; libzim consumes both hints and the format preserves no readable trace, so a smoke test is the strongest available check |
 | `content` and `content_path` both set | error naming the row's `path` (§4.2) |
 | neither content column set | error naming the row's `path` (§4.2) |
 | naive round trip | `COPY (FROM read_zim(x)) TO y` **binds and succeeds** (§6.1) |
