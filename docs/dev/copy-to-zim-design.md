@@ -20,8 +20,9 @@ TO 'out.zim' (FORMAT zim, TITLE 'My Archive', LANGUAGE 'eng');
 ```
 
 The design goal is that **`read_zim`'s output schema is `COPY`'s input schema**, so a
-ZIM→ZIM copy is close to an identity and can serve as a conformance test. Section 8
-documents exactly where that identity does and does not hold.
+ZIM→ZIM copy is close to an identity and can serve as a conformance test. That is a goal,
+not a description: §6 covers the reader and writer changes needed to make it true, and §8
+covers where the identity still does not hold once they are made.
 
 ## 2. The engine constraint that shapes everything
 
@@ -255,6 +256,75 @@ content stream cannot produce an archive with content but no identity.
 
 ## 6. Interaction with the reader
 
+### 6.0 The round trip does not currently type-check
+
+The claim in §1 — that `read_zim`'s output schema is `COPY`'s input schema — is **not true
+of the reader as it stands**, and this is the gap to close:
+
+| | columns |
+|---|---|
+| reader emits | `path, title, mimetype, is_redirect, redirect_path, size, content [, file_path]` |
+| writer accepts | `path, title, mimetype, content, content_path, entry_kind, target, front_article, compress` |
+| overlap | `path, title, mimetype, content` |
+
+`COPY (FROM read_zim('a.zim')) TO 'b.zim' (FORMAT zim)` would fail at bind on
+`is_redirect`. Two complementary changes close it, on opposite sides.
+
+### 6.1 Writer side — tolerate the reader's native columns
+
+The writer recognises the reader's spelling and maps it, rather than erroring:
+
+| reader column | writer treatment |
+|---|---|
+| `is_redirect` + `redirect_path` | mapped to `entry_kind` / `target` |
+| `size` | ignored — libzim derives it |
+| `file_path` | ignored — provenance, not content |
+| anything else unrecognised | **still an error** |
+
+This is a fixed, known list, so it does not weaken the typo guard: `titel` still fails.
+Supplying both spellings (`is_redirect` *and* `entry_kind`) is an error rather than
+last-wins, consistent with §3.1.
+
+Note the two spellings are **not equivalent**, which is why the writer keeps the enum as its
+own contract: `is_redirect BOOLEAN` + `redirect_path` cannot express an *alias*. Adding an
+`is_alias BOOLEAN` beside `is_redirect` would reintroduce exactly the illegal state
+(`is_redirect AND is_alias`) that the enum exists to prevent. The reader's schema is
+strictly less expressive, so the mapping is one-way: reader → `item`/`redirect` only.
+
+### 6.2 Reader side — `content_mode`
+
+Content is the dimension that actually differs between reading *to look at* and reading
+*to write back*, so that is what the parameter names — not the destination.
+
+`read_zim(files, …, content_mode := 'inline' | 'reference' | 'smart')`
+
+| Mode | Content columns emitted | Reads content? | Use |
+|---|---|---|---|
+| `inline` (default) | `content` | per `include_content` | today's behaviour, unchanged |
+| `reference` | `content_path` | **no** | subset / augment — lazy by construction |
+| `smart` | `content` **and** `content_path` | for the selected subset only | mixed corpora |
+
+`reference` emits `zim://<archive>/<path>` per row, so a subset needs no string
+concatenation and materialises nothing:
+
+```sql
+COPY (SELECT * FROM read_zim('big.zim', content_mode := 'reference')
+      WHERE path LIKE 'science/%')
+TO 'subset.zim' (FORMAT zim);
+```
+
+`smart` emits both columns with **exactly one non-NULL per row** — which is precisely the
+writer's rule from §4.2, so the two halves meet without an adapter. It is the augment case:
+convert the text, reference everything else.
+
+`inline` remains the default. The reader is released; changing the shape of an existing
+query's result is not something a new feature gets to do.
+
+Redirect rows carry no content in any mode: both content columns are NULL and
+`is_redirect`/`redirect_path` describe the entry.
+
+### 6.3 What carries over
+
 Three things already in the extension carry over and should not be rebuilt:
 
 - **The `zim://` grammar** — §4.2 reuses it verbatim as the source-mode locator, so the URI
@@ -447,13 +517,16 @@ on `read_zim`), so it is **v2 or later**. v1 documents the alias non-identity.
 
 **v1** — items only, inline content only. Columns `path`, `content`, `title`, `mimetype`,
 `front_article`, `compress`; all options in §3.1; §7.1, §7.2, §7.3, §7.5 handled; §7.4 not
-reachable without redirects. `content_path` and `PARTITION_BY` are rejected with "not yet
-supported" rather than "unknown", so the deferral reads as deferral.
+reachable without redirects. **Writer tolerance (§6.1) is v1**, because it is what makes the
+naive round trip work and the conformance test exist at all; `is_redirect` maps to a
+redirect entry even though `entry_kind` is not yet a column the user can write.
+`content_path` and `PARTITION_BY` are rejected with "not yet supported" rather than
+"unknown", so the deferral reads as deferral.
 
 **v2, immediately following** — `content_path` in both its forms (local file, and the
-`zim://` locator driving the subset/augment use cases), `entry_kind`/`target`, §7.4, and
-`PARTITION_BY` (§3.3). The v1 column contract is unchanged by all of this: v2 only adds
-columns, never renames or retypes one.
+`zim://` locator driving the subset/augment use cases), the reader's `content_mode` (§6.2),
+`entry_kind`/`target`, §7.4, and `PARTITION_BY` (§3.3). The v1 column contract is unchanged
+by all of this: v2 only adds columns, never renames or retypes one.
 
 **Later** — alias preservation (§8.1), contingent on reader changes; `zim_uri()` sugar (§6);
 per-partition metadata templating (§3.3).
@@ -477,6 +550,11 @@ Every item below is a regression test, not a manual check.
 | `FILE_SIZE_BYTES` | rejected, not ignored (§3.2) |
 | `content` and `content_path` both set | error naming the row's `path` (§4.2) |
 | neither content column set | error naming the row's `path` (§4.2) |
+| naive round trip | `COPY (FROM read_zim(x)) TO y` **binds and succeeds** (§6.1) |
+| `size` / `file_path` present | ignored, not an error (§6.1) |
+| `is_redirect` + `redirect_path` | mapped to a redirect entry (§6.1) |
+| both spellings supplied | `is_redirect` *and* `entry_kind` together is an error (§6.1) |
+| a genuinely unknown column | still an error — `titel` fails (§6.1) |
 | `INDEX true` | `zim_search` finds an entry in the written archive |
 | `INDEX true` without a language | clear error |
 | `INDEX true` on WASM | clear error — Xapian is absent, must not silently no-op |
@@ -489,6 +567,10 @@ v2 adds:
 |---|---|
 | `content_path` from disk | bytes match the source file; no buffering of the whole file |
 | `zim://` locator | subset of a source archive round-trips; **content is pulled lazily**, i.e. no read happens during the sink |
+| `content_mode := 'reference'` | emits `content_path`, not `content`; **reads no content at all** (§6.2) |
+| `content_mode := 'smart'` | emits both columns, exactly one non-NULL per row (§6.2) |
+| `content_mode` default | absent parameter emits today's schema unchanged — no existing query shifts (§6.2) |
+| redirect row in every mode | both content columns NULL (§6.2) |
 | `zim://` to a missing entry | clear error naming the URI |
 | non-local scheme in `content_path` | rejected (§4.2), not silently buffered |
 | `PARTITION_BY` | one archive per key, each independently openable by `read_zim` |
