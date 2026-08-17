@@ -656,11 +656,15 @@ SELECT count(*) FROM read_zim('__TEST_DIR__/aborted.zim');
 ----
 failed to open ZIM
 
-# and the predicate agrees
+# and nothing was left at the output path
+# NOTE: assert absence with glob(), not zim_check(). `zim_check` returns false for
+# BOTH "file absent" and "file present but corrupt", so it cannot distinguish the
+# two -- and on this branch it raises for an unopenable archive anyway (that fix
+# lives in a sibling PR). A zero glob count means exactly "no file".
 query I
-SELECT zim_check('__TEST_DIR__/aborted.zim');
+SELECT count(*) FROM glob('__TEST_DIR__/aborted.zim');
 ----
-false
+0
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
@@ -753,11 +757,11 @@ TO '__TEST_DIR__/dup.zim' (FORMAT zim);
 ----
 duplicate path 'A/Dup'
 
-# and it left nothing behind
+# and it left nothing behind (glob, not zim_check -- see the note above)
 query I
-SELECT zim_check('__TEST_DIR__/dup.zim');
+SELECT count(*) FROM glob('__TEST_DIR__/dup.zim');
 ----
-false
+0
 
 # ON_CONFLICT 'first' keeps the first occurrence
 statement ok
@@ -939,9 +943,9 @@ TO '__TEST_DIR__/badmain.zim' (FORMAT zim, MAIN_PATH 'A/Missing');
 MAIN_PATH 'A/Missing' does not match any entry
 
 query I
-SELECT zim_check('__TEST_DIR__/badmain.zim');
+SELECT count(*) FROM glob('__TEST_DIR__/badmain.zim');
 ----
-false
+0
 
 # a metadata key given twice, once named and once in the map, is an error
 statement error
