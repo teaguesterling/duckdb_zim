@@ -380,6 +380,57 @@ TO '__TEST_DIR__/noidxlang.zim' (FORMAT zim, INDEX true);
 ----
 INDEX requires a language
 
+# ...and the mirror: a language with no INDEX. ZimWriter only calls
+# configIndexing() when config.index is set, so this wrote an archive with NO
+# fulltext index -- measured before the fix: it succeeded and zim_search()
+# returned 0 rows against the result, with no error anywhere. Rejected rather
+# than treated as an implicit INDEX true: indexing costs time and bytes, and
+# doing more than was asked is its own surprise.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/langnoidx.zim' (FORMAT zim, INDEX_LANGUAGE 'eng');
+----
+INDEX_LANGUAGE has no effect without INDEX true
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/langnoidx.zim');
+----
+0
+
+# LANGUAGE (the metadata option) does NOT trip that check -- it only feeds the
+# index language when INDEX true was also asked for. Writing plain metadata with
+# no index must stay legal.
+statement ok
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/langonly.zim' (FORMAT zim, LANGUAGE 'eng');
+
+# --- MAIN_PATH and INDEX_LANGUAGE are VARCHAR, like every other ToString() option
+# ToString() is a formatted cast: on a BLOB it goes through CastFromBlob and
+# \x-escapes every byte >= 0x80. METADATA and ILLUSTRATION already guard against
+# that; these two did not. Measured before the fix: MAIN_PATH encode('A/café')
+# became the 12-character 'A/caf\xC3\xA9' and failed the finalize check naming a
+# path the caller never typed, and INDEX_LANGUAGE encode('eng') silently
+# configured a mangled stemmer language.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/mainblob.zim' (FORMAT zim, MAIN_PATH encode('A/x'));
+----
+MAIN_PATH must be VARCHAR, not BLOB
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/idxlangblob.zim' (FORMAT zim, INDEX true, INDEX_LANGUAGE encode('eng'));
+----
+INDEX_LANGUAGE must be VARCHAR, not BLOB
+
+# the rejection has to be about the TYPE, not about the escaping being visible:
+# an all-ASCII BLOB escapes to itself, so it would sail through a check that only
+# compared the round-tripped string.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/mainblob.zim');
+----
+0
+
 statement error
 COPY (SELECT 'A/x' AS path, 'y' AS content)
 TO '__TEST_DIR__/badcomp.zim' (FORMAT zim, COMPRESSION 'gzip');

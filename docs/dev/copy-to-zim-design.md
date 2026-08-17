@@ -60,7 +60,7 @@ COPY <query-or-table> TO '<path>.zim' (FORMAT zim [, option …]);
 | `ILLUSTRATION` | BLOB | — | 48×48 PNG cover image |
 | `MAIN_PATH` | VARCHAR | — | landing page; **must match an item in the input** (§7.3) |
 | `INDEX` | BOOLEAN | `false` | build a Xapian fulltext index |
-| `INDEX_LANGUAGE` | VARCHAR | `LANGUAGE` | stemming language for the index |
+| `INDEX_LANGUAGE` | VARCHAR | `LANGUAGE` | stemming language for the index; requires `INDEX true` |
 | `COMPRESSION` | VARCHAR | `zstd` | `zstd` \| `none` — see below |
 | `CLUSTER_SIZE` | BIGINT | libzim default | target uncompressed cluster size in bytes |
 | `WORKERS` | BIGINT | `4` | libzim's internal worker count |
@@ -88,6 +88,27 @@ with a message that says the format dropped it, rather than silently falling bac
 a caller who asked for a specific compression and got a different one has been lied to.
 (Found during implementation; the original three-value list here was written from the
 `configCompression` signature without checking the enum.)
+
+**`INDEX_LANGUAGE` without `INDEX true` is an error, and is not taken as a request to
+index.** Found in review. `ZimWriter`'s constructor only calls `configIndexing()` when
+`config.index` is set, so `INDEX_LANGUAGE 'eng'` on its own wrote an archive with no
+fulltext index — measured, `zim_search()` returns zero rows against it, with no error
+anywhere. That is the same "unsearchable archive that was asked to be searchable" failure
+this section already rejects from the other direction (`INDEX true` with no resolvable
+language); someone who named a stemming language asked for a searchable archive.
+
+Rejecting is the fix rather than implying `INDEX true`. Indexing costs time and bytes, and
+turning it on because a language was mentioned would be its own surprise — this design does
+not silently do *more* than it was asked any more than it silently does less.
+
+**Options read with `ToString()` must check for VARCHAR first.** `Value::ToString()` is a
+formatted cast: on a BLOB it goes through `CastFromBlob` and `\x`-escapes every byte ≥
+0x80. `METADATA`, the named metadata options and `ILLUSTRATION` guard against that;
+`MAIN_PATH` and `INDEX_LANGUAGE` did not, which review caught. `MAIN_PATH encode('A/café')`
+became the 12-character `A/caf\xC3\xA9` and then failed §7.3's finalize check with a
+message naming a path the caller never typed, and `INDEX_LANGUAGE <blob>` silently
+configured a mangled stemmer. All five now share one `require_varchar` helper so a new
+option cannot forget the guard.
 
 **No metadata is required.** Measured: an archive with no metadata at all is written
 successfully by libzim and *served* by kiwix-serve 3.8.2 (HTTP 200, viewer renders). So
@@ -888,7 +909,9 @@ Every item below is a regression test, not a manual check.
 | zero-row input | writes a valid, empty archive — finalize must not assume a row was seen |
 | `WORKERS` / `CLUSTER_SIZE` / `COMPRESSION 'none'` | bind and round-trip (no reader surface exists for any of them); `0` rejected for both numeric options, and `WORKERS` bounded above |
 | `COMPRESSION 'lzma'` | its own message ("no longer in the format"), distinct from the generic list |
-| `INDEX_LANGUAGE` alone | indexes and stems, and writes **no** `Language` metadata — otherwise indistinguishable from the `LANGUAGE`-derived default |
+| `INDEX true` + `INDEX_LANGUAGE` | indexes and stems, and writes **no** `Language` metadata — otherwise indistinguishable from the `LANGUAGE`-derived default |
+| `INDEX_LANGUAGE` alone | rejected at bind: it would silently write an unindexed archive (§3.1) |
+| `MAIN_PATH` / `INDEX_LANGUAGE` given a BLOB | rejected at bind, like `METADATA` and `ILLUSTRATION` — `ToString()` would `\x`-escape it (§3.1) |
 | `front_article` / `compress` | bind and round-trip; libzim consumes both hints and the format preserves no readable trace, so a smoke test is the strongest available check |
 | `content` and `content_path` both set | error naming the row's `path` (§4.2) |
 | neither content column set | error naming the row's `path` (§4.2) |

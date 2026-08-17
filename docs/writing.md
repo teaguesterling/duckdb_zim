@@ -116,6 +116,11 @@ same setting; supplying both for one key is a bind-time error rather than last-w
     unsearchable archive that was asked to be searchable. On a build with no Xapian support
     (WebAssembly), requesting `INDEX true` is also a bind-time error — never a silent no-op.
 
+    The reverse is an error too: `INDEX_LANGUAGE` alone doesn't turn indexing on, so it
+    would write an unindexed archive while looking like a request for a searchable one.
+    Pass `INDEX true` alongside it. It isn't taken as an implicit `INDEX true` because
+    indexing costs time and bytes, and doing more than you asked for is its own surprise.
+
 !!! note "`ON_CONFLICT 'last'` isn't offered"
     `'error'` (the default) fails on the first duplicate `path`, naming it. `'first'` keeps
     the first occurrence and skips the rest. `'last'` would require buffering every row

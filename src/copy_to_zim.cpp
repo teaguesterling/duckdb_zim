@@ -255,6 +255,21 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 	                             ? "application/octet-stream"
 	                             : "text/plain";
 
+	// Value::ToString() is a FORMATTED cast, not a raw extraction: on a BLOB it goes
+	// through CastFromBlob and \x-escapes every byte >= 0x80. So every option whose
+	// value is read with ToString() has to establish that the value really is VARCHAR
+	// first, or a BLOB argument is silently mangled rather than rejected -- e.g.
+	// MAIN_PATH encode('A/café') became the 12-character 'A/caf\xC3\xA9' and then
+	// failed ZimCopyFinalize's check with a message naming a path the caller never
+	// typed. Shared by every such branch so a new option cannot forget it.
+	auto require_varchar = [](const Value &value, const string &option_name) {
+		if (value.type().id() != LogicalTypeId::VARCHAR) {
+			throw BinderException("COPY TO (FORMAT zim): %s must be VARCHAR, not %s -- ToString() escapes "
+			                      "binary content instead of passing it through",
+			                      StringUtil::Upper(option_name), value.type().ToString());
+		}
+	};
+
 	// DuckDB's binder consumes every DuckDB-level COPY option (partition_by,
 	// overwrite, etc.) before we get here, and strips FORMAT too -- so
 	// input.info.options holds only options unrecognised at that level. This loop
@@ -297,15 +312,9 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 				throw BinderException("COPY TO (FORMAT zim): ON_CONFLICT must be 'error' or 'first'");
 			}
 		} else if (METADATA_OPTIONS.count(key)) {
-			// Same VARCHAR guard as the METADATA map branch below: value.ToString() is a
-			// formatted cast that \x-escapes bytes >= 0x80 on a BLOB (CastFromBlob). Named
-			// metadata options are text by contract, but nothing stops a caller from passing
-			// a BLOB literal, so reject that explicitly rather than silently corrupting it.
-			if (value.type().id() != LogicalTypeId::VARCHAR) {
-				throw BinderException("COPY TO (FORMAT zim): %s must be VARCHAR, not %s -- ToString() escapes "
-				                      "binary content instead of passing it through",
-				                      StringUtil::Upper(option.first), value.type().ToString());
-			}
+			// Named metadata options are text by contract, but nothing stops a caller from
+			// passing a BLOB literal, so reject that explicitly rather than corrupting it.
+			require_varchar(value, option.first);
 			SetMetadata(bind->config, METADATA_OPTIONS.at(key), value.ToString());
 		} else if (key == "metadata") {
 			if (value.type().id() != LogicalTypeId::MAP) {
@@ -350,10 +359,18 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 			}
 			bind->config.illustration = StringValue::Get(value);
 		} else if (key == "main_path") {
+			// An entry path is text; a BLOB here would be \x-escaped into a path that
+			// matches nothing, and the failure would surface from ZimCopyFinalize as
+			// "MAIN_PATH '...' does not match any entry" naming a mangled string.
+			require_varchar(value, option.first);
 			bind->config.main_path = value.ToString();
 		} else if (key == "index") {
 			bind->config.index = BooleanValue::Get(value.DefaultCastAs(LogicalType::BOOLEAN));
 		} else if (key == "index_language") {
+			// A mangled stemmer language does not fail at all -- libzim takes whatever
+			// string it is handed -- so an escaped BLOB would just silently configure the
+			// wrong stemmer.
+			require_varchar(value, option.first);
 			bind->config.index_language = value.ToString();
 		} else if (key == "compression") {
 			auto comp = StringUtil::Lower(value.ToString());
@@ -395,6 +412,24 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 		} else {
 			throw BinderException("COPY TO (FORMAT zim): unknown option '%s'", option.first);
 		}
+	}
+
+	// The mirror of the INDEX-without-a-language error below. ZimWriter only calls
+	// configIndexing() when config.index is set, so INDEX_LANGUAGE on its own writes
+	// an archive with no fulltext index at all -- measured: zim_search() returns zero
+	// rows against it, with no error anywhere. Someone who named a stemming language
+	// asked for a searchable archive, and got the same unsearchable one they would
+	// have got by saying nothing.
+	//
+	// Erroring is the fix, NOT implying INDEX true. Turning indexing on because a
+	// language was mentioned is its own surprise (indexing costs time and bytes), and
+	// this design does not silently do more than it was asked to any more than it
+	// silently does less. This check must run BEFORE the LANGUAGE-metadata defaulting
+	// below, which would otherwise make its condition unreadable.
+	if (!bind->config.index_language.empty() && !bind->config.index) {
+		throw BinderException("COPY TO (FORMAT zim): INDEX_LANGUAGE has no effect without INDEX true -- it only "
+		                      "chooses the stemming language for a fulltext index that is not being built. Pass "
+		                      "INDEX true as well to write one, or drop INDEX_LANGUAGE.");
 	}
 
 	// Indexing is off unless requested (design §3.1). A requested index with no
