@@ -574,7 +574,48 @@ something the destructor removes, the prior state is restored exactly.
 **The `.tmp` sibling.** An aborted write leaves libzim's `<target>.tmp` to libzim's own
 destructor. Task 2's implementer confirmed by `strace` that it is removed. If that ever
 proves untrue, the fix is to unlink `<target>.tmp` alongside the target — noted here so the
-next person does not have to re-derive it.
+next person does not have to re-derive it. There is one case where it *is* untrue and the
+unlink is now done here: see §7.2.1.
+
+#### 7.2.1 `finishZimCreation()` returning is not proof an archive exists
+
+The mirror image of §7.2, found in review. `finishZimCreation()` ends with
+
+```c
+  DEFAULTFS::rename(data->tmpFileName, data->zimName);   // creator.cpp:456
+  data->tmpFileName.clear();                             // creator.cpp:457
+```
+
+and libzim's `FS::rename` (`src/fs_unix.cpp:103`) calls `::rename()` and **discards the
+return value**. A failed rename is therefore indistinguishable from a successful one from
+inside libzim: no throw, no status, no log. `copy_to_finalize` used to take the return of
+`Finish()` as proof of success and set `finished = true`, which also suppressed the
+destructor's cleanup — so `COPY` reported success, exit 0, over an output that did not
+exist.
+
+**This is reachable from this extension's own refusals, not just from a hostile
+filesystem.** `PhysicalCopyToFile::GetGlobalSinkState` calls `CreateDirectory(file_path)`
+*before* `initialize_operator` runs, so a `PER_THREAD_OUTPUT` copy that §3.2 correctly
+rejects has already left a **directory** at the target path. The obvious retry without the
+option then renames onto a directory, fails with `EISDIR`/`ENOTDIR`, and "succeeds". The
+bind-time overwrite check does not catch it either: `FileExists` is `S_ISREG`-gated, so a
+directory at the target reads as "nothing there".
+
+So `copy_to_finalize` **verifies the output file exists after `Finish()` returns**, and
+throws an `IOException` naming the path if it does not. Two ordering details are
+load-bearing:
+
+- the check runs **before** `finished = true`, so the destructor's cleanup still applies on
+  this path;
+- the `<target>.tmp` is removed **here**, explicitly, because line 457 above clears
+  `tmpFileName` immediately after the failed rename — which disarms `~CreatorData`'s own
+  "remove the .tmp" (`creator.cpp:644`) and would otherwise leave the half-written sibling
+  behind. This is the exception the `.tmp` note above refers to.
+
+This is a *completeness* check of the weakest possible kind — file present or not — and it
+does not contradict §7.2's point that no post-hoc validation can distinguish a truncated
+finalized archive from a whole one. Nothing here inspects the bytes. It only catches the
+case where there are no bytes at all.
 
 ### 7.3 Invalid `MAIN_PATH` is silent in libzim
 

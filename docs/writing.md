@@ -153,6 +153,20 @@ libzim writes to a `.tmp` sibling and only renames it into place once the archiv
 complete, and `COPY` never finalizes while unwinding, so a failed write cannot leave a
 plausible-looking archive behind.
 
+The converse is checked too: a `COPY` that reports success has definitely produced a file.
+libzim's final rename does not report failure, so if the output path is a **directory**, or
+is not writable, the write can run to completion and land nowhere. `COPY` verifies the
+archive exists before it reports success and raises otherwise, naming the output path:
+
+```
+COPY TO (FORMAT zim): no archive was written to 'out.zim'. …
+```
+
+The most likely way to meet this is a rejected `PER_THREAD_OUTPUT` or `PARTITION_BY` write:
+DuckDB creates a directory at the output path before the zim writer gets to refuse the
+option, so the same path is a directory when you retry without it. Remove the directory
+before retrying.
+
 ## Aliases are not preserved
 
 An alias in a source archive shares its target's stored bytes, but `read_zim` can't tell an

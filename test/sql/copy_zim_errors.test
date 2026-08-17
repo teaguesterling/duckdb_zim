@@ -449,6 +449,38 @@ SELECT count(*) FROM glob('__TEST_DIR__/pto/**/*.zim');
 ----
 0
 
+# --- COPY must not report success when no archive was written ---------------
+# The refusal above is not free: PhysicalCopyToFile::GetGlobalSinkState calls
+# CreateDirectory(file_path) BEFORE initialize_operator runs, so the statement
+# that was rejected has already left a DIRECTORY at __TEST_DIR__/pto. The obvious
+# next thing a user types is the same COPY without the option -- and that target
+# is now a directory.
+#
+# libzim's finishZimCreation() ends with rename("<target>.tmp", "<target>"), and
+# FS::rename (src/fs_unix.cpp:103) discards ::rename()'s return value, so the
+# rename failing against a directory raises nothing. Measured before the fix:
+# this reported success, exited 0, wrote no archive, and left a stray
+# __TEST_DIR__/pto.tmp behind. Depends on the PER_THREAD_OUTPUT statement above
+# having created the directory -- do not reorder them.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content) TO '__TEST_DIR__/pto' (FORMAT zim);
+----
+no archive was written to
+
+# the error names the output path, so the message points at the real problem
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content) TO '__TEST_DIR__/pto' (FORMAT zim);
+----
+pto
+
+# and the half-written sibling is gone. libzim clears tmpFileName right after the
+# rename call, so ~CreatorData's own cleanup no longer fires for it -- Finalize
+# removes it explicitly. glob() matches files, not the pto directory itself.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/pto.tmp');
+----
+0
+
 # FILE_SIZE_BYTES is also consumed by DuckDB's binder before copy_to_bind, but
 # DuckDB itself rejects it for any format that leaves CopyFunction::rotate_files
 # unset (nullptr) -- which this extension deliberately does. No code here

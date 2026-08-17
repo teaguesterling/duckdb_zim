@@ -569,11 +569,46 @@ void ZimCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	}
 
 	gstate.writer->Finish();
-	// Set `finished` the instant Finish() returns, BEFORE reset(). Once
-	// finishZimCreation() has returned, the archive on disk is complete, so nothing
-	// after this point may lead to it being unlinked. ~Creator is effectively
-	// noexcept, so a throw from reset() is not reachable -- but ordering it this way
-	// costs nothing and removes the question.
+
+	// Finish() returning is NOT proof that an archive was written. finishZimCreation()
+	// ends with DEFAULTFS::rename("<target>.tmp", "<target>"), and libzim's FS::rename
+	// (src/fs_unix.cpp:103) calls ::rename() and DISCARDS its return value -- no throw,
+	// no status, nothing. So a failed rename is indistinguishable from a successful one
+	// from inside libzim, and COPY would report success over an output that does not
+	// exist. That is reachable from this extension's own error paths: PhysicalCopyToFile
+	// ::GetGlobalSinkState CreateDirectory()s the target before initialize_operator can
+	// refuse PER_THREAD_OUTPUT, so the obvious retry without that option targets a path
+	// that is now a DIRECTORY -- ::rename() fails with EISDIR/ENOTDIR and the copy
+	// "succeeds" having written nothing.
+	//
+	// Check the file is really there, and throw BEFORE setting `finished`, so the
+	// destructor's cleanup still runs on this path.
+	auto &fs = FileSystem::GetFileSystem(context);
+	if (!fs.FileExists(gstate.out_path)) {
+		// libzim clears tmpFileName immediately after the rename call (creator.cpp:457),
+		// so ~CreatorData's own "remove the .tmp" (creator.cpp:644) no longer fires and
+		// the half-written sibling would be left behind. Drop libzim's handle first, then
+		// remove it ourselves. A failure to clean up must not mask the real error below.
+		gstate.writer.reset();
+		try {
+			auto tmp_path = gstate.out_path + ".tmp";
+			if (fs.FileExists(tmp_path)) {
+				fs.RemoveFile(tmp_path);
+			}
+		} catch (const std::exception &) { // NOLINT: the throw below is the real error
+		}
+		throw IOException("COPY TO (FORMAT zim): no archive was written to '%s'. libzim finished the archive "
+		                  "but its final rename from '%s.tmp' did not produce that file, and libzim discards "
+		                  "the return value of ::rename() so it cannot report why. The usual cause is that "
+		                  "the output path is a directory, or is not writable. Nothing was left behind.",
+		                  gstate.out_path, gstate.out_path);
+	}
+
+	// Set `finished` the instant the output has been confirmed, BEFORE reset(). Once
+	// finishZimCreation() has returned and the file is there, the archive on disk is
+	// complete, so nothing after this point may lead to it being unlinked. ~Creator is
+	// effectively noexcept, so a throw from reset() is not reachable -- but ordering it
+	// this way costs nothing and removes the question.
 	gstate.finished = true; // suppresses the destructor's unlink
 	gstate.writer.reset();
 }
