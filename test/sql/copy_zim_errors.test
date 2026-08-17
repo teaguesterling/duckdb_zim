@@ -104,3 +104,23 @@ COPY (SELECT 'A/x' AS path, 'y' AS content)
 TO '__TEST_DIR__/dupbad.zim' (FORMAT zim, ON_CONFLICT 'sideways');
 ----
 ON_CONFLICT must be 'error' or 'first'
+
+# --- MAIN_PATH must name an entry the query actually produced ---------------
+statement error
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/badmain.zim' (FORMAT zim, MAIN_PATH 'A/Missing');
+----
+MAIN_PATH 'A/Missing' does not match any entry
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/badmain.zim');
+----
+0
+
+# a metadata key given twice, once named and once in the map, is an error
+statement error
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/dupmeta.zim'
+   (FORMAT zim, TITLE 'One', METADATA MAP {'Title': 'Two'});
+----
+metadata key 'Title' given twice

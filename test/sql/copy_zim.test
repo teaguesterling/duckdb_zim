@@ -61,3 +61,37 @@ query I
 SELECT mimetype FROM read_zim('__TEST_DIR__/defblob.zim');
 ----
 application/octet-stream
+
+# --- metadata options -------------------------------------------------------
+statement ok
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/meta.zim'
+   (FORMAT zim, TITLE 'My Archive', DESCRIPTION 'a test', LANGUAGE 'eng',
+    CREATOR 'me', PUBLISHER 'us', NAME 'testarchive', DATE '2026-08-17',
+    TAGS 'test;demo', MAIN_PATH 'A/Home');
+
+query I
+SELECT zim_metadata('__TEST_DIR__/meta.zim', 'Title');
+----
+My Archive
+
+query I
+SELECT zim_metadata('__TEST_DIR__/meta.zim', 'Language');
+----
+eng
+
+query I
+SELECT zim_main_entry('__TEST_DIR__/meta.zim');
+----
+A/Home
+
+# arbitrary keys via the METADATA map
+statement ok
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/meta2.zim'
+   (FORMAT zim, METADATA MAP {'Title': 'From Map', 'Source': 'nowhere'});
+
+query I
+SELECT zim_metadata('__TEST_DIR__/meta2.zim', 'Source');
+----
+nowhere

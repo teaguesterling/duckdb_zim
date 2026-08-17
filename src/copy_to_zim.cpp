@@ -84,6 +84,21 @@ struct ZimCopyGlobalState : public GlobalFunctionData {
 
 struct ZimCopyLocalState : public LocalFunctionData {};
 
+// Named metadata options are sugar for METADATA. Each maps to its ZIM key.
+const std::map<string, string> METADATA_OPTIONS = {{"title", "Title"},         {"description", "Description"},
+                                                   {"language", "Language"},   {"creator", "Creator"},
+                                                   {"publisher", "Publisher"}, {"name", "Name"},
+                                                   {"date", "Date"},           {"tags", "Tags"}};
+
+void SetMetadata(ZimWriterConfig &config, const string &key, const string &value) {
+	if (!config.metadata.insert({key, value}).second) {
+		throw BinderException(
+		    "COPY TO (FORMAT zim): metadata key '%s' given twice; specify it either as a named option "
+		    "or in METADATA, not both",
+		    key);
+	}
+}
+
 // Resolve a column by name, case-insensitively. Returns -1 when absent.
 int64_t FindColumn(const vector<string> &names, const string &want) {
 	for (idx_t i = 0; i < names.size(); i++) {
@@ -164,6 +179,21 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 			} else {
 				throw BinderException("COPY TO (FORMAT zim): ON_CONFLICT must be 'error' or 'first'");
 			}
+		} else if (METADATA_OPTIONS.count(key)) {
+			SetMetadata(bind->config, METADATA_OPTIONS.at(key), value.ToString());
+		} else if (key == "metadata") {
+			if (value.type().id() != LogicalTypeId::MAP) {
+				throw BinderException("COPY TO (FORMAT zim): METADATA must be a MAP(VARCHAR, VARCHAR)");
+			}
+			auto &entries = MapValue::GetChildren(value);
+			for (auto &entry : entries) {
+				auto &kv = StructValue::GetChildren(entry);
+				SetMetadata(bind->config, kv[0].ToString(), kv[1].ToString());
+			}
+		} else if (key == "illustration") {
+			bind->config.illustration = value.ToString();
+		} else if (key == "main_path") {
+			bind->config.main_path = value.ToString();
 		} else {
 			throw BinderException("COPY TO (FORMAT zim): unknown option '%s'", option.first);
 		}
@@ -237,7 +267,15 @@ void ZimCopyCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFu
 }
 
 void ZimCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate_p) {
+	auto &bind = bind_data.Cast<ZimCopyBindData>();
 	auto &gstate = gstate_p.Cast<ZimCopyGlobalState>();
+
+	// libzim accepts a main path that was never added and silently produces an
+	// archive with has_main_entry = false (§7.3). Validate against what we wrote.
+	if (!bind.config.main_path.empty() && !gstate.seen_paths.count(bind.config.main_path)) {
+		throw InvalidInputException("COPY TO (FORMAT zim): MAIN_PATH '%s' does not match any entry in the input",
+		                            bind.config.main_path);
+	}
 	gstate.writer->Finish();
 	gstate.writer.reset();
 	gstate.finished = true; // suppresses the destructor's unlink
