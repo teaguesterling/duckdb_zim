@@ -19,6 +19,14 @@ vcpkg_from_github(
         # (the catch still leaves stemming disabled, which is correct). Propose
         # upstream; drop this overlay once libzim stops printing to stdout.
         no-stemming-stdout.patch
+        # Local overlay only: libzim's writer defines INFO(e) as an UNGATED
+        # `std::cout << e`, unlike TINFO/TPROGRESS which check m_verbose. Four of its
+        # six call sites fire on a normal write ("Set entry indices", "Index titles",
+        # "Detect dangling redirects", "Detect loops and/or blind chains of
+        # redirects"); the other two announce removed invalid redirections. That
+        # pollutes the caller's stdout on every COPY TO. Keep log_info(), drop the
+        # print. Propose upstream; drop this overlay once libzim stops printing.
+        no-writer-stdout.patch
 )
 
 set(EXTRA_OPTIONS "")

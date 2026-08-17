@@ -122,6 +122,43 @@ SELECT count(*) FROM glob('__TEST_DIR__/badmain.zim');
 ----
 0
 
+# --- a redirect must target a path the query actually produced -------------
+# libzim silently removes dangling redirects at finishZimCreation() with no
+# throw and no warning (design §7.4) -- announcing each removal only through
+# the stdout prints task 8 suppresses. So this must be caught before libzim
+# ever sees it, the same way MAIN_PATH is validated above.
+statement error
+COPY (SELECT * FROM (VALUES
+        ('A/Home', 'hi', false, NULL),
+        ('A/Gone', NULL, true, 'A/DoesNotExist'))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/badredirect.zim' (FORMAT zim);
+----
+redirect 'A/Gone' -> 'A/DoesNotExist' does not match any entry in the input
+
+# and it left nothing behind -- zim_check() is not usable here (see the
+# identical reasoning above the other glob() checks in this file).
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/badredirect.zim');
+----
+0
+
+# a redirect declared before its target in the same COPY is fine -- finalize
+# runs only after every row has been seen, so declaration order cannot matter.
+statement ok
+COPY (SELECT * FROM (VALUES
+        ('A/Alias', NULL, true, 'A/Real'),
+        ('A/Real', 'hi', false, NULL))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/redirectorder.zim' (FORMAT zim);
+
+query II
+SELECT is_redirect, redirect_path
+FROM read_zim('__TEST_DIR__/redirectorder.zim')
+WHERE is_redirect;
+----
+true	A/Real
+
 # a metadata key given twice, once named and once in the map, is an error
 statement error
 COPY (SELECT 'A/Home' AS path, 'hi' AS content)

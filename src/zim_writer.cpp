@@ -84,6 +84,17 @@ bool ZimWriterHasFulltextIndexing() {
 #endif
 }
 
+// NOTE: libzim silently removes dangling redirects at finishZimCreation() -- no
+// throw, no warning. Before v1 could write redirects this was moot; it became
+// reachable once the writer learned read_zim's is_redirect/redirect_path
+// spelling. Before it reaches here, copy_to_zim.cpp's ZimCopyFinalize validates
+// every redirect target against the set of paths the sink actually saw and
+// throws an InvalidInputException if any target is missing -- mirroring the
+// MAIN_PATH check that already lives there. That is what keeps a dangling
+// redirect from silently dropping an entry now that libzim's own stdout
+// announcement of the removal (the two INFO() call sites this task's overlay
+// patch also silences) is no longer available as a fallback signal. See
+// docs/dev/copy-to-zim-design.md §7.4.
 void ZimWriter::Finish() {
 	for (auto &kv : impl->config.metadata) {
 		impl->creator.addMetadata(kv.first, kv.second);

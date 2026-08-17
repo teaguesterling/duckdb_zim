@@ -11,6 +11,7 @@
 
 #include "zim_writer.hpp"
 
+#include <map>
 #include <set>
 
 namespace duckdb {
@@ -85,6 +86,12 @@ struct ZimCopyGlobalState : public GlobalFunctionData {
 	string out_path;
 	unique_ptr<ZimWriter> writer;
 	std::set<string> seen_paths;
+	// Every non-empty redirect_path seen by the sink, mapped to the path of the
+	// redirect entry that named it (kept for the error message; only the first
+	// is kept if several redirects share a target). Validated against seen_paths
+	// in ZimCopyFinalize -- see the comment there and docs/dev/copy-to-zim-design.md
+	// §7.4 for why libzim cannot be trusted to catch this itself.
+	std::map<string, string> redirect_targets;
 	bool finished = false;
 };
 
@@ -374,6 +381,10 @@ void ZimCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 					throw InvalidInputException(
 					    "COPY TO (FORMAT zim): entry '%s' has is_redirect = true but no redirect_path", entry.path);
 				}
+				// Record the target for the dangling-redirect check in ZimCopyFinalize.
+				// emplace() keeps whichever redirect was seen first if several share a
+				// target; either is fine, since it is only used to name the error.
+				gstate.redirect_targets.emplace(entry.redirect_path, entry.path);
 			}
 		}
 		if (bind.cols.front_article >= 0) {
@@ -423,6 +434,26 @@ void ZimCopyFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 		throw InvalidInputException("COPY TO (FORMAT zim): MAIN_PATH '%s' does not match any entry in the input",
 		                            bind.config.main_path);
 	}
+
+	// libzim accepts addRedirection() to a target that was never added and
+	// silently REMOVES the dangling redirect at finishZimCreation() -- no throw,
+	// no warning (design §7.4). The only signal was two stdout prints that this
+	// task's overlay patch (vcpkg_ports/libzim/no-writer-stdout.patch) deletes
+	// along with the four that fire on every write, which would make the drop
+	// completely silent. Validate every redirect target against what was
+	// actually written, same as MAIN_PATH above, so this is a clear SQL error
+	// instead of a vanished entry. Order does not matter: this runs after every
+	// row has been seen, so a redirect declared before its target is fine.
+	for (auto &kv : gstate.redirect_targets) {
+		auto &target = kv.first;
+		auto &source_path = kv.second;
+		if (!gstate.seen_paths.count(target)) {
+			throw InvalidInputException(
+			    "COPY TO (FORMAT zim): redirect '%s' -> '%s' does not match any entry in the input", source_path,
+			    target);
+		}
+	}
+
 	gstate.writer->Finish();
 	gstate.writer.reset();
 	gstate.finished = true; // suppresses the destructor's unlink

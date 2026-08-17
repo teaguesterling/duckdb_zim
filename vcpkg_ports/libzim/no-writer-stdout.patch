@@ -1,0 +1,19 @@
+diff --git a/src/writer/creator.cpp b/src/writer/creator.cpp
+index c493ae9..c88cf10 100644
+--- a/src/writer/creator.cpp
++++ b/src/writer/creator.cpp
+@@ -69,10 +69,13 @@
+ 
+ log_define("zim.writer.creator")
+ 
++// Local overlay: INFO() used to write unconditionally to std::cout, unlike
++// TINFO/TPROGRESS which are gated on m_verbose. That pollutes the caller's
++// stdout on every archive write. Keep the log_info() call (which honours
++// libzim's own logging configuration) and drop the print.
+ #define INFO(e) \
+     do { \
+         log_info(e); \
+-        std::cout << e << std::endl; \
+     } while(false)
+ 
+ #define TINFO(e) \
