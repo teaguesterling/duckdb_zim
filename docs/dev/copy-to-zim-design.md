@@ -460,10 +460,17 @@ internal, and it makes `ON_CONFLICT` implementable:
 The memory cost is one copy of every path. On a 15,000-entry archive that is negligible;
 on a pathological one it is bounded by the path set, not the content.
 
-### 7.2 A failed write leaves a healthy-looking archive
+### 7.2 A *finalized* failed write leaves a healthy-looking archive
 
-**This is the most important finding in this document.** Measured: after a duplicate-path
-throw mid-stream, the 35,069-byte output file is *not* litter. It is a valid archive.
+> **Corrected during implementation.** This section originally claimed that any mid-stream
+> failure leaves a valid-looking archive at the output path, and called that the most
+> important finding in the document. That is **not true of this implementation**, and the
+> claim was built on a measurement of a different mechanism. The hazard is real but
+> narrower than stated. Both the original measurement and the correction are kept below,
+> because the reconciliation is the useful part.
+
+**What was measured (python-libzim):** after a duplicate-path throw mid-stream, a
+35,069-byte file at the output path was *not* litter — it was a valid archive.
 
 | check | result |
 |---|---|
@@ -474,19 +481,40 @@ throw mid-stream, the 35,069-byte output file is *not* litter. It is a valid arc
 
 Two independent readers accept it and the integrity check passes, because `zim_check`
 verifies internal *consistency*, not *completeness*, and the ZIM format records no expected
-entry count. A truncated-by-error archive reports healthy.
+entry count. That part stands, and §7.2's warning about `zim_check` remains correct.
 
-Therefore:
+**What actually produced it.** libzim never writes the target name incrementally. In 9.7.0,
+`src/writer/creator.cpp:579` sets `tmpFileName(fname + ".tmp")`, and `:453` performs
+`DEFAULTFS::rename(data->tmpFileName, data->zimName)` at the *end* of
+`finishZimCreation()`. The final name therefore appears only on success.
 
-- **Unlink the output on any error.** Implemented in the global state's destructor, guarded
-  by a `finished` flag set at the end of `copy_to_finalize`, so it covers both a mid-stream
-  throw and a query cancelled elsewhere.
-- **Test it explicitly.** Do not assume libzim's destructor, or DuckDB's, does this.
-- Do not rely on post-hoc validation to catch it. The obvious validator says *fine*.
+The measured file existed because python-libzim's `Creator` context manager calls
+`finishZimCreation()` from `__exit__` **even while an exception is propagating** — so what
+was measured was a *finished truncated* archive, not a partial one. Every observed property
+follows from that. The two results do not conflict; they measured different mechanisms.
 
-§3.4's no-overwrite rule is what makes the recovery clean: if the output could not have
-existed beforehand, unlinking restores the prior state exactly, with no question of whether
-something that mattered was clobbered.
+**Consequence for this design.** `COPY` never finalizes on the error path, so no
+SQL-reachable abort creates a file at the target name at all. Therefore:
+
+- **Never call `finishZimCreation()` from an error path.** This is the actual guarantee.
+  A truncated-but-finalized archive is indistinguishable from a complete one, and no
+  post-hoc validation can catch it — the obvious validator says *fine*.
+- **Unlink the output on any error anyway**, from the global state's destructor guarded by a
+  `finished` flag. This is **defense in depth, not the load-bearing mechanism**: it costs
+  nothing, and it stays correct if a future libzim drops the rename, or if a future code
+  path creates the target early.
+- **Do not manufacture a test for the unlink.** With no reachable trigger, any such test
+  would assert against a scenario the code cannot reach. The path is deliberately untested
+  and labelled as such — an honest gap beats a test that only appears to cover something.
+
+§3.4's no-overwrite rule is what makes recovery clean regardless: if the output could not
+have existed beforehand, then whether the abort leaves nothing (the normal case) or leaves
+something the destructor removes, the prior state is restored exactly.
+
+**The `.tmp` sibling.** An aborted write leaves libzim's `<target>.tmp` to libzim's own
+destructor. Task 2's implementer confirmed by `strace` that it is removed. If that ever
+proves untrue, the fix is to unlink `<target>.tmp` alongside the target — noted here so the
+next person does not have to re-derive it.
 
 ### 7.3 Invalid `MAIN_PATH` is silent in libzim
 
@@ -642,7 +670,8 @@ Every item below is a regression test, not a manual check.
 | duplicate path, `first` | first occurrence wins, later skipped |
 | `ON_CONFLICT last` | rejected at bind time |
 | existing output | refused; **the existing file is unmodified** (§3.4) |
-| mid-stream error | output unlinked — the central §7.2 guarantee |
+| mid-stream error | **no file at the output path** — asserted with `glob()`, which means exactly "absent" where `zim_check() = false` would conflate absent with corrupt (§7.2) |
+| error path never finalizes | no code path calls `finishZimCreation()` while unwinding — the actual §7.2 guarantee |
 | invalid `MAIN_PATH` | errors rather than writing a mainless archive (§7.3) |
 | `FILE_SIZE_BYTES` | rejected, not ignored (§3.2) |
 | `content` and `content_path` both set | error naming the row's `path` (§4.2) |
