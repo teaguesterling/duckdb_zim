@@ -78,14 +78,56 @@ rather than staying silent.
 
 ### 3.2 Options that must be rejected, not ignored
 
-- `PARTITION_BY` — a ZIM is a single self-contained archive; partitioning is meaningless.
-- `FILE_SIZE_BYTES` / file rotation — `copy_rotate_files` returns `false`.
+- `FILE_SIZE_BYTES` / file rotation — `copy_rotate_files` returns `false`. A ZIM cannot be
+  split mid-write and remain valid.
 - `USE_TMP_FILE` — the Creator owns its own output path.
 
-Silently accepting any of these would produce output that does not match what was asked
-for, which is the failure family this design is most concerned with.
+Silently accepting either would produce output that does not match what was asked for,
+which is the failure family this design is most concerned with.
 
-### 3.3 No overwrite
+### 3.3 `PARTITION_BY` — supported, in v2
+
+Writing one archive per value of a derived column is genuinely useful (a corpus split by
+language or subject), and DuckDB's operator already provides the right structure:
+`copy_to_initialize_global` is called **per partition file** with its full path, and
+`copy_to_finalize` per partition. That is exactly "one `Creator` per archive", so support
+is mostly a matter of *not rejecting it*.
+
+```sql
+COPY (SELECT path, title, mimetype, content, lang FROM articles)
+TO 'out' (FORMAT zim, PARTITION_BY (lang));
+-- out/lang=eng/data_0.zim, out/lang=fra/data_0.zim, …
+```
+
+Two complications, both requiring deliberate handling rather than being fatal:
+
+**A partition can fragment into several archives.** When the number of open partitions
+reaches `partitioned_write_max_open_files` (default 100), DuckDB finalises and evicts one,
+then reopens that key later as `data_1.zim`. For parquet this is invisible — the files are
+just more row groups. For a ZIM it is not: each fragment is a separate self-contained
+archive needing its own metadata, its own fulltext index, and its own main page. A user who
+asked for "one archive per language" and silently received three has a fragmented corpus.
+**Warn when a partition is reopened**, naming the key.
+
+**`MAIN_PATH` does not survive partitioning.** The landing page exists in exactly one
+partition, so §7.3's validation would fail for every other one. **Reject `MAIN_PATH`
+together with `PARTITION_BY`** rather than letting it half-work.
+
+Metadata options apply identically to every partition. That is defensible, and templating
+(`TITLE 'Wikipedia ({lang})'`) is left out until someone asks for it.
+
+The no-overwrite rule of §3.4 composes unchanged: it is checked per output file, so each
+partition file must not already exist.
+
+**The partition column does not collide with §4's "unknown columns are an error" rule.**
+`write_partition_columns` defaults to `false`, and DuckDB strips partition columns from both
+the names/types passed to `copy_to_bind` and the chunks passed to `copy_to_sink`
+(`GetNamesWithoutPartitions` / `SetDataWithoutPartitions`). So `lang` above is never seen by
+this function. If a user explicitly sets `write_partition_columns := true` the column *does*
+arrive and will be rejected as unknown — correct, since a ZIM entry has nowhere to store it,
+but the error must name the option so the cause is obvious.
+
+### 3.4 No overwrite
 
 **If the output path already exists, the copy fails.** This is a deliberate deviation from
 DuckDB's convention — `parquet` and `csv` clobber by default — and should be documented as
@@ -127,21 +169,53 @@ ignored — a typo'd `titel` should not silently produce untitled entries.
 | `target` | VARCHAR | no | target path for `redirect`/`alias` — **v2** |
 | `front_article` | BOOLEAN | no | libzim `FRONT_ARTICLE` hint |
 | `compress` | BOOLEAN | no | libzim `COMPRESS` hint |
-| `content_path` | VARCHAR | no | file to stream from disk — **v2** |
-| `source_archive` | VARCHAR | no | source ZIM to pull from — **v2** |
-| `source_entry` | VARCHAR | no | entry path within `source_archive` — **v2** |
+| `content_path` | VARCHAR | no | content *locator* — a file path or a `zim://` URI (§4.2) — **v2** |
 
-### 4.2 Content modes
+### 4.2 Content: two columns, three modes
 
-Exactly one content mode per row. v1 implements only the first.
+Content arrives one of two ways, and **exactly one of `content` / `content_path` must be
+non-NULL** per row. Supplying both, or neither, is an error naming the row's `path`.
 
-| Mode | Columns | Buffering | Use |
+| Column | Holds | Meaning |
+|---|---|---|
+| `content` | BLOB or VARCHAR | the bytes themselves |
+| `content_path` | VARCHAR | *where to get the bytes* |
+
+`content_path` is a **locator**, and its scheme selects the mechanism:
+
+| Locator | Mechanism | Buffering | Use |
 |---|---|---|---|
-| **inline** | `content` | full, until libzim pulls | derived/generated content, text |
-| **file** (v2) | `content_path` | none — libzim `FileProvider` | packing files from disk |
-| **source** (v2) | `source_archive`, `source_entry` | none — lazy pull from source | subset / augment an existing ZIM |
+| `content` column (inline) | `StringItem` | full, until libzim pulls | derived/generated content, text |
+| `photo.png` (v2) | libzim `FileProvider` | none | packing files from disk |
+| `zim://big.zim/A/Article` (v2) | lazy pull from the source archive | none | subset / augment an existing ZIM |
 
-Supplying more than one mode for a row, or none, is an error naming the row's `path`.
+This deliberately reuses the grammar the extension already ships and documents
+(`docs/filesystem.md`, `zim://<archive>.zim/<content-path>`), which is what lets three
+modes live in two columns:
+
+- The source mode's `(archive, entry)` pair is **already a single string** in that grammar,
+  so it needs no second column and no delimiter packing — and paths, which may contain
+  almost anything, never have to survive a round trip through an ad-hoc encoding.
+- "File on disk" and "entry in another ZIM" are both just *a place to get bytes*, so they
+  differ only by scheme. No mode enum is needed; the locator is self-describing.
+- `content` keeps its own column, so its **SQL type is preserved** — which is what drives
+  mimetype defaulting (§4.3). Folding it into a single payload column would force one type
+  across all three modes and lose that.
+
+Rejected alternatives, for the record: four columns (`content`, `content_path`,
+`source_archive`, `source_entry`) is more explicit but has strictly more illegal states to
+validate; a `content_mode` enum plus one payload column is uniform on paper but forces the
+source pair into a packed string and collapses BLOB vs VARCHAR.
+
+> **The surface reuses the `zim://` grammar; the implementation must not reuse the VFS.**
+> The registered `zim://` filesystem materialises each entry into RAM on open (issue #27),
+> which is exactly the buffering this mode exists to avoid. `COPY` parses the URI itself and
+> hands libzim its own lazy provider over a pooled source archive. The grammar is a naming
+> convention here, not a code path.
+
+Non-local schemes in `content_path` (`s3://`, `http://`) are **rejected** rather than
+silently buffered; libzim's `FileProvider` needs a local file, and pretending otherwise
+would reintroduce unbounded buffering under a name that promises streaming.
 
 `entry_kind` in (`redirect`, `alias`) requires `target` and forbids every content column.
 
@@ -166,7 +240,7 @@ binary content through a `str` re-encoded it as UTF-8 and inflated a 16.8 MB PDF
 |---|---|
 | `copy_to_bind` | validate options; resolve column indices by name; reject unknown columns and conflicting modes |
 | `execution_mode` | always `REGULAR_COPY_TO_FILE` — **serial**; libzim parallelises internally via `configNbWorkers` |
-| `copy_to_initialize_global` | fail if the output exists (§3.3); construct `Creator`; `config*()`; `startZimCreation()`; write metadata and illustration |
+| `copy_to_initialize_global` | fail if the output exists (§3.4); construct `Creator`; `config*()`; `startZimCreation()`; write metadata and illustration |
 | `copy_to_sink` | for each row: validate, materialise content into owned storage, `addItem()` |
 | `copy_to_finalize` | `setMainPath()`; `finishZimCreation()`; mark the global state *finished* |
 | `~GlobalState` | if not *finished*, unlink the output (§7.2) |
@@ -181,14 +255,21 @@ content stream cannot produce an archive with content but no identity.
 
 ## 6. Interaction with the reader
 
-Two things already in the extension carry over and should not be rebuilt:
+Three things already in the extension carry over and should not be rebuilt:
 
-- **`ArchivePool`** — v2's source mode must open each distinct `source_archive` once and
-  keep it open until `finishZimCreation()` returns, because libzim pulls *after* the sink
-  has moved on. Cache by resolved path; never close on a chunk boundary.
+- **The `zim://` grammar** — §4.2 reuses it verbatim as the source-mode locator, so the URI
+  format needs no new design and is already documented for users. Only the *parser* is
+  shared; the VFS itself is deliberately bypassed (§4.2).
+- **`ArchivePool`** — v2's source mode must open each distinct source archive once and keep
+  it open until `finishZimCreation()` returns, because libzim pulls *after* the sink has
+  moved on. Cache by resolved path; never close on a chunk boundary.
 - **`read_zim(…, include_filepath := true)`** — already tags every row with its source
   archive, and the LIST overload already scans many archives in one call. v2's subset and
   union cases need no new reader work; the linchpin exists.
+
+A **`zim_uri(archive, path)`** scalar would make the subset idiom read better than string
+concatenation (`'zim://' || file_path || '/' || path`) and would centralise escaping. Worth
+adding with v2, not before — it is sugar over a grammar that must work either way.
 
 ## 7. Failure modes
 
@@ -237,7 +318,7 @@ Therefore:
 - **Test it explicitly.** Do not assume libzim's destructor, or DuckDB's, does this.
 - Do not rely on post-hoc validation to catch it. The obvious validator says *fine*.
 
-§3.3's no-overwrite rule is what makes the recovery clean: if the output could not have
+§3.4's no-overwrite rule is what makes the recovery clean: if the output could not have
 existed beforehand, unlinking restores the prior state exactly, with no question of whether
 something that mattered was clobbered.
 
@@ -358,20 +439,24 @@ on `read_zim`), so it is **v2 or later**. v1 documents the alias non-identity.
   `content_path` (v2). Documented rather than left to be discovered.
 - **Concurrent writers to one archive.** Untested, unsupported.
 - **`COPY FROM`** — reading is already `read_zim`'s job.
-- **Appending to an existing archive.** libzim's `Creator` writes a new file; §3.3 forbids
+- **Appending to an existing archive.** libzim's `Creator` writes a new file; §3.4 forbids
   targeting an existing one. Augmenting is done by reading the old archive and writing a
   new one (v2's source mode).
 
 ## 10. Scope
 
-**v1** — items only. `path`, `content`, `title`, `mimetype`, `front_article`, `compress`;
-all options in §3.1 except those marked v2; §7.1, §7.2, §7.3, §7.5 handled; §7.4 not
-reachable without redirects.
+**v1** — items only, inline content only. Columns `path`, `content`, `title`, `mimetype`,
+`front_article`, `compress`; all options in §3.1; §7.1, §7.2, §7.3, §7.5 handled; §7.4 not
+reachable without redirects. `content_path` and `PARTITION_BY` are rejected with "not yet
+supported" rather than "unknown", so the deferral reads as deferral.
 
-**v2, immediately following** — the `source_archive`/`source_entry` mode, driven by the
-subset and augment use cases, plus `content_path`, `entry_kind`/`target`, and §7.4.
+**v2, immediately following** — `content_path` in both its forms (local file, and the
+`zim://` locator driving the subset/augment use cases), `entry_kind`/`target`, §7.4, and
+`PARTITION_BY` (§3.3). The v1 column contract is unchanged by all of this: v2 only adds
+columns, never renames or retypes one.
 
-**Later** — alias preservation (§8.1), contingent on reader changes.
+**Later** — alias preservation (§8.1), contingent on reader changes; `zim_uri()` sugar (§6);
+per-partition metadata templating (§3.3).
 
 ### 10.1 Test plan
 
@@ -386,12 +471,27 @@ Every item below is a regression test, not a manual check.
 | duplicate path, `error` | fails, error names the path, **output does not exist** (§7.2) |
 | duplicate path, `first` | first occurrence wins, later skipped |
 | `ON_CONFLICT last` | rejected at bind time |
-| existing output | refused; **the existing file is unmodified** (§3.3) |
+| existing output | refused; **the existing file is unmodified** (§3.4) |
 | mid-stream error | output unlinked — the central §7.2 guarantee |
 | invalid `MAIN_PATH` | errors rather than writing a mainless archive (§7.3) |
-| `PARTITION_BY` / `FILE_SIZE_BYTES` | rejected, not ignored (§3.2) |
+| `FILE_SIZE_BYTES` | rejected, not ignored (§3.2) |
+| `content` and `content_path` both set | error naming the row's `path` (§4.2) |
+| neither content column set | error naming the row's `path` (§4.2) |
 | `INDEX true` | `zim_search` finds an entry in the written archive |
 | `INDEX true` without a language | clear error |
 | `INDEX true` on WASM | clear error — Xapian is absent, must not silently no-op |
 | stdout cleanliness | a write emits **nothing** on stdout, including one with a dangling redirect (§7.4, §7.5) |
 | libzim private-API property | the §8.1 dedup/alias property holds on the pinned version |
+
+v2 adds:
+
+| Test | Asserts |
+|---|---|
+| `content_path` from disk | bytes match the source file; no buffering of the whole file |
+| `zim://` locator | subset of a source archive round-trips; **content is pulled lazily**, i.e. no read happens during the sink |
+| `zim://` to a missing entry | clear error naming the URI |
+| non-local scheme in `content_path` | rejected (§4.2), not silently buffered |
+| `PARTITION_BY` | one archive per key, each independently openable by `read_zim` |
+| `PARTITION_BY` + `MAIN_PATH` | rejected together (§3.3) |
+| partition fragmentation | a key reopened past `partitioned_write_max_open_files` warns, naming the key (§3.3) |
+| `write_partition_columns := true` | error names the option, not just "unknown column" (§3.3) |
