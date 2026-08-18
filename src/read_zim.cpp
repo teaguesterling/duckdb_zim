@@ -423,8 +423,18 @@ static LogicalType ZimColumnType(const ReadZimBindData &bind, column_t cid) {
 // chunk. Filters are keyed by *projected* index (PhysicalPlanGenerator's
 // CreateTableFilterSet rewrites the storage index into an index into column_ids), which
 // is exactly the output chunk's column order — filter_prune is off, so no projection_ids
-// indirection sits in between. A filter we cannot map is an internal error rather than a
-// skip: skipping is what made issue #29 silent.
+// indirection sits in between.
+//
+// A filter we cannot map raises rather than being skipped: skipping is what made issue
+// #29 silent, and this layer is the one results depend on. The type is
+// NotImplementedException, not InternalException (issue #35): DuckDB invalidates the
+// whole DatabaseInstance on ExceptionType::INTERNAL, so an unmapped column would cost the
+// user their connection instead of failing one query. Neither guard is reachable from SQL
+// today — every projected column id comes from the bound column list and read_zim exposes
+// no rowid — they exist to catch a future virtual column or column_t sentinel, and that is
+// exactly a "not implemented", not a broken invariant. ApplyPushedFilters skips the same
+// condition instead of raising because it only reads less; the error still surfaces here,
+// a few lines later, so nothing is silently dropped either way.
 static unique_ptr<Expression> BuildFilterExpression(const ReadZimBindData &bind, const ReadZimGlobalState &g,
                                                     TableFunctionInitInput &input) {
 	if (!input.filters || input.filters->filters.empty()) {
@@ -434,14 +444,14 @@ static unique_ptr<Expression> BuildFilterExpression(const ReadZimBindData &bind,
 	for (auto &entry : input.filters->filters) {
 		const idx_t proj_idx = entry.first;
 		if (proj_idx >= g.column_ids.size()) {
-			throw InternalException("read_zim: pushed-down filter references column %llu, but only %llu columns are "
-			                        "projected",
-			                        (uint64_t)proj_idx, (uint64_t)g.column_ids.size());
+			throw NotImplementedException("read_zim: pushed-down filter references column %llu, but only %llu columns "
+			                              "are projected",
+			                              (uint64_t)proj_idx, (uint64_t)g.column_ids.size());
 		}
 		auto type = ZimColumnType(bind, g.column_ids[proj_idx]);
 		if (type.id() == LogicalTypeId::INVALID) {
-			throw InternalException("read_zim: pushed-down filter on unknown column id %llu",
-			                        (uint64_t)g.column_ids[proj_idx]);
+			throw NotImplementedException("read_zim: pushed-down filter on unknown column id %llu",
+			                              (uint64_t)g.column_ids[proj_idx]);
 		}
 		auto col_ref = make_uniq<BoundReferenceExpression>(type, proj_idx);
 		// ToExpression is total over the TableFilter hierarchy; the approximate kinds
@@ -449,7 +459,7 @@ static unique_ptr<Expression> BuildFilterExpression(const ReadZimBindData &bind,
 		// because those are redundant with the join that produced them.
 		auto expr = entry.second->ToExpression(*col_ref);
 		if (!expr) {
-			throw InternalException("read_zim: could not rebuild a pushed-down filter as an expression");
+			throw NotImplementedException("read_zim: could not rebuild a pushed-down filter as an expression");
 		}
 		conditions.push_back(std::move(expr));
 	}
@@ -812,6 +822,22 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 		}
 		if (SelectFilteredRows(context, gstate, lstate, output) > 0) {
 			return;
+		}
+		// The whole batch was filtered out, so we have to keep scanning — and a zero-row
+		// chunk is not an option: PhysicalTableScan reads chunk.size() == 0 as
+		// SourceResultType::FINISHED (and the AsyncResultType::HAVE_MORE_OUTPUT escape
+		// hatch is rejected with an empty chunk under the synchronous strategy), so
+		// returning early would silently truncate the scan. Without a return there is no
+		// cancellation point: in the parallel path ProduceChunk pulls fresh morsels
+		// itself, so `WHERE path LIKE 'zzz%'` over a large archive would run the entire
+		// scan inside one call and ignore an interrupt for its duration (issue #35).
+		//
+		// DuckDB's own table scan has exactly this loop and exactly this remedy — see
+		// TableScanFunc in duckdb/src/function/table/table_scan.cpp, "Before looping
+		// back, check if we are interrupted". Same idiom, same granularity (at most one
+		// STANDARD_VECTOR_SIZE batch between checks).
+		if (context.interrupted) {
+			throw InterruptException();
 		}
 	}
 }

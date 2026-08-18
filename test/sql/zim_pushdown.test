@@ -449,3 +449,35 @@ SELECT count(*) FROM read_zim(['test/oracle/test.zim', 'test/oracle/test_zimit.z
 WHERE mimetype = 'image/png';
 ----
 0
+
+# ============================================================================
+# Issue #35: the filter retry loop. A chunk in which every row was filtered out
+# cannot be returned to DuckDB — PhysicalTableScan reads a zero-row chunk as
+# end-of-scan — so ReadZimFunction keeps scanning until a row survives. These
+# pin the two ends of that contract: the scan must not stop early when an
+# intermediate batch is empty, and it must terminate on a predicate nothing
+# matches. (The interrupt check the loop now performs before looping back is
+# not expressible here; it needs a concurrent cancellation.)
+# ============================================================================
+
+# nothing matches anywhere: the loop must drain every file and return 0 rows
+query I
+SELECT count(*) FROM read_zim(['test/oracle/test.zim', 'test/oracle/test_zimit.zim'])
+WHERE path LIKE 'zzz%';
+----
+0
+
+# the only survivor is the last entry of the LAST file: everything before it is
+# filtered out, so an early return would lose it
+query T
+SELECT path FROM read_zim(['test/oracle/test.zim', 'test/oracle/test_zimit.zim'])
+WHERE path LIKE 'example.com/static/%';
+----
+example.com/static/style.css
+
+# ...and the same with the scan forced single-threaded
+query T
+SELECT path FROM read_zim(['test/oracle/test.zim', 'test/oracle/test_zimit.zim'], parallel := false)
+WHERE path LIKE 'example.com/static/%';
+----
+example.com/static/style.css
