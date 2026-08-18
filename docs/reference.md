@@ -67,10 +67,44 @@ build (prefix fallback without Xapian). Federated like `zim_search`.
 | `zim_info(file)` | STRUCT | counts, flags, uuid, filesize, … |
 | `zim_illustration(file [, size])` | BLOB | cover image / favicon (default 48px); `NULL` if none |
 | `zim_random(file)` | VARCHAR | a random entry's path |
-| `zim_check(file)` | BOOLEAN | libzim archive integrity check |
+| `zim_check(file)` | BOOLEAN | archive is openable and internally consistent; `false` (not an error) if it cannot be opened |
 
 All VARCHAR outputs are **binary-safe**: non-UTF-8 bytes come back as `NULL` rather than
 being mangled.
+
+### `zim_check` — what it does and does not promise
+
+`zim_check` is the one function whose purpose is to answer *"is this archive usable?"*,
+so it answers rather than aborting the query:
+
+| input | result |
+|---|---|
+| a good archive | `true` |
+| an archive that opens but fails its integrity check | `false` |
+| a file that is not a ZIM, is truncated, or is missing | `false` |
+| `NULL` | `NULL` |
+
+This makes it usable as a predicate over a shelf, which is the point — one bad file in a
+directory no longer aborts the scan:
+
+```sql
+SELECT file, zim_check(file) AS readable
+FROM glob('/data/zim/*.zim');
+```
+
+`TRY()` is **not** a substitute for this behavior. `TRY()` intercepts conversion and range
+errors, not the exception raised from the archive-open path, so `TRY(zim_check(f))` on an
+unopenable file fails exactly as the bare call would.
+
+> **It verifies internal *consistency*, not *completeness*.** An archive whose writer died
+> part-way through is self-consistent: it opens, its checksum validates, and `zim_check`
+> returns `true` — while silently containing only the entries written before the failure.
+> Nothing in the ZIM format records how many entries *should* have been there. If you need
+> completeness, compare `zim_info(file).entry_count` against what you expect; `zim_check`
+> cannot tell you.
+
+Only the *open* is guarded. If `CheckIntegrity()` itself throws, that error still
+propagates — that is a real fault, not an unreadable file.
 
 ## The `zim://` filesystem
 

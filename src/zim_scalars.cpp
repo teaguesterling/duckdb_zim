@@ -166,12 +166,48 @@ void Random(DataChunk &args, ExpressionState &state, Vector &result) {
 	}
 }
 
-// zim_check(file) -> BOOLEAN : libzim archive integrity check
+// zim_check(file) -> BOOLEAN : libzim archive integrity check.
+//
+// Returns FALSE for an archive that cannot be OPENED, rather than raising.
+//
+// This is the one function in the family whose whole purpose is to answer "is
+// this archive usable?", so it has to be answerable without aborting the query.
+// Raising left callers with no way to ask at all: DuckDB's TRY() intercepts
+// conversion and range errors, not the InvalidInputException thrown from the
+// open path, so `TRY(zim_check(f))` propagates the error just the same.
+//
+// The concrete case is a shelf scanned from a directory where one file is
+// truncated or is not a ZIM. Without this, a query over that shelf can only
+// abort entirely, or use zim_search(ignore_errors := true) -- which skips the
+// bad archive silently, so the caller gets fewer results and no way to learn
+// that a corpus was dropped.
+//
+// Only the OPEN is guarded. An archive that opens but fails its integrity check
+// already returns false, and anything CheckIntegrity() itself throws still
+// propagates -- that is a real fault, not an unreadable file.
+//
+// CAVEAT, and it limits what this function can be believed to mean: it verifies
+// internal CONSISTENCY, not COMPLETENESS. An archive whose writer died part-way
+// through is self-consistent -- it opens, its checksum validates, and this
+// returns true -- while containing only the entries written before the failure.
+// Confirmed empirically: a libzim Creator aborted mid-write by a duplicate-path
+// error leaves a file that both libzim and read_zim open happily, with a valid
+// checksum, holding a strict prefix of the intended entries. The ZIM format does
+// not record an expected entry count, so no open-and-verify check can detect it.
+// Callers needing completeness must compare zim_info().entry_count against an
+// external expectation.
 void Check(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	args.data[0].Flatten(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
-		auto archive = Open(state, args.data[0], i);
+		std::shared_ptr<ZimArchive> archive;
+		try {
+			archive = Open(state, args.data[0], i);
+		} catch (const std::exception &) {
+			// Unopenable: not a ZIM, truncated, missing, or unreadable.
+			result.SetValue(i, Value::BOOLEAN(false));
+			continue;
+		}
 		result.SetValue(i, Value::BOOLEAN(archive->CheckIntegrity()));
 	}
 }
