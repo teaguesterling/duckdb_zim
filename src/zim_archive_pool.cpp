@@ -44,8 +44,11 @@ static std::string CanonicalKey(const std::string &file_path) {
 // on a path that runs once per scalar-function row, and it would still not
 // surface dev/inode. This is a plain metadata read of a local path -- no libzim,
 // no VFS. Windows is not a build target for this extension (the distribution
-// pipeline excludes every windows_* arch), so the POSIX-2008 st_mtim spelling
-// used here is available everywhere it is compiled: linux, osx and emscripten.
+// pipeline excludes every windows_* arch), so only POSIX spellings are needed --
+// but they are NOT uniform across the POSIX targets. Linux and emscripten expose
+// the POSIX-2008 `st_mtim`; Apple's <sys/stat.h> names the same field
+// `st_mtimespec` and does not define `st_mtim` by default, so this must be
+// conditional or the macOS build fails to compile.
 ArchivePool::FileIdentity ArchivePool::StatIdentity(const std::string &path) {
 	FileIdentity id;
 	struct stat st;
@@ -56,8 +59,13 @@ ArchivePool::FileIdentity ArchivePool::StatIdentity(const std::string &path) {
 	id.dev = static_cast<uint64_t>(st.st_dev);
 	id.inode = static_cast<uint64_t>(st.st_ino);
 	id.size = static_cast<uint64_t>(st.st_size);
+#if defined(__APPLE__)
+	id.mtime_sec = static_cast<int64_t>(st.st_mtimespec.tv_sec);
+	id.mtime_nsec = static_cast<int64_t>(st.st_mtimespec.tv_nsec);
+#else
 	id.mtime_sec = static_cast<int64_t>(st.st_mtim.tv_sec);
 	id.mtime_nsec = static_cast<int64_t>(st.st_mtim.tv_nsec);
+#endif
 	return id;
 }
 
