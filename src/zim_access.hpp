@@ -126,6 +126,47 @@ private:
 	std::unique_ptr<Impl> impl_;
 };
 
+// Seekable, opaque reader over one ZIM entry's decompressed content.
+//
+// Exists so the zim:// VFS can serve *ranged* reads without ever holding the
+// whole entry: it pins the resolved libzim item (so each read skips the dirent
+// lookup) and copies out only the requested window. libzim keeps the entry's
+// decompressed cluster in its own LRU cache, so successive windows over one
+// entry do not re-decompress.
+//
+// What this does and does not buy: a consumer doing ranged reads never
+// materializes the entry. A consumer that reads the whole file anyway
+// (read_blob / read_text) still ends up with one full copy -- in *its* buffer,
+// not an extra one of ours -- so for those the win is halving peak extension
+// memory, not eliminating it.
+//
+// The reader does NOT keep its ZimArchive alive; hold the pool's
+// shared_ptr<ZimArchive> alongside it for as long as the reader is used.
+class ZimContentReader {
+public:
+	~ZimContentReader();
+	ZimContentReader(ZimContentReader &&) noexcept;
+	ZimContentReader &operator=(ZimContentReader &&) noexcept;
+	ZimContentReader(const ZimContentReader &) = delete;
+	ZimContentReader &operator=(const ZimContentReader &) = delete;
+
+	// Decompressed size of the entry in bytes (resolved once, at open).
+	uint64_t Size() const;
+
+	// Copies at most `length` bytes starting at `offset` into `out`, clamped to
+	// the entry's end; returns the number of bytes actually written (0 at or past
+	// EOF, or when `length` is 0). Never writes more than `length` bytes, so the
+	// caller's allocation is the only bound that matters -- which is why a ranged
+	// read needs no separate decompression-bomb cap.
+	uint64_t ReadAt(uint64_t offset, uint64_t length, char *out) const;
+
+private:
+	friend class ZimArchive;
+	struct Impl;
+	explicit ZimContentReader(std::unique_ptr<Impl> impl);
+	std::unique_ptr<Impl> impl_;
+};
+
 // RAII handle around a single open zim::Archive. Cheap to copy by shared_ptr
 // via the ArchivePool; never construct directly outside the pool in the binding
 // layer (the pool keeps the libzim cluster cache warm across queries).
@@ -163,6 +204,16 @@ public:
 	// Just the bytes for a content path (redirect-following). nullopt if absent.
 	// `max_content_bytes` caps the decompressed size (0 disables); throws if exceeded.
 	std::optional<std::string> GetContent(const std::string &path, uint64_t max_content_bytes = 0) const;
+	// A ranged reader over a content path's bytes (redirect-following), for
+	// consumers that must not materialize the whole entry. nullopt if absent.
+	// `max_content_bytes` is checked here against the entry's *declared* size
+	// (0 disables) and throws if exceeded, without allocating. Opening still
+	// enforces the cap even though reads are now ranged, because the VFS's
+	// dominant consumers (read_blob / read_text) read the whole entry anyway,
+	// into an allocation this extension does not control; dropping the check
+	// would just relocate the unbounded allocation into DuckDB. Individual
+	// ReadAt calls need no cap -- they are bounded by the caller's own buffer.
+	std::optional<ZimContentReader> OpenContent(const std::string &path, uint64_t max_content_bytes = 0) const;
 	std::optional<std::string> GetMimetype(const std::string &path) const;
 	std::optional<std::string> GetRedirectTarget(const std::string &path) const;
 	std::string MainEntryPath() const; // redirect-resolved; "" if none

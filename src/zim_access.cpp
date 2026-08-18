@@ -11,6 +11,7 @@
 #include "zim_access.hpp"
 #include "zim_remote.hpp" // DuckdbZimRemoteReader + FileSystem (remote opens)
 
+#include <cstring> // std::memcpy (ZimContentReader::ReadAt)
 #include <stdexcept>
 #include <utility> // std::declval, for the EntryRange iterator type alias
 
@@ -48,22 +49,26 @@ static std::string BlobToString(const zim::Blob &blob) {
 	return std::string(blob.data(), blob.size());
 }
 
-// Shared, capped materialization for every getData() site. A ZIM cluster is
-// compressed, so a crafted archive can declare a huge uncompressed item size and
-// force an unbounded allocation (decompression bomb). Before materializing, check
-// the item's reported size against `max_bytes`; refuse an oversize item with a
-// clean error rather than allocating. `max_bytes == 0` disables the cap. The blob
-// itself is re-checked after the fact as defense-in-depth in case a declared size
-// ever understates the real output. `what` names the entry for the error message.
-static std::string MaterializeCapped(const zim::Item &item, uint64_t max_bytes, const std::string &what) {
-	if (max_bytes != 0) {
-		const uint64_t declared = static_cast<uint64_t>(item.getSize());
-		if (declared > max_bytes) {
-			throw std::runtime_error("zim: " + what + " decompressed size " + std::to_string(declared) +
-			                         " bytes exceeds zim_max_content_size (" + std::to_string(max_bytes) +
-			                         " bytes); raise zim_max_content_size or set it to 0 to disable the cap");
-		}
+// The cheap half of the decompression-bomb guard: a ZIM cluster is compressed, so
+// a crafted archive can declare a huge uncompressed item size and force an
+// unbounded allocation. Reject on the item's *declared* size, before anything is
+// allocated. `max_bytes == 0` disables the cap; `what` names the entry for the
+// error message. Shared by the materializing paths below and by OpenContent,
+// which allocates nothing itself but still refuses to hand out a reader for an
+// entry its callers would go on to materialize.
+static void CheckDeclaredSizeCap(uint64_t declared, uint64_t max_bytes, const std::string &what) {
+	if (max_bytes != 0 && declared > max_bytes) {
+		throw std::runtime_error("zim: " + what + " decompressed size " + std::to_string(declared) +
+		                         " bytes exceeds zim_max_content_size (" + std::to_string(max_bytes) +
+		                         " bytes); raise zim_max_content_size or set it to 0 to disable the cap");
 	}
+}
+
+// Shared, capped materialization for every whole-entry getData() site. The blob
+// is re-checked after the fact as defense-in-depth, in case a declared size ever
+// understates the real output.
+static std::string MaterializeCapped(const zim::Item &item, uint64_t max_bytes, const std::string &what) {
+	CheckDeclaredSizeCap(static_cast<uint64_t>(item.getSize()), max_bytes, what);
 	auto blob = item.getData();
 	if (max_bytes != 0 && static_cast<uint64_t>(blob.size()) > max_bytes) {
 		throw std::runtime_error("zim: " + what + " materialized size " + std::to_string(blob.size()) +
@@ -301,6 +306,64 @@ std::optional<std::string> ZimArchive::GetContent(const std::string &path, uint6
 	zim::Entry entry = archive_->getEntryByPath(p);
 	auto item = entry.getItem(true); // follow redirects
 	return MaterializeCapped(item, max_content_bytes, "entry '" + p + "'");
+}
+
+//===--------------------------------------------------------------------===//
+// ZimContentReader
+//===--------------------------------------------------------------------===//
+
+// Holds the resolved (redirect-followed) libzim item plus its decompressed size.
+// Keeping the zim::Item alive is what makes a ranged read cheap: the dirent
+// lookup and redirect resolution happen once, at open, and every ReadAt after
+// that is a cluster-cache hit plus a memcpy of the requested window.
+struct ZimContentReader::Impl {
+	zim::Item item;
+	uint64_t size;
+
+	Impl(zim::Item item_p, uint64_t size_p) : item(std::move(item_p)), size(size_p) {
+	}
+};
+
+ZimContentReader::ZimContentReader(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
+}
+ZimContentReader::~ZimContentReader() = default;
+ZimContentReader::ZimContentReader(ZimContentReader &&) noexcept = default;
+ZimContentReader &ZimContentReader::operator=(ZimContentReader &&) noexcept = default;
+
+uint64_t ZimContentReader::Size() const {
+	return impl_->size;
+}
+
+uint64_t ZimContentReader::ReadAt(uint64_t offset, uint64_t length, char *out) const {
+	if (length == 0 || offset >= impl_->size) {
+		return 0; // zero-length request, or at/past EOF
+	}
+	// Clamp to the entry's end ourselves rather than trusting libzim's clamp: the
+	// only thing standing between a malformed archive and a buffer overrun here is
+	// that we never copy more bytes than the caller asked for.
+	const uint64_t available = impl_->size - offset;
+	const uint64_t want = length < available ? length : available;
+	auto blob = impl_->item.getData(static_cast<zim::offset_type>(offset), static_cast<zim::size_type>(want));
+	uint64_t got = static_cast<uint64_t>(blob.size());
+	if (got > want) {
+		got = want; // defensive: never write past the caller's `length` bytes
+	}
+	if (got > 0) {
+		std::memcpy(out, blob.data(), static_cast<size_t>(got));
+	}
+	return got;
+}
+
+std::optional<ZimContentReader> ZimArchive::OpenContent(const std::string &path, uint64_t max_content_bytes) const {
+	auto p = NormalizeContentPath(path);
+	if (!archive_->hasEntryByPath(p)) {
+		return std::nullopt;
+	}
+	zim::Entry entry = archive_->getEntryByPath(p);
+	auto item = entry.getItem(true); // follow redirects, like GetContent
+	const uint64_t size = static_cast<uint64_t>(item.getSize());
+	CheckDeclaredSizeCap(size, max_content_bytes, "entry '" + p + "'");
+	return ZimContentReader(std::unique_ptr<ZimContentReader::Impl>(new ZimContentReader::Impl(std::move(item), size)));
 }
 
 std::optional<std::string> ZimArchive::GetMimetype(const std::string &path) const {
