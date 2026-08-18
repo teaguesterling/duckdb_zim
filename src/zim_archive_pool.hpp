@@ -24,6 +24,18 @@
 // (and its cache) stays alive. A bounded strong-ref LRU (Pin) keeps the last few
 // hot regardless of in-flight queries — cheap for local mmap, valuable for remote
 // (avoids a fresh httpfs connection + header/dirent re-read per call).
+//
+// REVALIDATION (issue #38) — a cached handle is not trusted forever:
+//   Replacing a .zim in place is routine (Kiwix ships updated archives under the
+//   same filename). A pool that never rechecks keeps serving the OLD bytes for
+//   the life of the DB, while the zim:// VFS's GetLastModifiedTime reports the
+//   NEW file's mtime — so a caching consumer (read_parquet over zim://) sees a
+//   changed mtime, re-reads, and gets the same stale bytes with no way to notice.
+//   Get() therefore stats the local file and reopens when its identity moved.
+//   Reopening only ever REPLACES the pool's own entry; the displaced ZimArchive
+//   is never mutated and stays alive until its last shared_ptr holder (an open
+//   zim:// FileHandle, an in-flight scan) releases it. See zim_archive_pool.cpp
+//   for the exact rule, and why remote archives are exempt.
 //===----------------------------------------------------------------------===//
 #pragma once
 
@@ -62,10 +74,41 @@ public:
 private:
 	// Hold a strong reference to the most-recently-used archives so they (and their
 	// libzim cluster caches) survive between calls/queries. Most-recent at the front.
+	// Re-pinning a key that is already present REPLACES its archive, which is what
+	// drops the pool's last strong ref to a superseded handle after a reopen.
 	void Pin(const std::string &key, const std::shared_ptr<ZimArchive> &archive);
 
+	// Identity of the file a cached archive was opened from, used to notice an
+	// in-place replacement. `valid` is false for remote URLs (nothing to stat) and
+	// for a local path whose stat failed; see ShouldReopen below.
+	struct FileIdentity {
+		bool valid = false;
+		uint64_t dev = 0;
+		uint64_t inode = 0;
+		uint64_t size = 0;
+		int64_t mtime_sec = 0;
+		int64_t mtime_nsec = 0;
+
+		bool operator==(const FileIdentity &o) const {
+			return valid == o.valid && dev == o.dev && inode == o.inode && size == o.size && mtime_sec == o.mtime_sec &&
+			       mtime_nsec == o.mtime_nsec;
+		}
+	};
+
+	struct CacheEntry {
+		std::weak_ptr<ZimArchive> archive;
+		FileIdentity identity; // of the file this archive was opened from
+	};
+
+	// Stats a local path; returns an invalid identity if the stat fails. Defined in
+	// the .cpp, which is where the rationale for stat-vs-FileSystem lives.
+	static FileIdentity StatIdentity(const std::string &path);
+	// True only on positive evidence that the file changed (both identities read
+	// successfully and they differ) -- an unreadable stat is never taken as change.
+	static bool ShouldReopen(const FileIdentity &cached, const FileIdentity &now);
+
 	std::mutex mu_;
-	std::unordered_map<std::string, std::weak_ptr<ZimArchive>> cache_;
+	std::unordered_map<std::string, CacheEntry> cache_;
 	// Bounded LRU of strong refs. Without this, archives are weak_ptr-only and are
 	// freed the instant no query holds them — so the next call reopens. Cheap for a
 	// local mmap but expensive for a remote archive (new httpfs connection +

@@ -57,6 +57,27 @@ Run locally after a build: `bash test/no_stdout_pollution.sh` /
 `bash test/no_writer_stdout_pollution.sh` (same `DUCKDB_BIN` / `ZIM_EXTENSION` overrides as
 below).
 
+## FileSystem-level C++ harnesses
+
+Two behaviours are only reachable through the C++ `FileSystem` / `DatabaseInstance` API,
+so they are compiled against the built `libduckdb` and run directly rather than through
+sqllogictest:
+
+- `test/vfs_ranged_reads.sh` (+ `.cpp`) — the `zim://` handle's ranged/positional reads
+  (reads at an offset, at EOF, spanning the end, zero-length). `read_blob` / `read_text`
+  only ever take the sequential overload, so SQL cannot reach these (issue #27).
+- `test/pool_revalidate.sh` (+ `.cpp`) — `ArchivePool` revalidation (issue #38): a `.zim`
+  replaced on disk must stop being served from the pool's cached handle, while a `zim://`
+  handle already open over the old archive keeps serving it. sqllogictest has no
+  file-manipulation directive, `COPY … (FORMAT zim)` refuses to overwrite an existing
+  archive, and restarting the DB would clear the pool and hide the bug — so the swap has
+  to happen between queries of one live `DatabaseInstance`.
+
+Run locally after `make release`: `bash test/vfs_ranged_reads.sh` /
+`bash test/pool_revalidate.sh`. Both link the locally built `libduckdb` under
+`build/release/src/`, so unlike the scripts above they are not part of the
+artifact-based CI jobs (which only download the loadable extension).
+
 ## Remote (http) integration test
 
 `zim_search` over an http(s) URL can't be expressed in sqllogictest (no way to host a

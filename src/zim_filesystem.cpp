@@ -243,13 +243,15 @@ public:
 	// visibly, i.e. precisely the positional-read consumers the ranged-read VFS exists
 	// to serve.
 	//
-	// KNOWN INCONSISTENCY (not fixed here; needs its own change): ArchivePool caches an
-	// opened ZimArchive and never revalidates it against the file on disk. If the .zim
-	// is replaced while a pooled handle is still live, reads keep being served from the
-	// OLD archive while this method reports the NEW file's mtime — the two disagree, and
-	// a consumer that trusts the mtime to mean "contents changed" would see stale bytes
-	// under a fresh timestamp. Fixing that belongs in the pool (stat-on-Get and reopen
-	// when dev/inode/mtime/size moved), not here.
+	// This used to disagree with what the pool served: ArchivePool cached an opened
+	// ZimArchive and never revalidated it, so a .zim replaced on disk kept being read
+	// from the OLD archive while this method reported the NEW file's mtime, and a
+	// consumer that trusts the mtime to mean "contents changed" saw stale bytes under a
+	// fresh timestamp (issue #38). The pool now stats on Get and reopens when
+	// dev/inode/mtime/size move, so the mtime reported here and the bytes read through
+	// a freshly opened handle refer to the same file. A handle already OPEN keeps its
+	// archive — its size and bytes stay self-consistent for its whole lifetime — which
+	// is what a reader mid-file needs; the next open picks up the new archive.
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override {
 		ParsedZimPath parsed;
 		if (!TryParseZimUrl(handle.path, parsed)) {
