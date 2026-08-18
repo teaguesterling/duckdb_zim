@@ -526,6 +526,30 @@ static void CollectMimetypeConstants(const TableFilter &filter, std::vector<std:
 	}
 }
 
+// Intersect the exact mimetype constants of a pushed-down filter with the Accept-style
+// patterns already in the scan spec (the `mimetype :=` named parameter, possibly empty).
+//
+// Issue #34: these two must be AND-ed. `mimetype := 'text/css'` is an explicit argument
+// that defines the rows the function produces; a WHERE clause can only narrow that set,
+// never widen it. Appending the pushed constants to the same vector made MimetypeAccepted
+// — an OR over its patterns — accept their union, so
+// `read_zim(..., mimetype := 'text/css') WHERE mimetype = 'image/png'` returned the PNG.
+//
+// The intersection is exact rather than approximate: `constants` are literal mimetypes,
+// so {m : m matches some pattern} INTERSECT {m : m IN constants} is precisely the subset
+// of `constants` the patterns accept. An empty `patterns` accepts everything
+// (MimetypeAccepted's own convention), which is the no-named-parameter case.
+static std::vector<std::string> IntersectMimetypes(const std::vector<std::string> &patterns,
+                                                   const std::vector<std::string> &constants) {
+	std::vector<std::string> result;
+	for (const auto &c : constants) {
+		if (MimetypeAccepted(patterns, c)) {
+			result.push_back(c);
+		}
+	}
+	return result;
+}
+
 // Best-effort read reduction (layer 1 above). Correctness never depends on this: every
 // pushed filter is re-applied exactly by g.filter_expression, so each rule here only has
 // to keep the scan a superset of the true result.
@@ -538,7 +562,15 @@ static void ApplyPushedFilters(ReadZimGlobalState &g, TableFunctionInitInput &in
 	// on the emitted rows like any other).
 	const bool scan_is_open = !g.single_lookup && !g.scan_spec.path_prefix.has_value() &&
 	                          !g.scan_spec.title_prefix.has_value() && g.scan_spec.order == ScanOrder::ByPath;
-	// filters are keyed by *projected* (output) column index; map back to storage.
+	// Mimetype constants pushed from WHERE, kept OUT of g.scan_spec until the whole
+	// filter set has been walked: they narrow the named-parameter patterns, they do not
+	// join them (issue #34).
+	std::vector<std::string> pushed_mimetypes;
+	bool have_pushed_mimetype = false;
+	// filters are keyed by *projected* (output) column index; map back to storage. An
+	// index we cannot map is skipped rather than raised: this layer only reads less, and
+	// BuildFilterExpression — the layer results actually depend on — throws on exactly
+	// the same condition a moment later, so nothing is silently dropped.
 	for (auto &entry : input.filters->filters) {
 		const idx_t proj_idx = entry.first;
 		if (proj_idx >= g.column_ids.size()) {
@@ -547,7 +579,17 @@ static void ApplyPushedFilters(ReadZimGlobalState &g, TableFunctionInitInput &in
 		const column_t storage_col = g.column_ids[proj_idx];
 		const TableFilter &filter = *entry.second;
 		if (storage_col == COL_MIMETYPE) {
-			CollectMimetypeConstants(filter, g.scan_spec.mimetype_filter);
+			std::vector<std::string> constants;
+			CollectMimetypeConstants(filter, constants);
+			// An unrepresentable filter yields no constants: keep whatever the other
+			// entries gave us (a superset of the AND) instead of widening back out.
+			if (!constants.empty()) {
+				// The same column can carry more than one filter entry (it may be
+				// projected twice); those are AND-ed, so intersect exactly.
+				pushed_mimetypes =
+				    have_pushed_mimetype ? IntersectMimetypes(pushed_mimetypes, constants) : std::move(constants);
+				have_pushed_mimetype = true;
+			}
 		} else if (scan_is_open && !g.single_lookup && (storage_col == COL_PATH || storage_col == COL_TITLE)) {
 			std::string key;
 			if (FilterEqualityString(filter, key)) {
@@ -557,6 +599,16 @@ static void ApplyPushedFilters(ReadZimGlobalState &g, TableFunctionInitInput &in
 				g.mode = ScanMode::Lookup;
 			}
 		}
+	}
+	if (have_pushed_mimetype) {
+		auto narrowed = IntersectMimetypes(g.scan_spec.mimetype_filter, pushed_mimetypes);
+		if (!narrowed.empty()) {
+			g.scan_spec.mimetype_filter = std::move(narrowed);
+		}
+		// An empty intersection means no mimetype can satisfy both. We cannot express
+		// "accept nothing" here — an empty mimetype_filter means accept EVERYTHING — so
+		// leave the named-parameter filter untouched; it is still a superset, and
+		// g.filter_expression removes the remaining rows.
 	}
 }
 

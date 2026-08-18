@@ -289,3 +289,163 @@ SELECT count(*) FROM read_zim(['test/oracle/test.zim', 'test/oracle/test_zimit.z
 WHERE mimetype LIKE 'text/css%';
 ----
 2
+
+# ============================================================================
+# Regression: issue #34 — a pushed-down `WHERE mimetype = ...` was OR-ed into the
+# `mimetype :=` named parameter instead of intersected, so a WHERE clause could
+# make the query return MORE rows than the named parameter alone.
+#
+# The named parameter is an explicit argument: it defines the row set the table
+# function produces. A WHERE clause can only ever narrow that set. The scan-level
+# mimetype filter must therefore be the INTERSECTION of the two, never the union.
+#
+# test.zim: 3 text/html, 1 text/css (style.css), 1 image/png (I/logo.png),
+# 1 redirect (NULL mimetype).
+# ============================================================================
+
+# --- baselines: each filter on its own ---
+
+# named parameter only
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css');
+----
+1
+
+# WHERE only
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim') WHERE mimetype = 'image/png';
+----
+1
+
+# --- the reported bug: disjoint named parameter + WHERE must yield nothing ---
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css') WHERE mimetype = 'image/png';
+----
+0
+
+# the un-pushed reference agrees (`|| ''` defeats pushdown)
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css') WHERE mimetype || '' = 'image/png';
+----
+0
+
+# ...and so does the same query with filter pushdown switched off entirely
+statement ok
+SET disabled_optimizers='filter_pushdown';
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css') WHERE mimetype = 'image/png';
+----
+0
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'image/png') WHERE mimetype = 'text/css';
+----
+0
+
+query T
+SELECT path FROM read_zim('test/oracle/test.zim', mimetype := 'text/*') WHERE mimetype = 'text/css';
+----
+style.css
+
+statement ok
+RESET disabled_optimizers;
+
+# --- the other order ---
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'image/png') WHERE mimetype = 'text/css';
+----
+0
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'image/png') WHERE mimetype || '' = 'text/css';
+----
+0
+
+# --- overlapping filters keep exactly the intersection ---
+query T
+SELECT path FROM read_zim('test/oracle/test.zim', mimetype := 'text/*') WHERE mimetype = 'text/css';
+----
+style.css
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim', mimetype := 'text/*') WHERE mimetype = 'text/css')
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim', mimetype := 'text/*') WHERE mimetype || '' = 'text/css')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM read_zim('test/oracle/test.zim', mimetype := 'text/*') WHERE mimetype || '' = 'text/css')
+  EXCEPT
+  (SELECT * FROM read_zim('test/oracle/test.zim', mimetype := 'text/*') WHERE mimetype = 'text/css')
+);
+----
+0
+
+# a WHERE that is wider than the named parameter still cannot widen the result
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css') WHERE mimetype LIKE 'text/%';
+----
+1
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css')
+WHERE mimetype IN ('image/png', 'text/css');
+----
+1
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css')
+WHERE mimetype || '' IN ('image/png', 'text/css');
+----
+1
+
+# a list-valued named parameter intersected with a WHERE IN list
+query T
+SELECT path FROM read_zim('test/oracle/test.zim', mimetype := ['text/css', 'text/html'])
+WHERE mimetype IN ('image/png', 'text/css') ORDER BY path;
+----
+style.css
+
+# --- the same holds in every scan mode, not just the parallel path scan ---
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css', parallel := false)
+WHERE mimetype = 'image/png';
+----
+0
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css', listing := 'title')
+WHERE mimetype = 'image/png';
+----
+0
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css', path_prefix := 'A/')
+WHERE mimetype = 'text/html';
+----
+0
+
+# exact-lookup mode (named path := / pushed path = const) shares the same gate
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css', path := 'I/logo.png')
+WHERE mimetype = 'image/png';
+----
+0
+
+query I
+SELECT count(*) FROM read_zim('test/oracle/test.zim', mimetype := 'text/css')
+WHERE path = 'I/logo.png' AND mimetype = 'image/png';
+----
+0
+
+# --- and across a multi-file scan ---
+query I
+SELECT count(*) FROM read_zim(['test/oracle/test.zim', 'test/oracle/test_zimit.zim'], mimetype := 'text/css')
+WHERE mimetype = 'image/png';
+----
+0
