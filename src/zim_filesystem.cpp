@@ -231,6 +231,39 @@ public:
 		return static_cast<int64_t>(handle.Cast<ZimFileHandle>().size);
 	}
 
+	// Modification time of a zim:// entry == mtime of the archive file that contains
+	// it. A ZIM entry has no independent mtime: the archive is a single immutable
+	// container, written once, so every entry inside it shares the container's
+	// modification time. That is also the answer a caching consumer wants — replacing
+	// the .zim file on disk is the only way an entry's bytes can change, so the
+	// container's mtime is exactly the invalidation signal.
+	//
+	// Without this override the base FileSystem throws NotImplementedException, which
+	// blocks every consumer that stats a file before reading it — read_parquet most
+	// visibly, i.e. precisely the positional-read consumers the ranged-read VFS exists
+	// to serve.
+	//
+	// KNOWN INCONSISTENCY (not fixed here; needs its own change): ArchivePool caches an
+	// opened ZimArchive and never revalidates it against the file on disk. If the .zim
+	// is replaced while a pooled handle is still live, reads keep being served from the
+	// OLD archive while this method reports the NEW file's mtime — the two disagree, and
+	// a consumer that trusts the mtime to mean "contents changed" would see stale bytes
+	// under a fresh timestamp. Fixing that belongs in the pool (stat-on-Get and reopen
+	// when dev/inode/mtime/size moved), not here.
+	timestamp_t GetLastModifiedTime(FileHandle &handle) override {
+		ParsedZimPath parsed;
+		if (!TryParseZimUrl(handle.path, parsed)) {
+			throw IOException("Invalid zim:// path '%s' (expected zim://<archive>.zim/<content-path>)", handle.path);
+		}
+		// Stat through the DB's FileSystem rather than a raw stat(): the archive may
+		// live behind another registered VFS, and this keeps the one open-and-stat
+		// path DuckDB already uses. No libzim involvement — this is a file stat, not
+		// an archive read, so it deliberately does not go through the archive pool.
+		auto &fs = FileSystem::GetFileSystem(db);
+		auto archive_handle = fs.OpenFile(parsed.archive, FileFlags::FILE_FLAGS_READ);
+		return fs.GetLastModifiedTime(*archive_handle);
+	}
+
 	void Seek(FileHandle &handle, idx_t location) override {
 		handle.Cast<ZimFileHandle>().position = location;
 	}
