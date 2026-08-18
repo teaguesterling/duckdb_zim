@@ -76,3 +76,19 @@ being mangled.
 
 Not a function — a registered read-only filesystem. See
 [The zim:// filesystem](filesystem.md).
+
+## Writing archives
+
+### `COPY (query) TO 'out.zim' (FORMAT zim [, options])`
+
+Writes the query's rows into a new ZIM archive. Columns are resolved by name
+(`path`, `content` required; `title`, `mimetype`, `is_redirect`/`redirect_path`,
+`front_article`, `compress` optional). `size` and `file_path` are accepted and ignored, so
+`read_zim`'s own output pipes straight back in; any other unknown column is a bind-time
+error. Options cover metadata (`TITLE`, `DESCRIPTION`, `LANGUAGE`, `CREATOR`, `PUBLISHER`,
+`NAME`, `DATE`, `TAGS`, `METADATA`), `ILLUSTRATION`, `MAIN_PATH`, `INDEX` /
+`INDEX_LANGUAGE`, `COMPRESSION` (`'zstd'` \| `'none'`), `CLUSTER_SIZE`, `WORKERS`, and
+`ON_CONFLICT` (`'error'` \| `'first'`). The output path must not already exist. See
+[Writing archives](writing.md) for the full column/option reference and the caveats —
+in particular, copying an existing archive must read `content` as `BLOB`, never with
+`content_as_varchar := true`.

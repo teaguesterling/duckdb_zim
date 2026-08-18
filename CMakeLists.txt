@@ -29,7 +29,9 @@ set(EXTENSION_SOURCES
     src/zim_metadata.cpp
     src/zim_scalars.cpp
     src/zim_filesystem.cpp
-    src/zim_search.cpp)
+    src/zim_search.cpp
+    src/zim_writer.cpp
+    src/copy_to_zim.cpp)
 
 # libzim ships libzim.pc (vcpkg_fixup_pkgconfig in the port), so pkg-config is the
 # reliable discovery path and pulls in its transitive deps (zstd/liblzma/icu/xapian).

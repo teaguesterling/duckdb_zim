@@ -1,0 +1,649 @@
+# name: test/sql/copy_zim_errors.test
+# description: COPY ... TO ... (FORMAT zim) -- refusals and cleanup
+# group: [sql]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# --- the input must carry the required columns ------------------------------
+# Uses only known column names (content, title) so this isolates "path is
+# missing" from "an unrecognized column was rejected" -- the latter is a
+# separate assertion below (an unknown column like the old 'notpath' here now
+# also errors, but with "unknown column", since Task 6 added a strict
+# known-column check that runs before the required-column check).
+statement error
+COPY (SELECT 'x' AS title, 'y' AS content) TO '__TEST_DIR__/e1.zim' (FORMAT zim);
+----
+must have a 'path' column
+
+statement error
+COPY (SELECT 'x' AS path) TO '__TEST_DIR__/e2.zim' (FORMAT zim);
+----
+must have a 'content' column
+
+# --- input column types are checked at BIND time ----------------------------
+# Without this the mismatch surfaces from FlatVector::GetData<string_t>/<bool>
+# in the sink -- an InternalException, thrown mid-write after the archive has
+# already been started, which invalidates the database instead of producing a
+# SQL error. Design §4.1 fixes the type of every column; these assert two ends
+# of that table (a string-ish column and a BOOLEAN one).
+statement error
+COPY (SELECT 42 AS path, 'x' AS content) TO '__TEST_DIR__/t1.zim' (FORMAT zim);
+----
+column 'path' must be VARCHAR, not INTEGER
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content, 1 AS is_redirect)
+TO '__TEST_DIR__/t2.zim' (FORMAT zim);
+----
+column 'is_redirect' must be BOOLEAN, not INTEGER
+
+# content is the one string-ish column where BLOB is meaningful, so it takes
+# either -- but not a third type.
+statement error
+COPY (SELECT 'A/x' AS path, 42 AS content) TO '__TEST_DIR__/t3.zim' (FORMAT zim);
+----
+column 'content' must be VARCHAR or BLOB, not INTEGER
+
+# --- a NULL option value is rejected, never coerced -------------------------
+# DuckDB's own binder rejects a directly-spelled `WORKERS NULL` (bind_copy.cpp
+# BindCopyOption), but it does that check BEFORE unpacking an unnamed struct into
+# separate option values -- so `row(NULL)` slips a genuine NULL Value past it and
+# into copy_to_bind. Spelled that way here on purpose: `WORKERS NULL` would test
+# DuckDB's guard, not ours, and would pass even with our guard deleted.
+#
+# Measured before the fix, each of these:
+#   WORKERS / CLUSTER_SIZE  -> INTERNAL "Calling GetValueInternal on a value that
+#                              is NULL"  (invalidates the database)
+#   ILLUSTRATION            -> INTERNAL "Calling StringValue::Get on a NULL value"
+#   INDEX                   -> BooleanValue::Get read uninitialized memory behind a
+#                              D_ASSERT and resolved to TRUE in this release build
+#   MAIN_PATH / TITLE       -> ToString() returned the literal string "NULL", so the
+#                              archive got an entry/metadata value named "NULL"
+# Same bug class as issue #28 on the read side (zim_search.cpp NonNegativeParam).
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/n1.zim' (FORMAT zim, INDEX row(NULL));
+----
+INDEX must not be NULL
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/n2.zim' (FORMAT zim, WORKERS row(NULL));
+----
+WORKERS must not be NULL
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/n3.zim' (FORMAT zim, MAIN_PATH row(NULL));
+----
+MAIN_PATH must not be NULL
+
+# NULL::VARCHAR, not a bare NULL: an untyped NULL binds as INTEGER and would be
+# caught by the VARCHAR type guard instead, testing the wrong thing.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/n4.zim' (FORMAT zim, TITLE row(NULL::VARCHAR));
+----
+TITLE must not be NULL
+
+# a NULL BLOB is still typed BLOB, so ILLUSTRATION's type guard passes it through
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/n5.zim' (FORMAT zim, ILLUSTRATION row(NULL::BLOB));
+----
+ILLUSTRATION must not be NULL
+
+# The option-level guard cannot see inside a MAP: the map Value is non-NULL while
+# one of its values is NULL. Before this check that key's metadata was written as
+# the literal 4-character string "NULL".
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/n6.zim' (FORMAT zim, METADATA MAP {'Title': NULL::VARCHAR});
+----
+METADATA value for key 'Title' must not be NULL
+
+# --- NULL content on a non-redirect row is data loss, not an empty entry -----
+# Discarding this made the entry write as EMPTY, silently: no error, and a
+# content-comparison test still passes because NULL was read back as NULL. It is
+# what feeding a COPY from content_as_varchar := true does to every non-UTF-8
+# entry -- docs/writing.md calls that the single easiest way to lose data here.
+statement error
+COPY (SELECT 'A/x' AS path, NULL::VARCHAR AS content)
+TO '__TEST_DIR__/nullcontent.zim' (FORMAT zim);
+----
+entry 'A/x' has NULL content
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/nullcontent.zim');
+----
+0
+
+# a REDIRECT row legitimately has NULL content -- that must stay allowed
+statement ok
+COPY (SELECT * FROM (VALUES ('A/Real',  'hi', false, NULL),
+                            ('A/Alias', NULL, true,  'A/Real'))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/nullcontent_ok.zim' (FORMAT zim);
+
+query II
+SELECT is_redirect, redirect_path
+FROM read_zim('__TEST_DIR__/nullcontent_ok.zim') WHERE is_redirect;
+----
+true	A/Real
+
+# --- refusing to overwrite --------------------------------------------------
+statement ok
+COPY (SELECT 'A/One' AS path, 'first' AS content)
+TO '__TEST_DIR__/nooverwrite.zim' (FORMAT zim);
+
+statement error
+COPY (SELECT 'A/Two' AS path, 'second' AS content)
+TO '__TEST_DIR__/nooverwrite.zim' (FORMAT zim);
+----
+already exists
+
+# OVERWRITE / OVERWRITE_OR_IGNORE / APPEND are accepted by DuckDB's binder for
+# every format and consumed before copy_to_bind, so they are silently inert here.
+# The refusal must SAY so: "remove the file first" on its own reads as an
+# instruction to do by hand exactly what the caller just asked for.
+statement error
+COPY (SELECT 'A/Two' AS path, 'second' AS content)
+TO '__TEST_DIR__/nooverwrite.zim' (FORMAT zim, OVERWRITE true);
+----
+OVERWRITE, OVERWRITE_OR_IGNORE and APPEND are not supported for this format
+
+# the original survives untouched -- the refusal must not have damaged it
+query II
+SELECT path, content
+FROM read_zim('__TEST_DIR__/nooverwrite.zim',
+              include_content := true, content_as_varchar := true);
+----
+A/One	first
+
+# --- a leftover or in-flight "<target>.tmp" is refused too ------------------
+# libzim builds the whole archive at "<target>.tmp" and opens it O_CREAT|O_TRUNC
+# with NO O_EXCL (creator.cpp:602), so a second writer aimed at the same target
+# truncates and interleaves into the first one's buffer, and the corrupt result
+# still passes zim_check(). Measured before this check: a pre-existing
+# 'a.zim.tmp' was silently clobbered and the COPY reported success.
+#
+# The archive written here is a stand-in for the in-flight .tmp of a concurrent
+# write; only its existence matters to the check.
+statement ok
+COPY (SELECT 'A/One' AS path, 'in flight' AS content)
+TO '__TEST_DIR__/inflight.zim.tmp' (FORMAT zim);
+
+statement error
+COPY (SELECT 'A/Two' AS path, 'second' AS content)
+TO '__TEST_DIR__/inflight.zim' (FORMAT zim);
+----
+is either in progress in another connection or was interrupted partway through
+
+# the refusal did not touch the file it refused over
+query II
+SELECT path, content
+FROM read_zim('__TEST_DIR__/inflight.zim.tmp',
+              include_content := true, content_as_varchar := true);
+----
+A/One	in flight
+
+# ...and once it is out of the way the same COPY goes through, so the check is a
+# refusal over a real conflict and not a permanent block on the target name.
+statement ok
+COPY (SELECT 'A/Two' AS path, 'second' AS content)
+TO '__TEST_DIR__/inflight2.zim' (FORMAT zim);
+
+# --- a mid-stream error leaves NO output ------------------------------------
+# The CAST fails partway through, after the sink has already taken chunks. The
+# global state's destructor must unlink the partial archive.
+statement error
+COPY (SELECT 'A/' || i AS path,
+             (CASE WHEN i < 5000 THEN '1' ELSE 'not-a-number' END)::INTEGER::VARCHAR AS content
+      FROM range(10000) t(i))
+TO '__TEST_DIR__/aborted.zim' (FORMAT zim);
+----
+Conversion Error
+
+# If the file still existed this would succeed and return rows; it must fail to open.
+statement error
+SELECT count(*) FROM read_zim('__TEST_DIR__/aborted.zim');
+----
+failed to open ZIM
+
+# and no file exists at all under that name -- not "exists but fails zim_check",
+# genuinely absent. glob() on a non-matching path returns zero rows rather than
+# raising, so this asserts absence directly instead of going through zim_check,
+# which conflates "file is absent" with "file is present but corrupt".
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/aborted.zim');
+----
+0
+
+# --- duplicate paths --------------------------------------------------------
+statement error
+COPY (SELECT * FROM (VALUES ('A/Dup', 'first'), ('A/Dup', 'second')) t(path, content))
+TO '__TEST_DIR__/dup.zim' (FORMAT zim);
+----
+duplicate path 'A/Dup'
+
+# and it left nothing behind. zim_check() is not usable here: on this branch it
+# raises InvalidInputException for an unopenable archive rather than returning
+# false (see the identical reasoning above the "aborted" glob() check), so a
+# missing file cannot be distinguished from a present-but-corrupt one through
+# it. Assert absence directly instead.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/dup.zim');
+----
+0
+
+# ON_CONFLICT 'first' keeps the first occurrence
+statement ok
+COPY (SELECT * FROM (VALUES ('A/Dup', 'first'), ('A/Dup', 'second')) t(path, content))
+TO '__TEST_DIR__/dupfirst.zim' (FORMAT zim, ON_CONFLICT 'first');
+
+query II
+SELECT path, content
+FROM read_zim('__TEST_DIR__/dupfirst.zim',
+              include_content := true, content_as_varchar := true);
+----
+A/Dup	first
+
+# 'last' cannot be done streaming and is rejected at bind time, not silently buffered
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/duplast.zim' (FORMAT zim, ON_CONFLICT 'last');
+----
+ON_CONFLICT 'last' would require buffering every row
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/dupbad.zim' (FORMAT zim, ON_CONFLICT 'sideways');
+----
+ON_CONFLICT must be 'error' or 'first'
+
+# --- MAIN_PATH must name an entry the query actually produced ---------------
+statement error
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/badmain.zim' (FORMAT zim, MAIN_PATH 'A/Missing');
+----
+MAIN_PATH 'A/Missing' does not match any entry
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/badmain.zim');
+----
+0
+
+# --- a redirect must target a path the query actually produced -------------
+# libzim silently removes dangling redirects at finishZimCreation() with no
+# throw and no warning (design §7.4) -- announcing each removal only through
+# the stdout prints task 8 suppresses. So this must be caught before libzim
+# ever sees it, the same way MAIN_PATH is validated above.
+statement error
+COPY (SELECT * FROM (VALUES
+        ('A/Home', 'hi', false, NULL),
+        ('A/Gone', NULL, true, 'A/DoesNotExist'))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/badredirect.zim' (FORMAT zim);
+----
+redirect 'A/Gone' -> 'A/DoesNotExist' does not match any entry in the input
+
+# and it left nothing behind -- zim_check() is not usable here (see the
+# identical reasoning above the other glob() checks in this file).
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/badredirect.zim');
+----
+0
+
+# --- a redirect chain must TERMINATE at a real entry ------------------------
+# Pointing at a path that exists is not enough. libzim runs
+# removeLoopsAndBlindChainsOfRedirects() (creator.cpp:851) immediately after
+# detectDanglingRedirects(), and it markRemoved()s every redirect in a chain that
+# never reaches a real item. That drop is exactly as silent as the dangling-target
+# one -- its only announcement was an INFO() print the stdout patch deletes.
+#
+# Measured before the fix: this wrote an archive containing ONLY A/Home. Two input
+# rows vanished, no error, no warning.
+statement error
+COPY (SELECT * FROM (VALUES
+        ('A/Home', 'hi', false, NULL),
+        ('A/X', NULL, true, 'A/Y'),
+        ('A/Y', NULL, true, 'A/X'))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/loop.zim' (FORMAT zim);
+----
+is part of a redirect cycle
+
+# the message names the cycle itself, not just one arbitrary member of it
+statement error
+COPY (SELECT * FROM (VALUES
+        ('A/Home', 'hi', false, NULL),
+        ('A/X', NULL, true, 'A/Y'),
+        ('A/Y', NULL, true, 'A/X'))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/loop2.zim' (FORMAT zim);
+----
+'A/X' -> 'A/Y' -> 'A/X'
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/loop.zim');
+----
+0
+
+# a self-redirect is the one-node case of the same cycle. Its target IS in
+# seen_paths, so the dangling check passes it -- only the transitive walk catches
+# it. Measured before the fix: A/X was silently dropped.
+statement error
+COPY (SELECT * FROM (VALUES
+        ('A/Home', 'hi', false, NULL),
+        ('A/X', NULL, true, 'A/X'))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/selfredirect.zim' (FORMAT zim);
+----
+'A/X' -> 'A/X'
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/selfredirect.zim');
+----
+0
+
+# ...but a multi-hop chain that DOES terminate at an item is valid and must keep
+# working. libzim resolves it; the check must not reject depth for its own sake.
+statement ok
+COPY (SELECT * FROM (VALUES
+        ('A/Real', 'hi', false, NULL),
+        ('A/B', NULL, true, 'A/Real'),
+        ('A/C', NULL, true, 'A/B'),
+        ('A/D', NULL, true, 'A/C'))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/redirectchain.zim' (FORMAT zim);
+
+query II
+SELECT path, redirect_path
+FROM read_zim('__TEST_DIR__/redirectchain.zim')
+WHERE is_redirect ORDER BY path;
+----
+A/B	A/Real
+A/C	A/B
+A/D	A/C
+
+# a redirect declared before its target in the same COPY is fine -- finalize
+# runs only after every row has been seen, so declaration order cannot matter.
+statement ok
+COPY (SELECT * FROM (VALUES
+        ('A/Alias', NULL, true, 'A/Real'),
+        ('A/Real', 'hi', false, NULL))
+      t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/redirectorder.zim' (FORMAT zim);
+
+query II
+SELECT is_redirect, redirect_path
+FROM read_zim('__TEST_DIR__/redirectorder.zim')
+WHERE is_redirect;
+----
+true	A/Real
+
+# a metadata key given twice, once named and once in the map, is an error
+statement error
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/dupmeta.zim'
+   (FORMAT zim, TITLE 'One', METADATA MAP {'Title': 'Two'});
+----
+metadata key 'Title' given twice
+
+# METADATA values must be VARCHAR -- a BLOB entry would otherwise be silently
+# \x-escaped by ToString(), corrupting binary content the same way ILLUSTRATION did.
+statement error
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/badmetablob.zim' (FORMAT zim, METADATA MAP {'Title': '\x89PNG'::BLOB});
+----
+METADATA values must be VARCHAR
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/badmetablob.zim');
+----
+0
+
+# --- INDEX needs a language -------------------------------------------------
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/noidxlang.zim' (FORMAT zim, INDEX true);
+----
+INDEX requires a language
+
+# ...and the mirror: a language with no INDEX. ZimWriter only calls
+# configIndexing() when config.index is set, so this wrote an archive with NO
+# fulltext index -- measured before the fix: it succeeded and zim_search()
+# returned 0 rows against the result, with no error anywhere. Rejected rather
+# than treated as an implicit INDEX true: indexing costs time and bytes, and
+# doing more than was asked is its own surprise.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/langnoidx.zim' (FORMAT zim, INDEX_LANGUAGE 'eng');
+----
+INDEX_LANGUAGE has no effect without INDEX true
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/langnoidx.zim');
+----
+0
+
+# LANGUAGE (the metadata option) does NOT trip that check -- it only feeds the
+# index language when INDEX true was also asked for. Writing plain metadata with
+# no index must stay legal.
+statement ok
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/langonly.zim' (FORMAT zim, LANGUAGE 'eng');
+
+# --- MAIN_PATH and INDEX_LANGUAGE are VARCHAR, like every other ToString() option
+# ToString() is a formatted cast: on a BLOB it goes through CastFromBlob and
+# \x-escapes every byte >= 0x80. METADATA and ILLUSTRATION already guard against
+# that; these two did not. Measured before the fix: MAIN_PATH encode('A/café')
+# became the 12-character 'A/caf\xC3\xA9' and failed the finalize check naming a
+# path the caller never typed, and INDEX_LANGUAGE encode('eng') silently
+# configured a mangled stemmer language.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/mainblob.zim' (FORMAT zim, MAIN_PATH encode('A/x'));
+----
+MAIN_PATH must be VARCHAR, not BLOB
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/idxlangblob.zim' (FORMAT zim, INDEX true, INDEX_LANGUAGE encode('eng'));
+----
+INDEX_LANGUAGE must be VARCHAR, not BLOB
+
+# the rejection has to be about the TYPE, not about the escaping being visible:
+# an all-ASCII BLOB escapes to itself, so it would sail through a check that only
+# compared the round-tripped string.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/mainblob.zim');
+----
+0
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/badcomp.zim' (FORMAT zim, COMPRESSION 'gzip');
+----
+COMPRESSION must be
+
+# 'lzma' gets its OWN message, not the generic one: libzim 9.7.0 removed LZMA
+# from the ZIM format, so the useful answer is "that compressor no longer
+# exists", not "pick from this list". Silently substituting zstd would lie to a
+# caller who asked for a specific compression.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/lzma.zim' (FORMAT zim, COMPRESSION 'lzma');
+----
+COMPRESSION 'lzma' is not available
+
+# --- option values that are the wrong shape ---------------------------------
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/badillus.zim' (FORMAT zim, ILLUSTRATION 42);
+----
+ILLUSTRATION must be VARCHAR or BLOB, not INTEGER
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/badmeta2.zim' (FORMAT zim, METADATA 'not-a-map');
+----
+METADATA must be a MAP
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/badopt.zim' (FORMAT zim, FLUGELHORN 3);
+----
+unknown option 'FLUGELHORN'
+
+# CLUSTER_SIZE 0 is the sentinel ZimWriterConfig uses for "leave libzim's default
+# alone", so accepting it would silently ignore the option rather than honour it.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/cs0.zim' (FORMAT zim, CLUSTER_SIZE 0);
+----
+CLUSTER_SIZE must be at least 1 byte
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/w0.zim' (FORMAT zim, WORKERS 0);
+----
+WORKERS must be between 1 and 256
+
+# each worker is a thread inside libzim, so an unbounded WORKERS turns a
+# fat-fingered literal into a spawn storm rather than a SQL error
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/wbig.zim' (FORMAT zim, WORKERS 100000);
+----
+WORKERS must be between 1 and 256
+
+# --- a genuinely unknown column is still an error ---------------------------
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content, 'z' AS titel)
+TO '__TEST_DIR__/typo.zim' (FORMAT zim);
+----
+unknown column 'titel'
+
+# --- v2 columns are refused as deferred, not as typos -----------------------
+# entry_kind is a v2 column. In v1 it cannot be accepted at all, so the error
+# says "not supported yet" rather than "unknown column" -- a deferral must read
+# as a deferral. There is deliberately no mutual-exclusion check against
+# is_redirect here: a column that cannot be supplied at all cannot conflict
+# with anything, so such a check would be unreachable in v1.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content, false AS is_redirect, 'item' AS entry_kind)
+TO '__TEST_DIR__/bothspellings.zim' (FORMAT zim);
+----
+not supported yet
+
+# ...but source_archive / source_entry are NOT deferred columns. They were the
+# four-column alternative design §4.2 explicitly rejected in favour of the single
+# `zim://` locator, and §10's v2 list does not contain them -- so promising them
+# as "not supported yet" would promise a v2 that will not exist. They are typos
+# as far as this format is concerned.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content, 'a.zim' AS source_archive)
+TO '__TEST_DIR__/srcarch.zim' (FORMAT zim);
+----
+unknown column 'source_archive'
+
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content, 'A/e' AS source_entry)
+TO '__TEST_DIR__/srcent.zim' (FORMAT zim);
+----
+unknown column 'source_entry'
+
+# --- options that must be refused, not ignored ------------------------------
+# PARTITION_BY is consumed by DuckDB's own binder before copy_to_bind ever sees
+# it (bind_copy.cpp clears stmt.info->options after extracting it), so the
+# rejection has to happen in initialize_operator, which is the only hook that
+# sees the PhysicalCopyToFile carrying partition_columns.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content, 'en' AS lang)
+TO '__TEST_DIR__/parts' (FORMAT zim, PARTITION_BY (lang));
+----
+PARTITION_BY is not supported yet
+
+# initialize_operator fires after copy_to_initialize_global, so a ZimWriter was
+# already constructed when the throw happened. Assert the end state anyway: no
+# .zim survives anywhere under the partition directory.
+#
+# What actually removes it is libzim, not our destructor -- design §7.2, as
+# corrected. libzim writes to "<target>.tmp" and renames to the target name only
+# at the end of a successful finishZimCreation(), so the file on disk here is
+# `data_0.zim.tmp` and ~Creator removes it; the global state's unlink finds
+# nothing at `data_0.zim` to remove. This assertion is kept because it pins the
+# end state regardless of which mechanism delivers it, and would catch a future
+# change that finalizes on an error path. zim_check() is deliberately not used
+# here (see the identical reasoning above the "aborted" and "dup" glob checks).
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/parts/**/*.zim');
+----
+0
+
+# PER_THREAD_OUTPUT reaches us the same way PARTITION_BY does, and must be
+# refused for the same reason. physical_copy_to_file.cpp creates one
+# GlobalFunctionData -- one ZimWriter -- PER THREAD and finalizes each
+# separately, so accepting it would write data_0.zim, data_1.zim, ... each with
+# its own seen_paths (duplicate detection defeated ACROSS files), its own
+# MAIN_PATH validation, and a duplicate copy of the metadata: exactly the
+# fragmentation §3.3 refuses PARTITION_BY for, with no key to explain it.
+# Measured before the fix: this wrote __TEST_DIR__/pto/data_0.zim and reported
+# success.
+statement error
+COPY (SELECT 'A/' || i AS path, 'y' AS content FROM range(5) t(i))
+TO '__TEST_DIR__/pto' (FORMAT zim, PER_THREAD_OUTPUT true);
+----
+PER_THREAD_OUTPUT is not supported
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/pto/**/*.zim');
+----
+0
+
+# --- COPY must not report success when no archive was written ---------------
+# The refusal above is not free: PhysicalCopyToFile::GetGlobalSinkState calls
+# CreateDirectory(file_path) BEFORE initialize_operator runs, so the statement
+# that was rejected has already left a DIRECTORY at __TEST_DIR__/pto. The obvious
+# next thing a user types is the same COPY without the option -- and that target
+# is now a directory.
+#
+# libzim's finishZimCreation() ends with rename("<target>.tmp", "<target>"), and
+# FS::rename (src/fs_unix.cpp:103) discards ::rename()'s return value, so the
+# rename failing against a directory raises nothing. Measured before the fix:
+# this reported success, exited 0, wrote no archive, and left a stray
+# __TEST_DIR__/pto.tmp behind. Depends on the PER_THREAD_OUTPUT statement above
+# having created the directory -- do not reorder them.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content) TO '__TEST_DIR__/pto' (FORMAT zim);
+----
+no archive was written to
+
+# the error names the output path, so the message points at the real problem
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content) TO '__TEST_DIR__/pto' (FORMAT zim);
+----
+pto
+
+# and the half-written sibling is gone. libzim clears tmpFileName right after the
+# rename call, so ~CreatorData's own cleanup no longer fires for it -- Finalize
+# removes it explicitly. glob() matches files, not the pto directory itself.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/pto.tmp');
+----
+0
+
+# FILE_SIZE_BYTES is also consumed by DuckDB's binder before copy_to_bind, but
+# DuckDB itself rejects it for any format that leaves CopyFunction::rotate_files
+# unset (nullptr) -- which this extension deliberately does. No code here
+# implements the rejection; this test exists to confirm DuckDB's default
+# behavior actually still fires the way this extension depends on.
+statement error
+COPY (SELECT 'A/x' AS path, 'y' AS content)
+TO '__TEST_DIR__/rot.zim' (FORMAT zim, FILE_SIZE_BYTES 1000);
+----
+FILE_SIZE_BYTES

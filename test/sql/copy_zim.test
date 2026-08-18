@@ -1,0 +1,321 @@
+# name: test/sql/copy_zim.test
+# description: COPY ... TO ... (FORMAT zim) -- writing archives
+# group: [sql]
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# --- minimal write: two items round-trip through read_zim -------------------
+statement ok
+COPY (SELECT * FROM (VALUES ('A/One', 'One', 'text/html', 'first'),
+                            ('A/Two', 'Two', 'text/html', 'second'))
+        t(path, title, mimetype, content))
+TO '__TEST_DIR__/minimal.zim' (FORMAT zim);
+
+query III
+SELECT path, title, mimetype
+FROM read_zim('__TEST_DIR__/minimal.zim')
+ORDER BY path;
+----
+A/One	One	text/html
+A/Two	Two	text/html
+
+query I
+SELECT content
+FROM read_zim('__TEST_DIR__/minimal.zim', path := 'A/One',
+              include_content := true, content_as_varchar := true);
+----
+first
+
+# title defaults to path when the column is absent
+statement ok
+COPY (SELECT 'A/NoTitle' AS path, 'x' AS content)
+TO '__TEST_DIR__/notitle.zim' (FORMAT zim);
+
+query II
+SELECT path, title FROM read_zim('__TEST_DIR__/notitle.zim');
+----
+A/NoTitle	A/NoTitle
+
+# --- mimetype defaults from the CONTENT COLUMN'S TYPE -----------------------
+# Not cosmetic: libzim writes "WARNING: mimetype missing for <path>" to stderr
+# once PER ROW, so a 15,000-entry archive with no mimetype is 15,000 lines of
+# stderr. Deriving the default from the SQL type is the advantage DuckDB's type
+# system gives us -- text and bytes are distinguishable here.
+statement ok
+COPY (SELECT 'A/Text' AS path, 'plain words' AS content)
+TO '__TEST_DIR__/deftext.zim' (FORMAT zim);
+
+query I
+SELECT mimetype FROM read_zim('__TEST_DIR__/deftext.zim');
+----
+text/plain
+
+statement ok
+COPY (SELECT 'A/Bytes' AS path, '\x00\x01\x02'::BLOB AS content)
+TO '__TEST_DIR__/defblob.zim' (FORMAT zim);
+
+query I
+SELECT mimetype FROM read_zim('__TEST_DIR__/defblob.zim');
+----
+application/octet-stream
+
+# --- metadata options -------------------------------------------------------
+statement ok
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/meta.zim'
+   (FORMAT zim, TITLE 'My Archive', DESCRIPTION 'a test', LANGUAGE 'eng',
+    CREATOR 'me', PUBLISHER 'us', NAME 'testarchive', DATE '2026-08-17',
+    TAGS 'test;demo', MAIN_PATH 'A/Home');
+
+query I
+SELECT zim_metadata('__TEST_DIR__/meta.zim', 'Title');
+----
+My Archive
+
+query I
+SELECT zim_metadata('__TEST_DIR__/meta.zim', 'Language');
+----
+eng
+
+query I
+SELECT zim_main_entry('__TEST_DIR__/meta.zim');
+----
+A/Home
+
+# arbitrary keys via the METADATA map
+statement ok
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/meta2.zim'
+   (FORMAT zim, METADATA MAP {'Title': 'From Map', 'Source': 'nowhere'});
+
+query I
+SELECT zim_metadata('__TEST_DIR__/meta2.zim', 'Source');
+----
+nowhere
+
+# --- illustration option -----------------------------------------------------
+# The payload below starts with 0x89 (>= 0x80) on purpose: Value::ToString() on a
+# BLOB escapes every byte >= 0x80 as a 4-character \xHH sequence (CastFromBlob).
+# A pure-ASCII payload would pass even with that bug present, so it would be a
+# worthless test -- assert byte-for-byte equality, not just that COPY succeeded.
+statement ok
+COPY (SELECT 'A/Home' AS path, 'hi' AS content)
+TO '__TEST_DIR__/illustration.zim'
+   (FORMAT zim, ILLUSTRATION '\x89PNG\x0D\x0A\x1A\x0A fake48illustration'::BLOB);
+
+query I
+SELECT zim_illustration('__TEST_DIR__/illustration.zim') = '\x89PNG\x0D\x0A\x1A\x0A fake48illustration'::BLOB
+----
+true
+
+query I
+SELECT octet_length(zim_illustration('__TEST_DIR__/illustration.zim'))
+----
+27
+
+# --- fulltext index ---------------------------------------------------------
+
+statement ok
+COPY (SELECT * FROM (VALUES ('A/Photo', 'Photosynthesis', 'text/html',
+                             '<html><body>Photosynthesis converts light into sugar.</body></html>'),
+                            ('A/Water', 'Water', 'text/html',
+                             '<html><body>Water is essential to plants.</body></html>'))
+        t(path, title, mimetype, content))
+TO '__TEST_DIR__/indexed.zim' (FORMAT zim, LANGUAGE 'eng', INDEX true);
+
+query I
+SELECT count(*) > 0 FROM zim_search('__TEST_DIR__/indexed.zim', 'photosynthesis');
+----
+true
+
+# without INDEX, no fulltext index is built
+statement ok
+COPY (SELECT 'A/Photo' AS path, 'text/html' AS mimetype,
+             '<html><body>Photosynthesis</body></html>' AS content)
+TO '__TEST_DIR__/unindexed.zim' (FORMAT zim, LANGUAGE 'eng');
+
+query I
+SELECT (zim_info('__TEST_DIR__/unindexed.zim')).has_fulltext_index;
+----
+false
+
+# --- the naive round trip binds and succeeds --------------------------------
+# NOTE: the plan's draft used content_as_varchar := true for the round-trip
+# source. That is wrong, not just for the comparison below but for the COPY
+# itself: content_as_varchar returns SQL NULL for any content that is not
+# valid UTF-8 (src/read_zim.cpp's IsValidUtf8 guard), and test.zim's I/logo.png
+# is a binary (non-UTF-8) fake PNG. Piping that NULL through COPY silently
+# writes an EMPTY item instead of the image's 16 bytes -- a real, silent data
+# loss in the copy, not just a test artifact. Read content as BLOB (the
+# default) instead, which preserves it byte for byte.
+statement ok
+COPY (SELECT * FROM read_zim('test/oracle/test.zim', include_content := true))
+TO '__TEST_DIR__/roundtrip.zim' (FORMAT zim);
+
+# same entry count, and the redirect survived as a redirect
+query I
+SELECT (SELECT count(*) FROM read_zim('__TEST_DIR__/roundtrip.zim'))
+     = (SELECT count(*) FROM read_zim('test/oracle/test.zim'));
+----
+true
+
+# Measured directly (do not trust a plan's guessed value): the fixture's only
+# redirect is A/Photosynth -> A/Photosynthesis, not A/Calcium.
+query II
+SELECT is_redirect, redirect_path
+FROM read_zim('__TEST_DIR__/roundtrip.zim')
+WHERE is_redirect
+ORDER BY path;
+----
+true	A/Photosynthesis
+
+# content matches entry for entry -- BLOB comparison, for the same reason the
+# COPY above avoids content_as_varchar: I/logo.png's bytes are not valid UTF-8,
+# so a VARCHAR comparison would compare two NULLs (trivially "equal", proving
+# nothing) instead of actually checking the bytes.
+query I
+SELECT count(*)
+FROM read_zim('test/oracle/test.zim', include_content := true) a
+JOIN read_zim('__TEST_DIR__/roundtrip.zim', include_content := true) b
+  USING (path)
+WHERE a.content IS DISTINCT FROM b.content;
+----
+0
+
+# the archive-level counters agree too -- a content-only assertion cannot fail
+# where the round trip is not an identity (design §8). Measured: test.zim has
+# no aliases, so entry_count is a true identity here (6 == 6).
+query I
+SELECT (SELECT (zim_info('__TEST_DIR__/roundtrip.zim')).entry_count)
+     = (SELECT (zim_info('test/oracle/test.zim')).entry_count);
+----
+true
+
+# zim_counter() is the second assertable counter: it histograms USER entries by
+# mimetype, which is exactly what COPY carries. Measured, both sides:
+# {image/png=1, text/css=1, text/html=3}.
+query I
+SELECT zim_counter('__TEST_DIR__/roundtrip.zim') = zim_counter('test/oracle/test.zim');
+----
+true
+
+# all_entry_count is the third counter §8 asked for, and it is NOT an identity --
+# measured 16 (source) vs 9 (copy). This is not a defect and not fixable from the
+# writer: a ZIM->ZIM COPY carries no metadata, no illustration and no main entry,
+# because those come only from OPTIONS and the input schema has no column for
+# them. The seven-entry gap here is exactly the five metadata entries the source
+# carries beyond Counter (Creator, Date, Description, Language, Title) plus the
+# two Xapian entries of its fulltext index, which the copy did not request. So
+# assert the DIRECTION -- the copy is a strict subset of the source's full entry
+# list -- rather than equality, which cannot hold.
+query I
+SELECT (SELECT (zim_info('__TEST_DIR__/roundtrip.zim')).all_entry_count)
+     < (SELECT (zim_info('test/oracle/test.zim')).all_entry_count);
+----
+true
+
+# ...and assert the CAUSE directly, so the inequality above cannot silently start
+# holding for some unrelated reason: user metadata and the main entry are dropped.
+query III
+SELECT list_contains(zim_metadata_keys('test/oracle/test.zim'), 'Title'),
+       list_contains(zim_metadata_keys('__TEST_DIR__/roundtrip.zim'), 'Title'),
+       zim_main_entry('__TEST_DIR__/roundtrip.zim') IS NULL;
+----
+true	false	true
+
+# --- options with no reader surface still have to bind and write -------------
+# WORKERS, CLUSTER_SIZE and COMPRESSION change how libzim lays out the archive,
+# not what an archive reports, so nothing can assert their effect through the
+# reader. A round trip through them is the strongest available check: it proves
+# the values reach libzim's config* calls without being rejected and that the
+# resulting archive is still readable byte for byte.
+statement ok
+COPY (SELECT 'A/Opt' AS path, 'hello world' AS content)
+TO '__TEST_DIR__/opts.zim'
+   (FORMAT zim, WORKERS 2, CLUSTER_SIZE 1048576, COMPRESSION 'none');
+
+query II
+SELECT path, content
+FROM read_zim('__TEST_DIR__/opts.zim',
+              include_content := true, content_as_varchar := true);
+----
+A/Opt	hello world
+
+# front_article / compress are libzim Hints. libzim consumes them when laying out
+# clusters and the ZIM format preserves no readable trace of either, so -- as with
+# WORKERS above -- a bind-and-round-trip smoke test is the best available check.
+# Both are tri-state in ZimWriteEntry (absent = let libzim decide), so this also
+# covers the has_* plumbing for a true and a false value.
+statement ok
+COPY (SELECT * FROM (VALUES ('A/Front', 'x', true,  true),
+                            ('A/Back',  'y', false, false))
+        t(path, content, front_article, compress))
+TO '__TEST_DIR__/hints.zim' (FORMAT zim);
+
+query II
+SELECT path, content
+FROM read_zim('__TEST_DIR__/hints.zim',
+              include_content := true, content_as_varchar := true)
+ORDER BY path;
+----
+A/Back	y
+A/Front	x
+
+# --- INDEX_LANGUAGE independently of LANGUAGE -------------------------------
+# INDEX_LANGUAGE sets the stemming language ONLY; unlike LANGUAGE it writes no
+# Language metadata. Assert both halves, or this cannot be told apart from the
+# LANGUAGE-derived default the indexed.zim case above exercises.
+statement ok
+COPY (SELECT 'A/Photo' AS path, 'text/html' AS mimetype,
+             '<html><body>Photosynthesis converts light into sugar.</body></html>' AS content)
+TO '__TEST_DIR__/idxlang.zim' (FORMAT zim, INDEX true, INDEX_LANGUAGE 'eng');
+
+query I
+SELECT count(*) > 0 FROM zim_search('__TEST_DIR__/idxlang.zim', 'photosynthesis');
+----
+true
+
+query I
+SELECT list_contains(zim_metadata_keys('__TEST_DIR__/idxlang.zim'), 'Language');
+----
+false
+
+# --- a zero-row input writes a valid, empty archive -------------------------
+# Not an error: an empty result set is a legitimate corpus of zero entries, and
+# libzim finalizes it happily. The failure mode this guards against is finalize
+# assuming at least one row was seen.
+statement ok
+COPY (SELECT 'A/x' AS path, 'y' AS content WHERE false)
+TO '__TEST_DIR__/empty.zim' (FORMAT zim);
+
+query I
+SELECT count(*) FROM read_zim('__TEST_DIR__/empty.zim');
+----
+0
+
+query I
+SELECT zim_check('__TEST_DIR__/empty.zim');
+----
+true
+
+# --- a skipped duplicate must not register a redirect target ----------------
+# The second row here is dropped by ON_CONFLICT 'first' before it is written, so
+# its dangling redirect_path ('A/Nope') must never be validated: it belongs to an
+# entry that does not exist in the output. Recording the target above the dedup
+# check made this COPY fail with "redirect 'A/x' -> 'A/Nope' does not match any
+# entry", rejecting the whole archive over a row deliberately never written.
+statement ok
+COPY (SELECT * FROM (VALUES ('A/x', 'c',  false, NULL),
+                            ('A/x', NULL, true,  'A/Nope'))
+        t(path, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/skipredirect.zim' (FORMAT zim, ON_CONFLICT 'first');
+
+query III
+SELECT path, content, is_redirect
+FROM read_zim('__TEST_DIR__/skipredirect.zim',
+              include_content := true, content_as_varchar := true);
+----
+A/x	c	false

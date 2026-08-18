@@ -96,6 +96,9 @@ jobs:
           # #21 guard: searching a no-stemmer-language archive must not leak
           # libzim's "No stemming ..." line to stdout (sqllogictest can't see stdout).
           DUCKDB_BIN="$PWD/duckdb-cli/duckdb" ZIM_EXTENSION="$ext" bash test/no_stdout_pollution.sh
+          # Writer counterpart of the #21 guard above: writing a ZIM must not leak
+          # libzim's writer-side INFO() prints to stdout either.
+          DUCKDB_BIN="$PWD/duckdb-cli/duckdb" ZIM_EXTENSION="$ext" bash test/no_writer_stdout_pollution.sh
 
   # The parallel read_zim scan reads one shared libzim Archive from many threads
   # (see DESIGN.md). A ThreadSanitizer build of the extension runs the many-entry

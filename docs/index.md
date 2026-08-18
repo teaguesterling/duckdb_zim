@@ -37,6 +37,8 @@ FROM read_text('zim://wikipedia.zim/A/Photosynthesis');   -- LOAD webbed;
 - **Metadata & utilities** — `read_zim_metadata`, `zim_counter`, `zim_info`,
   `zim_illustration`, `zim_random`, `zim_check`, and the lookup scalars. See the
   **[function reference](reference.md)**.
+- **[Writing archives](writing.md)** — `COPY (query) TO 'out.zim' (FORMAT zim)` turns any
+  query into a new ZIM archive.
 
 ## Status
 

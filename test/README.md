@@ -38,6 +38,24 @@ python3 test/oracle/make_zimit_fixture.py
 - `zim_utilities.test`       — `zim_suggest` / `zim_illustration` / `zim_random` / `zim_check`
 - `zim_zimit.test`           — zimit-style full-URL paths, trailing slashes, no-index search
 - `zim_errors.test`          — binder validation + bad-archive handling
+- `copy_zim.test`            — `COPY ... TO ... (FORMAT zim)`: write, round trip, metadata, index
+- `copy_zim_errors.test`     — write refusals: existing output, duplicates, bad options
+
+## stdout-cleanliness shell tests
+
+sqllogictest compares query results via the API and never inspects process stdout, so two
+regressions get their own shell scripts instead:
+
+- `test/no_stdout_pollution.sh` — searching a ZIM whose language Xapian can't stem (e.g.
+  Chinese) must not print libzim's `No stemming for language 'X'` to stdout (issue #21).
+- `test/no_writer_stdout_pollution.sh` — writing a ZIM (`COPY ... TO ... (FORMAT zim)`)
+  must not print any of libzim's writer `INFO()` lines (`Set entry indices`, `Index
+  titles`, `Detect dangling redirects`, …) to stdout; `configVerbose(false)` doesn't gate
+  that macro. Both regressions are covered by patches in `vcpkg_ports/libzim/`.
+
+Run locally after a build: `bash test/no_stdout_pollution.sh` /
+`bash test/no_writer_stdout_pollution.sh` (same `DUCKDB_BIN` / `ZIM_EXTENSION` overrides as
+below).
 
 ## Remote (http) integration test
 
