@@ -1,0 +1,112 @@
+# name: test/sql/zim_filesystem_parquet.test
+# description: read_parquet over zim:// — the positional-read consumer path (GetLastModifiedTime)
+# group: [sql]
+
+# Before ZimFileSystem overrode GetLastModifiedTime, this whole file was
+# impossible: read_parquet stats a file before reading it, and the base
+# FileSystem::GetLastModifiedTime throws NotImplementedException, so every
+# read_parquet('zim://…') died with
+#   Not implemented Error: ZimFileSystem: GetLastModifiedTime is not implemented!
+# The override reports the mtime of the containing .zim file — a ZIM entry has no
+# mtime of its own, and replacing the archive is the only way its bytes change.
+#
+# This lives in its own file (rather than in zim_filesystem.test) because
+# `require parquet` applies to the whole file, and a build without the parquet
+# extension must skip only this coverage, not the rest of the VFS tests.
+
+require zim
+
+require parquet
+
+statement ok
+PRAGMA enable_verification
+
+# --- fixture: a real parquet file carried into an archive as a BLOB ------------
+# The content column MUST stay BLOB. With content_as_varchar the non-UTF-8
+# parquet bytes come back NULL, an empty entry gets written, and a weaker test
+# would still pass — hence the explicit size assertions below.
+statement ok
+CREATE TABLE pq_src AS
+SELECT i AS id, 'row_' || i AS name, i * 1.5 AS val FROM range(1000) t(i);
+
+statement ok
+COPY pq_src TO '__TEST_DIR__/pq_src.parquet' (FORMAT parquet);
+
+statement ok
+CREATE TABLE pq_bytes AS SELECT content FROM read_blob('__TEST_DIR__/pq_src.parquet');
+
+query II
+SELECT typeof(content), octet_length(content) > 0 FROM pq_bytes;
+----
+BLOB	true
+
+statement ok
+COPY (SELECT 'data/src.parquet' AS path,
+             'application/vnd.apache.parquet' AS mimetype,
+             content
+      FROM pq_bytes)
+TO '__TEST_DIR__/parquet_in.zim' (FORMAT zim);
+
+# the entry survived the write at full size (an empty entry would read as 0)
+query I
+SELECT octet_length(content) = (SELECT octet_length(content) FROM pq_bytes)
+FROM read_blob('zim://__TEST_DIR__/parquet_in.zim/data/src.parquet');
+----
+true
+
+# --- the payoff: read_parquet straight out of the archive ---------------------
+query IIII
+SELECT count(*), sum(id), min(name), max(val)
+FROM read_parquet('zim://__TEST_DIR__/parquet_in.zim/data/src.parquet');
+----
+1000	499500	row_0	1498.5
+
+# every row round-trips, not just the aggregates (both directions)
+query I
+SELECT count(*) FROM (
+  SELECT * FROM read_parquet('zim://__TEST_DIR__/parquet_in.zim/data/src.parquet')
+  EXCEPT ALL
+  SELECT * FROM pq_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM pq_src
+  EXCEPT ALL
+  SELECT * FROM read_parquet('zim://__TEST_DIR__/parquet_in.zim/data/src.parquet')
+);
+----
+0
+
+# projection + filter pushdown through the parquet reader's positional reads
+query II
+SELECT id, name
+FROM read_parquet('zim://__TEST_DIR__/parquet_in.zim/data/src.parquet')
+WHERE id BETWEEN 997 AND 999
+ORDER BY id;
+----
+997	row_997
+998	row_998
+999	row_999
+
+# --- the mtime itself: the archive's, not an epoch placeholder ----------------
+query I
+SELECT last_modified = (SELECT last_modified
+                        FROM read_blob('__TEST_DIR__/parquet_in.zim'))
+FROM read_blob('zim://__TEST_DIR__/parquet_in.zim/data/src.parquet');
+----
+true
+
+# every entry in one archive reports the same (container) mtime
+statement ok
+COPY (SELECT 'a.txt' AS path, 'one' AS content
+      UNION ALL SELECT 'b/c.txt', 'two')
+TO '__TEST_DIR__/two_entries.zim' (FORMAT zim);
+
+query I
+SELECT count(DISTINCT last_modified)
+FROM read_blob('zim://__TEST_DIR__/two_entries.zim/**');
+----
+1

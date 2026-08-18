@@ -30,9 +30,21 @@ after the `.zim/` boundary is the entry path within the archive. Split archives
   (`zim://archive.zim/www.nhs.uk/medicines/insulin/`).
 
 !!! note "Memory"
-    A ZIM item is a decompressed blob, not a seekable byte range, so an entry is
-    materialized into memory on open. Fine for articles; a single very large media item
-    costs its size in RAM.
+    Opening a `zim://` path does **not** materialize the entry: the handle serves
+    ranged reads out of the archive, so a consumer that reads byte ranges (Parquet,
+    CSV, a media player) never holds the whole item.
+
+    Measured on a 268 MB entry: opening it and reading one 1 MiB window costs
+    ~2 MB of peak RSS, against ~524 MB before.
+
+    A consumer that reads the whole file anyway — `read_blob`, `read_text`,
+    `read_html` — still ends up with one full copy in *its own* buffer. That is
+    unavoidable; what changed is that the extension no longer keeps a second copy
+    beside it (peak RSS on that same 268 MB entry: 550 MB → 417 MB).
+
+    `zim_max_content_size` still applies when a `zim://` path is opened, against
+    the entry's declared decompressed size, because those whole-file consumers
+    would go on to allocate it.
 
 ## Composition example
 

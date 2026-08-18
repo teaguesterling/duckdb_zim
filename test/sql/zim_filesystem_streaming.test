@@ -1,0 +1,112 @@
+# name: test/sql/zim_filesystem_streaming.test
+# description: zim:// ranged reads (#27) — the VFS serves windows out of a pinned
+# group: [sql]
+
+#              libzim item instead of a materialized blob. Covers what SQL can
+#              reach: byte-exactness against the whole-entry materialization
+#              path, multi-buffer sequential reads, zero-length entries, and the
+#              content cap. The offset/EOF/spanning-the-end semantics have no SQL
+#              consumer over zim:// (see test/vfs_ranged_reads.cpp for why, and
+#              for their coverage). Fixtures are written with COPY ... (FORMAT
+#              zim) into __TEST_DIR__ so nothing large is committed.
+
+require zim
+
+statement ok
+PRAGMA enable_verification
+
+# --- fixture: a 1 MiB incompressible binary entry, an empty entry, and a --------
+# multi-line CSV, all in one archive. The binary payload is md5-derived so it is
+# non-repeating: a ranged reader that mixed up an offset would not go unnoticed.
+statement ok
+CREATE TABLE payload AS
+SELECT from_hex(string_agg(md5(i::VARCHAR), '' ORDER BY i)) AS b
+FROM range(65536) t(i);
+
+statement ok
+CREATE TABLE csv_body AS
+SELECT string_agg(i || ',' || repeat('x', 60), chr(10) ORDER BY i) || chr(10) AS s
+FROM range(20000) t(i);
+
+statement ok
+COPY (SELECT 'bin/big.bin' AS path, b AS content FROM payload
+      UNION ALL SELECT 'bin/empty.bin', ''::BLOB
+      UNION ALL SELECT 'data/rows.csv', s::BLOB FROM csv_body)
+TO '__TEST_DIR__/streaming.zim' (FORMAT zim);
+
+# --- byte-for-byte vs the unchanged whole-entry materialization path -----------
+# zim_get_content still materializes in one shot inside the access layer; the
+# zim:// read now reassembles the same bytes from ranged windows. Equal blobs is
+# the load-bearing assertion of this whole change.
+query I
+SELECT content = zim_get_content('__TEST_DIR__/streaming.zim', 'bin/big.bin')
+FROM read_blob('zim://__TEST_DIR__/streaming.zim/bin/big.bin');
+----
+true
+
+# ... and the same again against the in-memory source, so a bug that corrupted
+# both read paths identically could not hide.
+query I
+SELECT content = (SELECT b FROM payload)
+FROM read_blob('zim://__TEST_DIR__/streaming.zim/bin/big.bin');
+----
+true
+
+# GetFileSize is served from the item's declared size, not from a materialized
+# buffer. 65536 md5 digests × 16 bytes = 1 MiB.
+query I
+SELECT size FROM read_blob('zim://__TEST_DIR__/streaming.zim/bin/big.bin');
+----
+1048576
+
+# --- zero-length entry: a zero-length read at offset 0 is not an error ---------
+query II
+SELECT size, content = ''::BLOB
+FROM read_blob('zim://__TEST_DIR__/streaming.zim/bin/empty.bin');
+----
+0	true
+
+# --- sequential reads across many buffer boundaries ----------------------------
+# The CSV reader pulls fixed-size buffers and hits a short (clamped) read at EOF.
+# ~1.2 MB of body means many windows, and the last one must clamp rather than
+# overrun or error.
+query II
+SELECT count(*), sum(i) FROM read_csv('zim://__TEST_DIR__/streaming.zim/data/rows.csv',
+                                      columns := {'i': 'BIGINT', 'pad': 'VARCHAR'},
+                                      header := false);
+----
+20000	199990000
+
+# --- the content cap still applies at open, against the declared size ----------
+# Reads are ranged now, but opening an entry larger than zim_max_content_size is
+# still refused: read_blob/read_text materialize the whole entry downstream in an
+# allocation this extension does not control.
+statement ok
+SET zim_max_content_size = 1024;
+
+statement error
+SELECT content FROM read_blob('zim://__TEST_DIR__/streaming.zim/bin/big.bin');
+----
+exceeds zim_max_content_size
+
+# The refusal is about size, not about the archive: a small entry in the same
+# archive still opens under the same low cap.
+query I
+SELECT size FROM read_blob('zim://__TEST_DIR__/streaming.zim/bin/empty.bin');
+----
+0
+
+statement ok
+RESET zim_max_content_size;
+
+# --- redirects still resolve before the reader is pinned ----------------------
+statement ok
+COPY (SELECT * FROM (VALUES ('A/Target', 'Target', 'text/plain', 'redirected-body', false, ''),
+                            ('A/Alias', 'Alias', NULL, NULL, true, 'A/Target'))
+        t(path, title, mimetype, content, is_redirect, redirect_path))
+TO '__TEST_DIR__/redir.zim' (FORMAT zim);
+
+query II
+SELECT size, content FROM read_text('zim://__TEST_DIR__/redir.zim/A/Alias');
+----
+15	redirected-body
