@@ -423,8 +423,18 @@ static LogicalType ZimColumnType(const ReadZimBindData &bind, column_t cid) {
 // chunk. Filters are keyed by *projected* index (PhysicalPlanGenerator's
 // CreateTableFilterSet rewrites the storage index into an index into column_ids), which
 // is exactly the output chunk's column order — filter_prune is off, so no projection_ids
-// indirection sits in between. A filter we cannot map is an internal error rather than a
-// skip: skipping is what made issue #29 silent.
+// indirection sits in between.
+//
+// A filter we cannot map raises rather than being skipped: skipping is what made issue
+// #29 silent, and this layer is the one results depend on. The type is
+// NotImplementedException, not InternalException (issue #35): DuckDB invalidates the
+// whole DatabaseInstance on ExceptionType::INTERNAL, so an unmapped column would cost the
+// user their connection instead of failing one query. Neither guard is reachable from SQL
+// today — every projected column id comes from the bound column list and read_zim exposes
+// no rowid — they exist to catch a future virtual column or column_t sentinel, and that is
+// exactly a "not implemented", not a broken invariant. ApplyPushedFilters skips the same
+// condition instead of raising because it only reads less; the error still surfaces here,
+// a few lines later, so nothing is silently dropped either way.
 static unique_ptr<Expression> BuildFilterExpression(const ReadZimBindData &bind, const ReadZimGlobalState &g,
                                                     TableFunctionInitInput &input) {
 	if (!input.filters || input.filters->filters.empty()) {
@@ -434,14 +444,14 @@ static unique_ptr<Expression> BuildFilterExpression(const ReadZimBindData &bind,
 	for (auto &entry : input.filters->filters) {
 		const idx_t proj_idx = entry.first;
 		if (proj_idx >= g.column_ids.size()) {
-			throw InternalException("read_zim: pushed-down filter references column %llu, but only %llu columns are "
-			                        "projected",
-			                        (uint64_t)proj_idx, (uint64_t)g.column_ids.size());
+			throw NotImplementedException("read_zim: pushed-down filter references column %llu, but only %llu columns "
+			                              "are projected",
+			                              (uint64_t)proj_idx, (uint64_t)g.column_ids.size());
 		}
 		auto type = ZimColumnType(bind, g.column_ids[proj_idx]);
 		if (type.id() == LogicalTypeId::INVALID) {
-			throw InternalException("read_zim: pushed-down filter on unknown column id %llu",
-			                        (uint64_t)g.column_ids[proj_idx]);
+			throw NotImplementedException("read_zim: pushed-down filter on unknown column id %llu",
+			                              (uint64_t)g.column_ids[proj_idx]);
 		}
 		auto col_ref = make_uniq<BoundReferenceExpression>(type, proj_idx);
 		// ToExpression is total over the TableFilter hierarchy; the approximate kinds
@@ -449,7 +459,7 @@ static unique_ptr<Expression> BuildFilterExpression(const ReadZimBindData &bind,
 		// because those are redundant with the join that produced them.
 		auto expr = entry.second->ToExpression(*col_ref);
 		if (!expr) {
-			throw InternalException("read_zim: could not rebuild a pushed-down filter as an expression");
+			throw NotImplementedException("read_zim: could not rebuild a pushed-down filter as an expression");
 		}
 		conditions.push_back(std::move(expr));
 	}
@@ -526,6 +536,30 @@ static void CollectMimetypeConstants(const TableFilter &filter, std::vector<std:
 	}
 }
 
+// Intersect the exact mimetype constants of a pushed-down filter with the Accept-style
+// patterns already in the scan spec (the `mimetype :=` named parameter, possibly empty).
+//
+// Issue #34: these two must be AND-ed. `mimetype := 'text/css'` is an explicit argument
+// that defines the rows the function produces; a WHERE clause can only narrow that set,
+// never widen it. Appending the pushed constants to the same vector made MimetypeAccepted
+// — an OR over its patterns — accept their union, so
+// `read_zim(..., mimetype := 'text/css') WHERE mimetype = 'image/png'` returned the PNG.
+//
+// The intersection is exact rather than approximate: `constants` are literal mimetypes,
+// so {m : m matches some pattern} INTERSECT {m : m IN constants} is precisely the subset
+// of `constants` the patterns accept. An empty `patterns` accepts everything
+// (MimetypeAccepted's own convention), which is the no-named-parameter case.
+static std::vector<std::string> IntersectMimetypes(const std::vector<std::string> &patterns,
+                                                   const std::vector<std::string> &constants) {
+	std::vector<std::string> result;
+	for (const auto &c : constants) {
+		if (MimetypeAccepted(patterns, c)) {
+			result.push_back(c);
+		}
+	}
+	return result;
+}
+
 // Best-effort read reduction (layer 1 above). Correctness never depends on this: every
 // pushed filter is re-applied exactly by g.filter_expression, so each rule here only has
 // to keep the scan a superset of the true result.
@@ -538,7 +572,15 @@ static void ApplyPushedFilters(ReadZimGlobalState &g, TableFunctionInitInput &in
 	// on the emitted rows like any other).
 	const bool scan_is_open = !g.single_lookup && !g.scan_spec.path_prefix.has_value() &&
 	                          !g.scan_spec.title_prefix.has_value() && g.scan_spec.order == ScanOrder::ByPath;
-	// filters are keyed by *projected* (output) column index; map back to storage.
+	// Mimetype constants pushed from WHERE, kept OUT of g.scan_spec until the whole
+	// filter set has been walked: they narrow the named-parameter patterns, they do not
+	// join them (issue #34).
+	std::vector<std::string> pushed_mimetypes;
+	bool have_pushed_mimetype = false;
+	// filters are keyed by *projected* (output) column index; map back to storage. An
+	// index we cannot map is skipped rather than raised: this layer only reads less, and
+	// BuildFilterExpression — the layer results actually depend on — throws on exactly
+	// the same condition a moment later, so nothing is silently dropped.
 	for (auto &entry : input.filters->filters) {
 		const idx_t proj_idx = entry.first;
 		if (proj_idx >= g.column_ids.size()) {
@@ -547,7 +589,17 @@ static void ApplyPushedFilters(ReadZimGlobalState &g, TableFunctionInitInput &in
 		const column_t storage_col = g.column_ids[proj_idx];
 		const TableFilter &filter = *entry.second;
 		if (storage_col == COL_MIMETYPE) {
-			CollectMimetypeConstants(filter, g.scan_spec.mimetype_filter);
+			std::vector<std::string> constants;
+			CollectMimetypeConstants(filter, constants);
+			// An unrepresentable filter yields no constants: keep whatever the other
+			// entries gave us (a superset of the AND) instead of widening back out.
+			if (!constants.empty()) {
+				// The same column can carry more than one filter entry (it may be
+				// projected twice); those are AND-ed, so intersect exactly.
+				pushed_mimetypes =
+				    have_pushed_mimetype ? IntersectMimetypes(pushed_mimetypes, constants) : std::move(constants);
+				have_pushed_mimetype = true;
+			}
 		} else if (scan_is_open && !g.single_lookup && (storage_col == COL_PATH || storage_col == COL_TITLE)) {
 			std::string key;
 			if (FilterEqualityString(filter, key)) {
@@ -557,6 +609,16 @@ static void ApplyPushedFilters(ReadZimGlobalState &g, TableFunctionInitInput &in
 				g.mode = ScanMode::Lookup;
 			}
 		}
+	}
+	if (have_pushed_mimetype) {
+		auto narrowed = IntersectMimetypes(g.scan_spec.mimetype_filter, pushed_mimetypes);
+		if (!narrowed.empty()) {
+			g.scan_spec.mimetype_filter = std::move(narrowed);
+		}
+		// An empty intersection means no mimetype can satisfy both. We cannot express
+		// "accept nothing" here — an empty mimetype_filter means accept EVERYTHING — so
+		// leave the named-parameter filter untouched; it is still a superset, and
+		// g.filter_expression removes the remaining rows.
 	}
 }
 
@@ -760,6 +822,22 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 		}
 		if (SelectFilteredRows(context, gstate, lstate, output) > 0) {
 			return;
+		}
+		// The whole batch was filtered out, so we have to keep scanning — and a zero-row
+		// chunk is not an option: PhysicalTableScan reads chunk.size() == 0 as
+		// SourceResultType::FINISHED (and the AsyncResultType::HAVE_MORE_OUTPUT escape
+		// hatch is rejected with an empty chunk under the synchronous strategy), so
+		// returning early would silently truncate the scan. Without a return there is no
+		// cancellation point: in the parallel path ProduceChunk pulls fresh morsels
+		// itself, so `WHERE path LIKE 'zzz%'` over a large archive would run the entire
+		// scan inside one call and ignore an interrupt for its duration (issue #35).
+		//
+		// DuckDB's own table scan has exactly this loop and exactly this remedy — see
+		// TableScanFunc in duckdb/src/function/table/table_scan.cpp, "Before looping
+		// back, check if we are interrupted". Same idiom, same granularity (at most one
+		// STANDARD_VECTOR_SIZE batch between checks).
+		if (context.interrupted) {
+			throw InterruptException();
 		}
 	}
 }
