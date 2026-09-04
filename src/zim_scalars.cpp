@@ -9,6 +9,7 @@
 //   zim_mimetype(file, path)       -> VARCHAR
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
+#include "duckdb_compat.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "utf8proc_wrapper.hpp"

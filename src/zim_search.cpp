@@ -293,7 +293,12 @@ void SuggestFunction(ClientContext &, TableFunctionInput &data, DataChunk &outpu
 
 TableFunction MakeFn(const string &name, const LogicalType &files_type, table_function_t fn, table_function_bind_t bind,
                      table_function_init_global_t init) {
-	TableFunction f(name, {files_type, LogicalType::VARCHAR}, fn, bind, init);
+	// CompatMakeName, not `name` directly: on v2.0 TableFunction's name parameter is
+	// an Identifier, and Identifier(const string &) is EXPLICIT -- deliberately, so
+	// that promoting a RUNTIME string to an identifier is a visible act. A literal
+	// converts implicitly (Identifier(const char *) is not explicit), which is why
+	// every other function registration in this extension needs nothing.
+	TableFunction f(CompatMakeName(name), {files_type, LogicalType::VARCHAR}, fn, bind, init);
 	f.named_parameters["max_results"] = LogicalType::BIGINT;
 	f.named_parameters["result_offset"] = LogicalType::BIGINT;
 	f.named_parameters["with_snippet"] = LogicalType::BOOLEAN;
