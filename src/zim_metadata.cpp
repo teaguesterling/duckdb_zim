@@ -217,9 +217,11 @@ void RegisterZimMetadata(ExtensionLoader &loader) {
 
 	// All four open an archive, so all four throw at execution time on a missing or
 	// corrupt ZIM -- test/sql/zim_errors.test asserts exactly that for zim_info.
-	// DuckDB v2.0 requires such a function to declare itself fallible; see the note
-	// on RegisterFallible in zim_scalars.cpp for why the omission is invisible at
-	// compile time and shows up only on an assertions-enabled build. No-op on v1.5.
+	// DuckDB v2.0 requires such a function to declare itself fallible; see the note on
+	// RegisterFallible in zim_scalars.cpp for why the omission is invisible at compile
+	// time, why it shows up only on an assertions-enabled build, and what the flag
+	// also does on the pinned v1.5 (where it is advisory, and where setting it is both
+	// truthful and strictly more conservative).
 	auto register_fallible = [&loader](ScalarFunction fun) {
 		CompatSetFallible(fun);
 		loader.RegisterFunction(std::move(fun));

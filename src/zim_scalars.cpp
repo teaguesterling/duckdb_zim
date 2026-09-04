@@ -248,9 +248,21 @@ void Illustration(DataChunk &args, ExpressionState &state, Vector &result) {
 // fires only on an assertions-enabled build -- invisible at compile time, and able
 // to be red on one CI arch while green on another for the very same commit.
 //
+// This is the ONE place in the v2.0 port where the pinned v1.5 build also changes,
+// so it is worth being precise. SetFallible() exists on v1.5.4 too (function.hpp),
+// and there it is ADVISORY rather than contractual: it feeds
+// BoundFunctionExpression::CanThrow(), and it suppresses UnaryExecutor's
+// dictionary-vector shortcut, which evaluates a function over dictionary entries
+// that no row references -- a shortcut that is only sound for a function which
+// cannot throw. The default is FunctionErrors::CANNOT_ERROR, so before this change
+// zim was telling the planner something untrue about twelve functions that open
+// files. Setting it moves v1.5 strictly toward being MORE conservative and toward
+// the truth; `make test` is unchanged at 538 assertions. CompatSetFallible is kept
+// rather than calling SetFallible() directly so this still compiles if the pin ever
+// moves to a DuckDB that predates the setter.
+//
 // Routed through one helper so a scalar cannot be added without walking past the
-// reason. CompatSetFallible is a no-op on the pinned v1.5, which has no such
-// contract, so registration there is unchanged.
+// reason.
 static void RegisterFallible(ExtensionLoader &loader, ScalarFunction fun) {
 	CompatSetFallible(fun);
 	loader.RegisterFunction(std::move(fun));
