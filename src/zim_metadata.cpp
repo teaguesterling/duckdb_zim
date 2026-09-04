@@ -11,6 +11,7 @@
 //   zim_info(file)                     -> STRUCT(...)            (counts/flags/uuid)
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
+#include "duckdb_compat.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "utf8proc_wrapper.hpp"
@@ -51,7 +52,7 @@ struct MetadataGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> MetadataBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                                      vector<string> &names) {
+                                      vector<CompatName> &names) {
 	auto bind = make_uniq<MetadataBindData>();
 	bind->file_path = input.inputs[0].GetValue<string>();
 	for (auto &kv : input.named_parameters) {

@@ -22,6 +22,7 @@
 // `max_results` / `result_offset`.
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
+#include "duckdb_compat.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -132,7 +133,7 @@ static void ParseSearchParams(SearchBindData &bind, TableFunctionBindInput &inpu
 }
 
 unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunctionBindInput &input,
-                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                    vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind = make_uniq<SearchBindData>();
 	bind->file_paths = ExpandFiles(context, input.inputs[0], "zim_search");
 	bind->query = input.inputs[1].GetValue<string>();
@@ -255,7 +256,7 @@ void SearchFunction(ClientContext &, TableFunctionInput &data, DataChunk &output
 // --- zim_suggest: title autocomplete (reuses SearchBindData / SearchGlobalState) ---
 
 unique_ptr<FunctionData> SuggestBind(ClientContext &context, TableFunctionBindInput &input,
-                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                     vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind = make_uniq<SearchBindData>();
 	bind->file_paths = ExpandFiles(context, input.inputs[0], "zim_suggest");
 	bind->query = input.inputs[1].GetValue<string>();

@@ -4,6 +4,7 @@
 // DuckDB binding only: no zim:: types appear here (see zim_writer.hpp).
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
+#include "duckdb_compat.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/function/copy_function.hpp"
@@ -122,17 +123,25 @@ void SetMetadata(ZimWriterConfig &config, const string &key, const string &value
 }
 
 // Resolve a column by name, case-insensitively. Returns -1 when absent.
-int64_t FindColumn(const vector<string> &names, const string &want) {
+//
+// The comparison stays StringUtil::CIEquals on the *rendered* name rather than
+// leaning on the element type. On DuckDB v2.0 `names` is a vector<Identifier> and
+// Identifier's own operator== is already case-insensitive, so `==` would look
+// equivalent -- but on the pinned v1.5 build the element is a plain string, where
+// `==` is case-SENSITIVE. Comparing rendered strings with CIEquals is the one
+// formulation that means the same thing under both, which is the point: COPY TO
+// zim has always matched its columns case-insensitively and must keep doing so.
+int64_t FindColumn(const vector<CompatName> &names, const string &want) {
 	for (idx_t i = 0; i < names.size(); i++) {
-		if (StringUtil::CIEquals(names[i], want)) {
+		if (StringUtil::CIEquals(CompatNameStr(names[i]), want)) {
 			return static_cast<int64_t>(i);
 		}
 	}
 	return -1;
 }
 
-unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInput &input, const vector<string> &names,
-                                     const vector<LogicalType> &sql_types) {
+unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInput &input,
+                                     const vector<CompatName> &names, const vector<LogicalType> &sql_types) {
 	auto bind = make_uniq<ZimCopyBindData>();
 
 	bind->cols.path = FindColumn(names, "path");
@@ -156,7 +165,9 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 	static const char *DEFERRED_COLUMNS[] = {"content_path", "entry_kind", "target"};
 
 	for (idx_t i = 0; i < names.size(); i++) {
-		auto &n = names[i];
+		// Rendered once per column: `names[i]` is an Identifier on v2.0, which neither
+		// converts to string implicitly nor formats into a BinderException message.
+		const auto n = CompatNameStr(names[i]);
 		bool known = false;
 		for (auto *k :
 		     {"path", "content", "title", "mimetype", "is_redirect", "redirect_path", "front_article", "compress"}) {
@@ -302,9 +313,15 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 	// input.info.options holds only options unrecognised at that level. This loop
 	// is the single entry point later tasks extend with more `else if` branches.
 	for (auto &option : input.info.options) {
-		auto key = StringUtil::Lower(option.first);
+		// COPY option keys are Identifiers on DuckDB v2.0, not strings: they neither
+		// convert implicitly nor format into an exception message. Rendered once here,
+		// as spelled by the caller, so `raw_key` is what the user sees in errors while
+		// `key` remains the lowered form every branch below dispatches on -- exactly the
+		// split this loop already had.
+		const auto raw_key = CompatNameStr(option.first);
+		auto key = StringUtil::Lower(raw_key);
 		if (option.second.size() != 1) {
-			throw BinderException("COPY TO (FORMAT zim): option '%s' takes exactly one value", option.first);
+			throw BinderException("COPY TO (FORMAT zim): option '%s' takes exactly one value", raw_key);
 		}
 		auto &value = option.second[0];
 		// A NULL Value must never reach the branches below. StringValue::Get and
@@ -322,7 +339,7 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 		// here with a NULL Value today. This guard is the backstop that does not depend
 		// on which spellings DuckDB happens to filter.
 		if (value.IsNull()) {
-			throw BinderException("COPY TO (FORMAT zim): %s must not be NULL", StringUtil::Upper(option.first));
+			throw BinderException("COPY TO (FORMAT zim): %s must not be NULL", StringUtil::Upper(raw_key));
 		}
 		if (key == "on_conflict") {
 			auto policy = StringUtil::Lower(value.ToString());
@@ -341,7 +358,7 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 		} else if (METADATA_OPTIONS.count(key)) {
 			// Named metadata options are text by contract, but nothing stops a caller from
 			// passing a BLOB literal, so reject that explicitly rather than corrupting it.
-			require_varchar(value, option.first);
+			require_varchar(value, raw_key);
 			SetMetadata(bind->config, METADATA_OPTIONS.at(key), value.ToString());
 		} else if (key == "metadata") {
 			if (value.type().id() != LogicalTypeId::MAP) {
@@ -389,7 +406,7 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 			// An entry path is text; a BLOB here would be \x-escaped into a path that
 			// matches nothing, and the failure would surface from ZimCopyFinalize as
 			// "MAIN_PATH '...' does not match any entry" naming a mangled string.
-			require_varchar(value, option.first);
+			require_varchar(value, raw_key);
 			bind->config.main_path = value.ToString();
 		} else if (key == "index") {
 			bind->config.index = BooleanValue::Get(value.DefaultCastAs(LogicalType::BOOLEAN));
@@ -397,7 +414,7 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 			// A mangled stemmer language does not fail at all -- libzim takes whatever
 			// string it is handed -- so an escaped BLOB would just silently configure the
 			// wrong stemmer.
-			require_varchar(value, option.first);
+			require_varchar(value, raw_key);
 			bind->config.index_language = value.ToString();
 		} else if (key == "compression") {
 			auto comp = StringUtil::Lower(value.ToString());
@@ -437,7 +454,7 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 			}
 			bind->config.workers = static_cast<uint32_t>(n);
 		} else {
-			throw BinderException("COPY TO (FORMAT zim): unknown option '%s'", option.first);
+			throw BinderException("COPY TO (FORMAT zim): unknown option '%s'", raw_key);
 		}
 	}
 

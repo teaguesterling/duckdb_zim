@@ -16,6 +16,7 @@
 // access is entirely via zim_ext::ZimArchive, so nothing here needs <zim/*>.
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
+#include "duckdb_compat.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -190,7 +191,7 @@ LogicalType ContentType(const ReadZimBindData &bind) {
 }
 
 unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindInput &input,
-                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                     vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind = make_uniq<ReadZimBindData>();
 
 	// Input is a single VARCHAR pattern or a LIST(VARCHAR) of patterns. Glob patterns

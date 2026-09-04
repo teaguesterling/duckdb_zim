@@ -12,6 +12,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Forward-compat canary: builds this extension's sources against duckdb `main`,
+  # which is the v2.0 line (v2.0-cyanoptera). duckdb/community-extensions builds
+  # every release PR against v2.0 via build_next.yml, with no per-extension opt-out
+  # -- so an extension that stops compiling there has a red check on every release.
+  # This job is where that breakage is found, on demand, instead of in a release PR.
+  #
+  # Informational, NOT a merge blocker: merge-readiness is judged on the stable
+  # v1.5.4 build below, which is what this extension ships. Expected to go red
+  # whenever upstream drifts; do not pin it.
+  #
+  # Gated with `if:` and not `continue-on-error:` -- a job that calls a REUSABLE
+  # workflow accepts only a fixed set of keys, and adding continue-on-error makes
+  # the whole file fail to parse, scheduling zero jobs. The gate also keeps the
+  # canary off pull_request runs, where a red advisory leg would sit in every PR's
+  # check rollup.
+  duckdb-next-build:
+    name: Canary — build against DuckDB main (advisory)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: main
+      ci_tools_version: main
+      extension_name: zim
+      vcpkg_binary_sources: 'clear'
+      # linux_amd64 only. The canary answers exactly one question -- "do these
+      # sources still compile against the v2.0 API?" -- and that answer is
+      # arch-independent, while every extra arch means another from-source build of
+      # libzim + xapian + icu (this extension's vcpkg set is expensive; see the
+      # 'clear' above). Keeping it to one arch is what makes the port loop minutes
+      # rather than an hour. The stable job below still covers the full matrix.
+      exclude_archs: 'linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
   duckdb-stable-build:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
