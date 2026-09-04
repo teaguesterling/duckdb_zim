@@ -215,14 +215,22 @@ void RegisterZimMetadata(ExtensionLoader &loader) {
 	meta.named_parameters["filename"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(meta);
 
-	loader.RegisterFunction(ScalarFunction("zim_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, ZimMetadataScalar));
-	loader.RegisterFunction(ScalarFunction("zim_metadata_keys", {LogicalType::VARCHAR},
-	                                       LogicalType::LIST(LogicalType::VARCHAR), ZimMetadataKeysScalar));
-	loader.RegisterFunction(ScalarFunction("zim_counter", {LogicalType::VARCHAR},
-	                                       LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT),
-	                                       ZimCounterScalar));
-	loader.RegisterFunction(ScalarFunction("zim_info", {LogicalType::VARCHAR}, ZimInfoType(), ZimInfoScalar));
+	// All four open an archive, so all four throw at execution time on a missing or
+	// corrupt ZIM -- test/sql/zim_errors.test asserts exactly that for zim_info.
+	// DuckDB v2.0 requires such a function to declare itself fallible; see the note
+	// on RegisterFallible in zim_scalars.cpp for why the omission is invisible at
+	// compile time and shows up only on an assertions-enabled build. No-op on v1.5.
+	auto register_fallible = [&loader](ScalarFunction fun) {
+		CompatSetFallible(fun);
+		loader.RegisterFunction(std::move(fun));
+	};
+	register_fallible(ScalarFunction("zim_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                                 ZimMetadataScalar));
+	register_fallible(ScalarFunction("zim_metadata_keys", {LogicalType::VARCHAR},
+	                                 LogicalType::LIST(LogicalType::VARCHAR), ZimMetadataKeysScalar));
+	register_fallible(ScalarFunction("zim_counter", {LogicalType::VARCHAR},
+	                                 LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT), ZimCounterScalar));
+	register_fallible(ScalarFunction("zim_info", {LogicalType::VARCHAR}, ZimInfoType(), ZimInfoScalar));
 }
 
 } // namespace duckdb

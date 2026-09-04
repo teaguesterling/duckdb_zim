@@ -239,21 +239,44 @@ void Illustration(DataChunk &args, ExpressionState &state, Vector &result) {
 
 } // namespace
 
+// EVERY scalar function in this extension can throw at execution time: each one
+// opens an archive through the pool, and a missing, unreadable or corrupt ZIM
+// raises from there rather than returning NULL (test/sql/zim_errors.test asserts
+// exactly that for `SELECT zim_info('/no/such/archive.zim')`). DuckDB v2.0 requires
+// a scalar function that can throw to declare it; throwing from one that has not
+// is an InternalException naming SetFallible. That check is an ASSERTION, so it
+// fires only on an assertions-enabled build -- invisible at compile time, and able
+// to be red on one CI arch while green on another for the very same commit.
+//
+// Routed through one helper so a scalar cannot be added without walking past the
+// reason. CompatSetFallible is a no-op on the pinned v1.5, which has no such
+// contract, so registration there is unchanged.
+static void RegisterFallible(ExtensionLoader &loader, ScalarFunction fun) {
+	CompatSetFallible(fun);
+	loader.RegisterFunction(std::move(fun));
+}
+
 void RegisterZimScalars(ExtensionLoader &loader) {
 	const auto V = LogicalType::VARCHAR;
-	loader.RegisterFunction(ScalarFunction("zim_get_content", {V, V}, LogicalType::BLOB, GetContent));
-	loader.RegisterFunction(ScalarFunction("zim_get_text", {V, V}, V, GetText));
-	loader.RegisterFunction(ScalarFunction("zim_has_entry", {V, V}, LogicalType::BOOLEAN, HasEntry));
-	loader.RegisterFunction(ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget));
-	loader.RegisterFunction(ScalarFunction("zim_mimetype", {V, V}, V, Mimetype));
-	loader.RegisterFunction(ScalarFunction("zim_main_entry", {V}, V, MainEntry));
-	loader.RegisterFunction(ScalarFunction("zim_random", {V}, V, Random));
-	loader.RegisterFunction(ScalarFunction("zim_check", {V}, LogicalType::BOOLEAN, Check));
+	RegisterFallible(loader, ScalarFunction("zim_get_content", {V, V}, LogicalType::BLOB, GetContent));
+	RegisterFallible(loader, ScalarFunction("zim_get_text", {V, V}, V, GetText));
+	RegisterFallible(loader, ScalarFunction("zim_has_entry", {V, V}, LogicalType::BOOLEAN, HasEntry));
+	RegisterFallible(loader, ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget));
+	RegisterFallible(loader, ScalarFunction("zim_mimetype", {V, V}, V, Mimetype));
+	RegisterFallible(loader, ScalarFunction("zim_main_entry", {V}, V, MainEntry));
+	RegisterFallible(loader, ScalarFunction("zim_random", {V}, V, Random));
+	RegisterFallible(loader, ScalarFunction("zim_check", {V}, LogicalType::BOOLEAN, Check));
 
 	// zim_illustration(file) defaults to 48px; zim_illustration(file, size) is explicit.
+	// Marked fallible BEFORE AddFunction: a v2.0 FunctionSet yields shared_ptr<const
+	// T>, so a member cannot be configured once it is in the set.
 	ScalarFunctionSet illustration("zim_illustration");
-	illustration.AddFunction(ScalarFunction({V}, LogicalType::BLOB, Illustration));
-	illustration.AddFunction(ScalarFunction({V, LogicalType::INTEGER}, LogicalType::BLOB, Illustration));
+	ScalarFunction illustration_default({V}, LogicalType::BLOB, Illustration);
+	CompatSetFallible(illustration_default);
+	illustration.AddFunction(std::move(illustration_default));
+	ScalarFunction illustration_sized({V, LogicalType::INTEGER}, LogicalType::BLOB, Illustration);
+	CompatSetFallible(illustration_sized);
+	illustration.AddFunction(std::move(illustration_sized));
 	loader.RegisterFunction(illustration);
 }
 
