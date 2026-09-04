@@ -257,14 +257,23 @@ void Illustration(DataChunk &args, ExpressionState &state, Vector &result) {
 // cannot throw. The default is FunctionErrors::CANNOT_ERROR, so before this change
 // zim was telling the planner something untrue about twelve functions that open
 // files. Setting it moves v1.5 strictly toward being MORE conservative and toward
-// the truth; `make test` is unchanged at 538 assertions. CompatSetFallible is kept
-// rather than calling SetFallible() directly so this still compiles if the pin ever
-// moves to a DuckDB that predates the setter.
+// the truth; `make test` is unchanged at 538 assertions. Called DIRECTLY rather
+// than through a compat shim: the member exists identically on both lines, so a
+// feature probe would take the same branch on each and only disguise the fact
+// that this is a real change on the shipped build.
+//
+// The one thing worth checking, because this extension is the one doing filter
+// pushdown: CanThrow() gates pushdown_get.cpp, but on the FILTER expression, and
+// read_zim's pushed filters are comparisons on COLUMNS (`WHERE mimetype = ...`),
+// never calls to these scalars. So this does not touch read_zim's own pushdown.
+// What it does restrain is pushing or reordering a predicate that CALLS one of
+// them -- which is the point: `zim_info(f)` must not be hoisted onto rows an
+// earlier predicate would have excluded.
 //
 // Routed through one helper so a scalar cannot be added without walking past the
 // reason.
 static void RegisterFallible(ExtensionLoader &loader, ScalarFunction fun) {
-	CompatSetFallible(fun);
+	fun.SetFallible();
 	loader.RegisterFunction(std::move(fun));
 }
 
@@ -284,10 +293,10 @@ void RegisterZimScalars(ExtensionLoader &loader) {
 	// T>, so a member cannot be configured once it is in the set.
 	ScalarFunctionSet illustration("zim_illustration");
 	ScalarFunction illustration_default({V}, LogicalType::BLOB, Illustration);
-	CompatSetFallible(illustration_default);
+	illustration_default.SetFallible();
 	illustration.AddFunction(std::move(illustration_default));
 	ScalarFunction illustration_sized({V, LogicalType::INTEGER}, LogicalType::BLOB, Illustration);
-	CompatSetFallible(illustration_sized);
+	illustration_sized.SetFallible();
 	illustration.AddFunction(std::move(illustration_sized));
 	loader.RegisterFunction(illustration);
 }

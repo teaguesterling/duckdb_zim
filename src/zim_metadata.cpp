@@ -223,7 +223,7 @@ void RegisterZimMetadata(ExtensionLoader &loader) {
 	// also does on the pinned v1.5 (where it is advisory, and where setting it is both
 	// truthful and strictly more conservative).
 	auto register_fallible = [&loader](ScalarFunction fun) {
-		CompatSetFallible(fun);
+		fun.SetFallible();
 		loader.RegisterFunction(std::move(fun));
 	};
 	register_fallible(ScalarFunction("zim_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
