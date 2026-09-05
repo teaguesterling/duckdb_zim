@@ -250,7 +250,7 @@ void SearchFunction(ClientContext &, TableFunctionInput &data, DataChunk &output
 		output.data[4].SetValue(count, Value(tagged.file));
 		count++;
 	}
-	output.SetCardinality(count);
+	CompatSetCardinality(output, count);
 }
 
 // --- zim_suggest: title autocomplete (reuses SearchBindData / SearchGlobalState) ---
@@ -288,7 +288,7 @@ void SuggestFunction(ClientContext &, TableFunctionInput &data, DataChunk &outpu
 		output.data[3].SetValue(count, Value(tagged.file));
 		count++;
 	}
-	output.SetCardinality(count);
+	CompatSetCardinality(output, count);
 }
 
 TableFunction MakeFn(const string &name, const LogicalType &files_type, table_function_t fn, table_function_bind_t bind,

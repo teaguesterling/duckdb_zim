@@ -234,4 +234,52 @@ inline ValidityMask &CompatFlatValidityMutable(Vector &vec) {
 	return CompatFlatValidityMutableImpl<FV>(vec, CompatHasFlatValidityMutable<FV>());
 }
 
+// --- finishing a chunk: SetCardinality vs SetChildCardinality -------------------
+// v1.5: SetCardinality(n)        sets the chunk's count. Vectors have no own size.
+// v2.0: SetCardinality(n)        [[deprecated]], sets ONLY the chunk's count
+//       SetChildCardinality(n)   also sizes the CHILD VECTORS
+//
+// v2.0 gave every Vector its own size, and that size is what several operators now
+// iterate. `Vector::SetValue(i, v)` writes AT AN INDEX and never moves it, so a
+// table function that fills a chunk with SetValue -- the idiomatic shape, and the
+// only shape this extension uses -- leaves every child vector at size 0 after
+// DataChunk::Reset(). SetChildCardinality is the only call that sizes them.
+//
+// THE FAILURE IS SILENT AND VERY MISLEADING. Nothing crashes and most things stay
+// correct, because the printer, scalar functions and aggregates all work off the
+// CHUNK's count. But `IS NULL` / `IS NOT NULL` go through IsNullLoop
+// (null_operations.cpp), which iterates `input.size()` -- the VECTOR's size. At
+// zero it writes no results at all and the caller reads the untouched result
+// buffer, so every row reports false. The observable symptom is a column that
+// PRINTS as NULL while `x IS NULL` returns false for the very same row, in the
+// very same result set: read_zim.test:49 and zim_include_content.test:21 are
+// exactly this. Reading the value is fine; asking whether it is null is not.
+//
+// Probed on SetChildCardinality, which exists only on v2.0. Note the v1.5 branch
+// must not be spelled `SetChildCardinality` anywhere the compiler can see it on
+// v1.5, hence the tag dispatch rather than an `if constexpr`.
+//
+// Only correct because this codebase never uses Vector::Append/AppendValue, which
+// DO advance the vector size as they go; for an appending caller
+// SetChildCardinality(N) would be a no-op at best and a logical shrink at worst.
+// The audit is `grep -rn '\.Append(\|AppendValue' src/`, and it is empty here.
+template <class T, class = void>
+struct CompatHasSetChildCardinality : std::false_type {};
+template <class T>
+struct CompatHasSetChildCardinality<T, decltype(void(std::declval<T &>().SetChildCardinality(idx_t(0))))>
+    : std::true_type {};
+
+template <class CHUNK>
+inline void CompatSetCardinalityImpl(CHUNK &chunk, idx_t count, std::true_type) {
+	chunk.SetChildCardinality(count);
+}
+template <class CHUNK>
+inline void CompatSetCardinalityImpl(CHUNK &chunk, idx_t count, std::false_type) {
+	chunk.SetCardinality(count);
+}
+template <class CHUNK = DataChunk>
+inline void CompatSetCardinality(CHUNK &chunk, idx_t count) {
+	CompatSetCardinalityImpl(chunk, count, CompatHasSetChildCardinality<CHUNK>());
+}
+
 } // namespace duckdb

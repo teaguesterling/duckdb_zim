@@ -765,7 +765,7 @@ static void ProduceChunk(const ReadZimBindData &bind, ReadZimGlobalState &gstate
 				}
 			}
 		}
-		output.SetCardinality(count);
+		CompatSetCardinality(output, count);
 		return;
 	}
 
@@ -808,7 +808,7 @@ static void ProduceChunk(const ReadZimBindData &bind, ReadZimGlobalState &gstate
 			}
 		}
 	}
-	output.SetCardinality(count);
+	CompatSetCardinality(output, count);
 }
 
 void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -832,7 +832,7 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 		lstate.scan_chunk.Reset();
 		ProduceChunk(bind, gstate, lstate, lstate.scan_chunk);
 		if (lstate.scan_chunk.size() == 0) {
-			output.SetCardinality(0);
+			CompatSetCardinality(output, 0);
 			return;
 		}
 		if (SelectFilteredRows(context, gstate, lstate, output) > 0) {

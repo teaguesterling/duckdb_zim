@@ -98,7 +98,7 @@ void MetadataFunction(ClientContext &, TableFunctionInput &data, DataChunk &outp
 		}
 		count++;
 	}
-	output.SetCardinality(count);
+	CompatSetCardinality(output, count);
 }
 
 //===--------------------------------------------------------------------===//
