@@ -52,6 +52,39 @@ FROM read_zim('test/oracle/test.zim', path := 'A/Photosynth');
 ----
 true
 
+# --- regression: reading a value and asking whether it is NULL must agree -----
+# Pins the chunk-cardinality contract directly, rather than leaving it to the
+# incidental IS NULL above. DuckDB v2.0 gave every Vector its own size, and
+# DataChunk::SetCardinality does NOT set it -- only SetChildCardinality does.
+# Vector::SetValue writes at an index without advancing that size, so a scan that
+# finishes its chunk with the wrong call leaves every child vector at size 0.
+#
+# Nothing crashes and the VALUES still read back correctly, because the printer,
+# scalar functions and aggregates all work off the chunk's count. But IS NULL /
+# IS NOT NULL iterate the VECTOR's size (IsNullLoop, null_operations.cpp), so at
+# size 0 they write no results and every row reports false. The signature is a
+# column that reads as NULL while `x IS NULL` says false for that same row --
+# which is what the A/Photosynth row below asserts, both halves in one row: the
+# mimetype column comes from the value path, the third from the validity path,
+# and the bug is exactly those two disagreeing.
+#
+# NO WHERE CLAUSE, DELIBERATELY. A pushed-down filter sends the scan through
+# SelectFilteredRows, whose DataChunk::Reference/Slice size the child vectors
+# correctly on the way out -- so the identical assertion with `WHERE is_redirect`
+# PASSES even with the bug present, and would be a guard that guards nothing.
+# Measured both ways against DuckDB main before settling on this form.
+# See CompatSetCardinality in src/include/duckdb_compat.hpp.
+query III
+SELECT path, mimetype, mimetype IS NULL
+FROM read_zim('test/oracle/test.zim') ORDER BY path;
+----
+A/Calcium	text/html	false
+A/Chlorophyll	text/html	false
+A/Photosynth	NULL	true
+A/Photosynthesis	text/html	false
+I/logo.png	image/png	false
+style.css	text/css	false
+
 # non-redirects carry mimetype and size (verified: 107 bytes)
 query II
 SELECT mimetype, size FROM read_zim('test/oracle/test.zim', path := 'A/Photosynthesis');
