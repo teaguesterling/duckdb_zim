@@ -27,5 +27,13 @@ endif
 # while stabilizing CI. DuckDB's own compile stays parallel (ninja).
 export VCPKG_MAX_CONCURRENCY=1
 
+# TEMPORARY DIAGNOSTIC -- REMOVE BEFORE MERGE.
+# extension-ci-tools' run_tests.py swallows the actual expected-vs-actual diff and
+# reports only the failing query's source context, which makes a v2.0-only test
+# failure impossible to diagnose from CI logs. Pointing TEST_RUNNER_SCRIPT at a
+# nonexistent path empties TEST_RUNNER, so `make test_release` invokes the unittest
+# binary directly and the real diff (or crash) is printed.
+TEST_RUNNER_SCRIPT := /nonexistent
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
