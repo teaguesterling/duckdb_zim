@@ -314,14 +314,25 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 	// is the single entry point later tasks extend with more `else if` branches.
 	for (auto &option : input.info.options) {
 		// COPY option keys are Identifiers on DuckDB v2.0, not strings: they neither
-		// convert implicitly nor format into an exception message. Rendered once here,
-		// as spelled by the caller, so `raw_key` is what the user sees in errors while
-		// `key` remains the lowered form every branch below dispatches on -- exactly the
+		// convert implicitly nor format into an exception message. Rendered once here
+		// so `key` is the lowered form every branch below dispatches on -- exactly the
 		// split this loop already had.
+		//
+		// ERROR MESSAGES USE THE UPPERCASED NAME, NOT THE CALLER'S SPELLING. The
+		// original casing is not available on both lines: v2.0's PEG parser lowercases
+		// every COPY option name before the binder ever sees it
+		// (BuildGenericCopyOption in transform_generic_copy_option.cpp does
+		// `Identifier(StringUtil::Lower(...))`), while the v1.5 parser preserves it.
+		// So echoing the key verbatim produces `unknown option 'FLUGELHORN'` on v1.5
+		// and `unknown option 'flugelhorn'` on v2.0 -- a message that cannot be
+		// asserted once. Uppercasing is stable on both, and matches how COPY options
+		// are spelled everywhere in this extension's docs and errors; the NULL and
+		// type-mismatch messages below already did exactly this.
 		const auto raw_key = CompatNameStr(option.first);
 		auto key = StringUtil::Lower(raw_key);
+		const auto display_key = StringUtil::Upper(raw_key);
 		if (option.second.size() != 1) {
-			throw BinderException("COPY TO (FORMAT zim): option '%s' takes exactly one value", raw_key);
+			throw BinderException("COPY TO (FORMAT zim): option '%s' takes exactly one value", display_key);
 		}
 		auto &value = option.second[0];
 		// A NULL Value must never reach the branches below. StringValue::Get and
@@ -454,7 +465,7 @@ unique_ptr<FunctionData> ZimCopyBind(ClientContext &context, CopyFunctionBindInp
 			}
 			bind->config.workers = static_cast<uint32_t>(n);
 		} else {
-			throw BinderException("COPY TO (FORMAT zim): unknown option '%s'", raw_key);
+			throw BinderException("COPY TO (FORMAT zim): unknown option '%s'", display_key);
 		}
 	}
 
