@@ -11,6 +11,7 @@
 //   zim_info(file)                     -> STRUCT(...)            (counts/flags/uuid)
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
+#include "duckdb_compat.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "utf8proc_wrapper.hpp"
@@ -51,7 +52,7 @@ struct MetadataGlobalState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> MetadataBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                                      vector<string> &names) {
+                                      vector<CompatName> &names) {
 	auto bind = make_uniq<MetadataBindData>();
 	bind->file_path = input.inputs[0].GetValue<string>();
 	for (auto &kv : input.named_parameters) {
@@ -97,7 +98,7 @@ void MetadataFunction(ClientContext &, TableFunctionInput &data, DataChunk &outp
 		}
 		count++;
 	}
-	output.SetCardinality(count);
+	CompatSetCardinality(output, count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -214,14 +215,24 @@ void RegisterZimMetadata(ExtensionLoader &loader) {
 	meta.named_parameters["filename"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(meta);
 
-	loader.RegisterFunction(ScalarFunction("zim_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                       LogicalType::VARCHAR, ZimMetadataScalar));
-	loader.RegisterFunction(ScalarFunction("zim_metadata_keys", {LogicalType::VARCHAR},
-	                                       LogicalType::LIST(LogicalType::VARCHAR), ZimMetadataKeysScalar));
-	loader.RegisterFunction(ScalarFunction("zim_counter", {LogicalType::VARCHAR},
-	                                       LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT),
-	                                       ZimCounterScalar));
-	loader.RegisterFunction(ScalarFunction("zim_info", {LogicalType::VARCHAR}, ZimInfoType(), ZimInfoScalar));
+	// All four open an archive, so all four throw at execution time on a missing or
+	// corrupt ZIM -- test/sql/zim_errors.test asserts exactly that for zim_info.
+	// DuckDB v2.0 requires such a function to declare itself fallible; see the note on
+	// RegisterFallible in zim_scalars.cpp for why the omission is invisible at compile
+	// time, why it shows up only on an assertions-enabled build, and what the flag
+	// also does on the pinned v1.5 (where it is advisory, and where setting it is both
+	// truthful and strictly more conservative).
+	auto register_fallible = [&loader](ScalarFunction fun) {
+		fun.SetFallible();
+		loader.RegisterFunction(std::move(fun));
+	};
+	register_fallible(ScalarFunction("zim_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                                 ZimMetadataScalar));
+	register_fallible(ScalarFunction("zim_metadata_keys", {LogicalType::VARCHAR},
+	                                 LogicalType::LIST(LogicalType::VARCHAR), ZimMetadataKeysScalar));
+	register_fallible(ScalarFunction("zim_counter", {LogicalType::VARCHAR},
+	                                 LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT), ZimCounterScalar));
+	register_fallible(ScalarFunction("zim_info", {LogicalType::VARCHAR}, ZimInfoType(), ZimInfoScalar));
 }
 
 } // namespace duckdb

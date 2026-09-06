@@ -9,6 +9,7 @@
 //   zim_mimetype(file, path)       -> VARCHAR
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
+#include "duckdb_compat.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "utf8proc_wrapper.hpp"
@@ -238,21 +239,65 @@ void Illustration(DataChunk &args, ExpressionState &state, Vector &result) {
 
 } // namespace
 
+// EVERY scalar function in this extension can throw at execution time: each one
+// opens an archive through the pool, and a missing, unreadable or corrupt ZIM
+// raises from there rather than returning NULL (test/sql/zim_errors.test asserts
+// exactly that for `SELECT zim_info('/no/such/archive.zim')`). DuckDB v2.0 requires
+// a scalar function that can throw to declare it; throwing from one that has not
+// is an InternalException naming SetFallible. That check is an ASSERTION, so it
+// fires only on an assertions-enabled build -- invisible at compile time, and able
+// to be red on one CI arch while green on another for the very same commit.
+//
+// This is the ONE place in the v2.0 port where the pinned v1.5 build also changes,
+// so it is worth being precise. SetFallible() exists on v1.5.4 too (function.hpp),
+// and there it is ADVISORY rather than contractual: it feeds
+// BoundFunctionExpression::CanThrow(), and it suppresses UnaryExecutor's
+// dictionary-vector shortcut, which evaluates a function over dictionary entries
+// that no row references -- a shortcut that is only sound for a function which
+// cannot throw. The default is FunctionErrors::CANNOT_ERROR, so before this change
+// zim was telling the planner something untrue about twelve functions that open
+// files. Setting it moves v1.5 strictly toward being MORE conservative and toward
+// the truth; `make test` is unchanged at 538 assertions. Called DIRECTLY rather
+// than through a compat shim: the member exists identically on both lines, so a
+// feature probe would take the same branch on each and only disguise the fact
+// that this is a real change on the shipped build.
+//
+// The one thing worth checking, because this extension is the one doing filter
+// pushdown: CanThrow() gates pushdown_get.cpp, but on the FILTER expression, and
+// read_zim's pushed filters are comparisons on COLUMNS (`WHERE mimetype = ...`),
+// never calls to these scalars. So this does not touch read_zim's own pushdown.
+// What it does restrain is pushing or reordering a predicate that CALLS one of
+// them -- which is the point: `zim_info(f)` must not be hoisted onto rows an
+// earlier predicate would have excluded.
+//
+// Routed through one helper so a scalar cannot be added without walking past the
+// reason.
+static void RegisterFallible(ExtensionLoader &loader, ScalarFunction fun) {
+	fun.SetFallible();
+	loader.RegisterFunction(std::move(fun));
+}
+
 void RegisterZimScalars(ExtensionLoader &loader) {
 	const auto V = LogicalType::VARCHAR;
-	loader.RegisterFunction(ScalarFunction("zim_get_content", {V, V}, LogicalType::BLOB, GetContent));
-	loader.RegisterFunction(ScalarFunction("zim_get_text", {V, V}, V, GetText));
-	loader.RegisterFunction(ScalarFunction("zim_has_entry", {V, V}, LogicalType::BOOLEAN, HasEntry));
-	loader.RegisterFunction(ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget));
-	loader.RegisterFunction(ScalarFunction("zim_mimetype", {V, V}, V, Mimetype));
-	loader.RegisterFunction(ScalarFunction("zim_main_entry", {V}, V, MainEntry));
-	loader.RegisterFunction(ScalarFunction("zim_random", {V}, V, Random));
-	loader.RegisterFunction(ScalarFunction("zim_check", {V}, LogicalType::BOOLEAN, Check));
+	RegisterFallible(loader, ScalarFunction("zim_get_content", {V, V}, LogicalType::BLOB, GetContent));
+	RegisterFallible(loader, ScalarFunction("zim_get_text", {V, V}, V, GetText));
+	RegisterFallible(loader, ScalarFunction("zim_has_entry", {V, V}, LogicalType::BOOLEAN, HasEntry));
+	RegisterFallible(loader, ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget));
+	RegisterFallible(loader, ScalarFunction("zim_mimetype", {V, V}, V, Mimetype));
+	RegisterFallible(loader, ScalarFunction("zim_main_entry", {V}, V, MainEntry));
+	RegisterFallible(loader, ScalarFunction("zim_random", {V}, V, Random));
+	RegisterFallible(loader, ScalarFunction("zim_check", {V}, LogicalType::BOOLEAN, Check));
 
 	// zim_illustration(file) defaults to 48px; zim_illustration(file, size) is explicit.
+	// Marked fallible BEFORE AddFunction: a v2.0 FunctionSet yields shared_ptr<const
+	// T>, so a member cannot be configured once it is in the set.
 	ScalarFunctionSet illustration("zim_illustration");
-	illustration.AddFunction(ScalarFunction({V}, LogicalType::BLOB, Illustration));
-	illustration.AddFunction(ScalarFunction({V, LogicalType::INTEGER}, LogicalType::BLOB, Illustration));
+	ScalarFunction illustration_default({V}, LogicalType::BLOB, Illustration);
+	illustration_default.SetFallible();
+	illustration.AddFunction(std::move(illustration_default));
+	ScalarFunction illustration_sized({V, LogicalType::INTEGER}, LogicalType::BLOB, Illustration);
+	illustration_sized.SetFallible();
+	illustration.AddFunction(std::move(illustration_sized));
 	loader.RegisterFunction(illustration);
 }
 

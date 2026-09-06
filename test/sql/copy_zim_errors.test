@@ -606,34 +606,48 @@ SELECT count(*) FROM glob('__TEST_DIR__/pto/**/*.zim');
 0
 
 # --- COPY must not report success when no archive was written ---------------
-# The refusal above is not free: PhysicalCopyToFile::GetGlobalSinkState calls
-# CreateDirectory(file_path) BEFORE initialize_operator runs, so the statement
-# that was rejected has already left a DIRECTORY at __TEST_DIR__/pto. The obvious
-# next thing a user types is the same COPY without the option -- and that target
-# is now a directory.
+# What is under test: libzim's finishZimCreation() ends with
+# rename("<target>.tmp", "<target>"), and FS::rename (src/fs_unix.cpp:103)
+# discards ::rename()'s return value, so a rename that fails because the target
+# is a DIRECTORY raises nothing. Measured before the fix: COPY reported success,
+# exited 0, wrote no archive, and left a stray <target>.tmp behind.
 #
-# libzim's finishZimCreation() ends with rename("<target>.tmp", "<target>"), and
-# FS::rename (src/fs_unix.cpp:103) discards ::rename()'s return value, so the
-# rename failing against a directory raises nothing. Measured before the fix:
-# this reported success, exited 0, wrote no archive, and left a stray
-# __TEST_DIR__/pto.tmp behind. Depends on the PER_THREAD_OUTPUT statement above
-# having created the directory -- do not reorder them.
+# THE TARGET MUST ALREADY BE A DIRECTORY, and this test used to obtain that by
+# side effect: on v1.5 PhysicalCopyToFile::GetGlobalSinkState calls
+# CreateDirectory(file_path) BEFORE initialize_operator runs, so the
+# PER_THREAD_OUTPUT statement above -- though rejected -- still left a directory
+# at __TEST_DIR__/pto for this statement to collide with. DuckDB v2.0 no longer
+# creates it before the format's own refusal, so on v2.0 nothing was there, the
+# COPY wrote a perfectly good archive, and `statement error` failed with "Query
+# unexpectedly succeeded" -- a red test caused by an upstream ordering detail,
+# not by this extension (the guard itself is fine on both lines).
+#
+# So name a directory that certainly exists on every version instead of
+# inheriting one: __TEST_DIR__ is itself a directory the harness created. No
+# ordering dependency on any statement above.
 statement error
-COPY (SELECT 'A/x' AS path, 'y' AS content) TO '__TEST_DIR__/pto' (FORMAT zim);
+COPY (SELECT 'A/x' AS path, 'y' AS content) TO '__TEST_DIR__' (FORMAT zim);
 ----
 no archive was written to
 
-# the error names the output path, so the message points at the real problem
+# the error names the output path, so the message points at the real problem.
+# Assert on 'duckdb_unittest_tempdir', the one component the expansion shares
+# across versions: v1.5 expands __TEST_DIR__ to duckdb_unittest_tempdir/<pid>,
+# v2.0 to duckdb_unittest_tempdir/<timestamp>--<name>/<per-test dir>. Anything
+# more specific than the common prefix passes on one line and fails on the other.
 statement error
-COPY (SELECT 'A/x' AS path, 'y' AS content) TO '__TEST_DIR__/pto' (FORMAT zim);
+COPY (SELECT 'A/x' AS path, 'y' AS content) TO '__TEST_DIR__' (FORMAT zim);
 ----
-pto
+duckdb_unittest_tempdir
 
 # and the half-written sibling is gone. libzim clears tmpFileName right after the
 # rename call, so ~CreatorData's own cleanup no longer fires for it -- Finalize
-# removes it explicitly. glob() matches files, not the pto directory itself.
+# removes it explicitly. The sibling is now "<test dir>.tmp" -- __TEST_DIR__ is
+# a plain textual substitution, so appending .tmp names exactly that one file
+# rather than globbing the shared parent, where another test's leftovers would
+# make this assertion flap.
 query I
-SELECT count(*) FROM glob('__TEST_DIR__/pto.tmp');
+SELECT count(*) FROM glob('__TEST_DIR__.tmp');
 ----
 0
 

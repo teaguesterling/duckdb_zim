@@ -22,6 +22,7 @@
 // `max_results` / `result_offset`.
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
+#include "duckdb_compat.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -132,7 +133,7 @@ static void ParseSearchParams(SearchBindData &bind, TableFunctionBindInput &inpu
 }
 
 unique_ptr<FunctionData> SearchBind(ClientContext &context, TableFunctionBindInput &input,
-                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                    vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind = make_uniq<SearchBindData>();
 	bind->file_paths = ExpandFiles(context, input.inputs[0], "zim_search");
 	bind->query = input.inputs[1].GetValue<string>();
@@ -249,13 +250,13 @@ void SearchFunction(ClientContext &, TableFunctionInput &data, DataChunk &output
 		output.data[4].SetValue(count, Value(tagged.file));
 		count++;
 	}
-	output.SetCardinality(count);
+	CompatSetCardinality(output, count);
 }
 
 // --- zim_suggest: title autocomplete (reuses SearchBindData / SearchGlobalState) ---
 
 unique_ptr<FunctionData> SuggestBind(ClientContext &context, TableFunctionBindInput &input,
-                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                     vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind = make_uniq<SearchBindData>();
 	bind->file_paths = ExpandFiles(context, input.inputs[0], "zim_suggest");
 	bind->query = input.inputs[1].GetValue<string>();
@@ -287,12 +288,17 @@ void SuggestFunction(ClientContext &, TableFunctionInput &data, DataChunk &outpu
 		output.data[3].SetValue(count, Value(tagged.file));
 		count++;
 	}
-	output.SetCardinality(count);
+	CompatSetCardinality(output, count);
 }
 
 TableFunction MakeFn(const string &name, const LogicalType &files_type, table_function_t fn, table_function_bind_t bind,
                      table_function_init_global_t init) {
-	TableFunction f(name, {files_type, LogicalType::VARCHAR}, fn, bind, init);
+	// CompatMakeName, not `name` directly: on v2.0 TableFunction's name parameter is
+	// an Identifier, and Identifier(const string &) is EXPLICIT -- deliberately, so
+	// that promoting a RUNTIME string to an identifier is a visible act. A literal
+	// converts implicitly (Identifier(const char *) is not explicit), which is why
+	// every other function registration in this extension needs nothing.
+	TableFunction f(CompatMakeName(name), {files_type, LogicalType::VARCHAR}, fn, bind, init);
 	f.named_parameters["max_results"] = LogicalType::BIGINT;
 	f.named_parameters["result_offset"] = LogicalType::BIGINT;
 	f.named_parameters["with_snippet"] = LogicalType::BOOLEAN;

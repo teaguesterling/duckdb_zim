@@ -16,6 +16,8 @@
 // access is entirely via zim_ext::ZimArchive, so nothing here needs <zim/*>.
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
+#include "duckdb_compat.hpp"
+#include "duckdb_compat_planner.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -190,7 +192,7 @@ LogicalType ContentType(const ReadZimBindData &bind) {
 }
 
 unique_ptr<FunctionData> ReadZimBind(ClientContext &context, TableFunctionBindInput &input,
-                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                     vector<LogicalType> &return_types, vector<CompatName> &names) {
 	auto bind = make_uniq<ReadZimBindData>();
 
 	// Input is a single VARCHAR pattern or a LIST(VARCHAR) of patterns. Glob patterns
@@ -437,12 +439,25 @@ static LogicalType ZimColumnType(const ReadZimBindData &bind, column_t cid) {
 // a few lines later, so nothing is silently dropped either way.
 static unique_ptr<Expression> BuildFilterExpression(const ReadZimBindData &bind, const ReadZimGlobalState &g,
                                                     TableFunctionInitInput &input) {
-	if (!input.filters || input.filters->filters.empty()) {
+	if (!input.filters) {
+		return nullptr;
+	}
+	// DuckDB v2.0's TableFilterSet can also carry filters that span several columns.
+	// They are not part of the per-column collection, so nothing below would see one
+	// -- and since DuckDB deletes a fully-pushed filter from the plan, an unseen
+	// filter is an unapplied filter, which is issue #29 exactly. Refuse instead of
+	// dropping it. Unreachable on the pinned v1.5 build, which has no such filters.
+	if (CompatHasMultiColumnFilters(*input.filters)) {
+		throw NotImplementedException(
+		    "read_zim: a multi-column pushed-down filter cannot be rebuilt as a per-column expression");
+	}
+	auto pushed = CompatTableFilters(*input.filters);
+	if (pushed.empty()) {
 		return nullptr;
 	}
 	vector<unique_ptr<Expression>> conditions;
-	for (auto &entry : input.filters->filters) {
-		const idx_t proj_idx = entry.first;
+	for (auto &entry : pushed) {
+		const idx_t proj_idx = entry.index;
 		if (proj_idx >= g.column_ids.size()) {
 			throw NotImplementedException("read_zim: pushed-down filter references column %llu, but only %llu columns "
 			                              "are projected",
@@ -457,7 +472,7 @@ static unique_ptr<Expression> BuildFilterExpression(const ReadZimBindData &bind,
 		// ToExpression is total over the TableFilter hierarchy; the approximate kinds
 		// (bloom, uninitialized dynamic) return the constant TRUE, which is safe here
 		// because those are redundant with the join that produced them.
-		auto expr = entry.second->ToExpression(*col_ref);
+		auto expr = entry.filter.get().ToExpression(*col_ref);
 		if (!expr) {
 			throw NotImplementedException("read_zim: could not rebuild a pushed-down filter as an expression");
 		}
@@ -468,7 +483,7 @@ static unique_ptr<Expression> BuildFilterExpression(const ReadZimBindData &bind,
 	}
 	auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
 	for (auto &condition : conditions) {
-		conjunction->children.push_back(std::move(condition));
+		CompatConjunctionChildren(*conjunction).push_back(std::move(condition));
 	}
 	return std::move(conjunction);
 }
@@ -492,10 +507,10 @@ static idx_t SelectFilteredRows(ClientContext &context, const ReadZimGlobalState
 
 // `col = <varchar const>` -> sets `out`, returns true.
 static bool FilterEqualityString(const TableFilter &filter, std::string &out) {
-	if (filter.filter_type != TableFilterType::CONSTANT_COMPARISON) {
+	if (filter.filter_type != CompatConstantFilterType) {
 		return false;
 	}
-	auto &cf = filter.Cast<ConstantFilter>();
+	auto &cf = filter.Cast<CompatConstantFilter>();
 	if (cf.comparison_type != ExpressionType::COMPARE_EQUAL || cf.constant.IsNull() ||
 	    cf.constant.type().id() != LogicalTypeId::VARCHAR) {
 		return false;
@@ -509,8 +524,8 @@ static bool FilterEqualityString(const TableFilter &filter, std::string &out) {
 // MimetypePatternMatch never matches an empty mimetype, so pushing it would drop the
 // very rows `mimetype = ''` selects.
 static void CollectMimetypeConstants(const TableFilter &filter, std::vector<std::string> &out) {
-	if (filter.filter_type == TableFilterType::CONSTANT_COMPARISON) {
-		auto &cf = filter.Cast<ConstantFilter>();
+	if (filter.filter_type == CompatConstantFilterType) {
+		auto &cf = filter.Cast<CompatConstantFilter>();
 		if (cf.comparison_type == ExpressionType::COMPARE_EQUAL && !cf.constant.IsNull() &&
 		    cf.constant.type().id() == LogicalTypeId::VARCHAR) {
 			auto value = cf.constant.GetValue<std::string>();
@@ -518,9 +533,9 @@ static void CollectMimetypeConstants(const TableFilter &filter, std::vector<std:
 				out.push_back(std::move(value));
 			}
 		}
-	} else if (filter.filter_type == TableFilterType::IN_FILTER) {
+	} else if (filter.filter_type == CompatInFilterType) {
 		std::vector<std::string> values;
-		for (auto &v : filter.Cast<InFilter>().values) {
+		for (auto &v : filter.Cast<CompatInFilter>().values) {
 			if (v.IsNull() || v.type().id() != LogicalTypeId::VARCHAR) {
 				return; // cannot represent this IN list; leave the scan unfiltered
 			}
@@ -581,13 +596,13 @@ static void ApplyPushedFilters(ReadZimGlobalState &g, TableFunctionInitInput &in
 	// index we cannot map is skipped rather than raised: this layer only reads less, and
 	// BuildFilterExpression — the layer results actually depend on — throws on exactly
 	// the same condition a moment later, so nothing is silently dropped.
-	for (auto &entry : input.filters->filters) {
-		const idx_t proj_idx = entry.first;
+	for (auto &entry : CompatTableFilters(*input.filters)) {
+		const idx_t proj_idx = entry.index;
 		if (proj_idx >= g.column_ids.size()) {
 			continue;
 		}
 		const column_t storage_col = g.column_ids[proj_idx];
-		const TableFilter &filter = *entry.second;
+		const TableFilter &filter = entry.filter.get();
 		if (storage_col == COL_MIMETYPE) {
 			std::vector<std::string> constants;
 			CollectMimetypeConstants(filter, constants);
@@ -750,7 +765,7 @@ static void ProduceChunk(const ReadZimBindData &bind, ReadZimGlobalState &gstate
 				}
 			}
 		}
-		output.SetCardinality(count);
+		CompatSetCardinality(output, count);
 		return;
 	}
 
@@ -793,7 +808,7 @@ static void ProduceChunk(const ReadZimBindData &bind, ReadZimGlobalState &gstate
 			}
 		}
 	}
-	output.SetCardinality(count);
+	CompatSetCardinality(output, count);
 }
 
 void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -817,7 +832,7 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 		lstate.scan_chunk.Reset();
 		ProduceChunk(bind, gstate, lstate, lstate.scan_chunk);
 		if (lstate.scan_chunk.size() == 0) {
-			output.SetCardinality(0);
+			CompatSetCardinality(output, 0);
 			return;
 		}
 		if (SelectFilteredRows(context, gstate, lstate, output) > 0) {
@@ -836,7 +851,7 @@ void ReadZimFunction(ClientContext &context, TableFunctionInput &data, DataChunk
 		// TableScanFunc in duckdb/src/function/table/table_scan.cpp, "Before looping
 		// back, check if we are interrupted". Same idiom, same granularity (at most one
 		// STANDARD_VECTOR_SIZE batch between checks).
-		if (context.interrupted) {
+		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
 	}
