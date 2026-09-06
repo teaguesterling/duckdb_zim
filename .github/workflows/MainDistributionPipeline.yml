@@ -105,37 +105,98 @@ jobs:
   # test/remote/remote_search.sh integration test against the built linux artifact +
   # a matching DuckDB CLI: serve the committed test.zim over http and assert a remote
   # zim_search returns the same hits as the local search (the reader-copy path).
+  #
+  # EVERY ARTIFACT IS TESTED, EACH WITH THE SHELL IT WAS BUILT AGAINST. This job used
+  # to download every "*linux_amd64*" artifact and then test whichever one `find`
+  # happened to return first, against a hardcoded v1.5.4 shell. That was harmless
+  # while the stable build was the only artifact -- but once main grew a DuckDB-main
+  # canary, a second artifact appeared and `find` picked it roughly at random. A
+  # DuckDB-main extension cannot load into a v1.5.4 shell (an extension loads only
+  # into the exact DuckDB it was built against), so the load failed, every query
+  # returned nothing, and the script reported "missing expected hit" -- an ABI
+  # mismatch wearing the costume of a silent wrong answer in remote search.
+  #
+  # So: iterate the artifacts explicitly, and derive each one's shell rather than
+  # assuming. The distribution workflow ships a test-support bundle containing the
+  # duckdb binary built from that same source tree, which is matching BY
+  # CONSTRUCTION; use it when present and fall back to the released CLI named in the
+  # artifact otherwise. If neither can be resolved, FAIL rather than test the wrong
+  # pair. remote_search.sh itself now refuses to run before the extension loads and
+  # httpfs installs, so the two environment failures can no longer masquerade as
+  # missing search hits.
   remote-search-test:
     name: Remote search integration test
-    needs: [duckdb-stable-build]
+    # Waits for the canary too, so its artifact is present rather than racing it --
+    # otherwise "which artifacts exist" depends on job timing. always() is required
+    # because the canary is SKIPPED on pull_request and on non-main pushes, and a
+    # skipped dependency would otherwise skip this job with it.
+    needs: [duckdb-stable-build, duckdb-next-build]
+    if: always() && needs.duckdb-stable-build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download linux extension artifact
+      - name: Download linux extension artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: "*linux_amd64*"
           path: ext-artifacts
-      - name: Fetch matching DuckDB CLI (v1.5.4)
+      - name: Fetch released DuckDB CLI (v1.5.4)
         run: |
+          set -euo pipefail
           curl -fL -o duckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip
           unzip -o duckdb.zip -d duckdb-cli
           ./duckdb-cli/duckdb --version
-      - name: Run remote search test
+      - name: Run remote search + stdout guards against every artifact
         run: |
           set -euo pipefail
-          ext="$(find ext-artifacts \( -name 'zim.duckdb_extension' -o -name 'zim.duckdb_extension.gz' \) | head -1)"
-          if [ -z "$ext" ]; then echo "no zim.duckdb_extension in artifacts:"; find ext-artifacts -type f; exit 1; fi
-          if [ "${ext##*.}" = "gz" ]; then gunzip -kf "$ext"; ext="${ext%.gz}"; fi
-          ext="$(readlink -f "$ext")"
-          echo "extension: $ext"
-          DUCKDB_BIN="$PWD/duckdb-cli/duckdb" ZIM_EXTENSION="$ext" bash test/remote/remote_search.sh
-          # #21 guard: searching a no-stemmer-language archive must not leak
-          # libzim's "No stemming ..." line to stdout (sqllogictest can't see stdout).
-          DUCKDB_BIN="$PWD/duckdb-cli/duckdb" ZIM_EXTENSION="$ext" bash test/no_stdout_pollution.sh
-          # Writer counterpart of the #21 guard above: writing a ZIM must not leak
-          # libzim's writer-side INFO() prints to stdout either.
-          DUCKDB_BIN="$PWD/duckdb-cli/duckdb" ZIM_EXTENSION="$ext" bash test/no_writer_stdout_pollution.sh
+          shopt -s nullglob
+          tested=0
+          for artdir in ext-artifacts/*/; do
+            name="$(basename "$artdir")"
+            ext="$(find "$artdir" \( -name 'zim.duckdb_extension' -o -name 'zim.duckdb_extension.gz' \) | head -1)"
+            if [ -z "$ext" ]; then
+              echo "::notice::$name carries no zim.duckdb_extension, skipping"
+              continue
+            fi
+            if [ "${ext##*.}" = "gz" ]; then gunzip -kf "$ext"; ext="${ext%.gz}"; fi
+            ext="$(readlink -f "$ext")"
+
+            # Resolve the shell this artifact can actually load into.
+            cli=""
+            ts="$(find "$artdir" -name 'test-support.tar.gz' | head -1)"
+            if [ -n "$ts" ]; then
+              dest="shells/$name"
+              mkdir -p "$dest"
+              # The bundle is built from the same tree as the extension, so its
+              # duckdb binary matches by construction whatever version that was.
+              tar xzf "$ts" -C "$dest" release/duckdb
+              cli="$(readlink -f "$dest/release/duckdb")"
+            elif [[ "$name" == *v1.5.4* ]]; then
+              cli="$PWD/duckdb-cli/duckdb"
+            else
+              echo "::error::no DuckDB shell available for artifact '$name'; refusing to test it against a mismatched shell"
+              exit 1
+            fi
+
+            echo "=============================================================="
+            echo "artifact:  $name"
+            echo "extension: $ext"
+            echo "shell:     $cli ($("$cli" --version))"
+            echo "=============================================================="
+            DUCKDB_BIN="$cli" ZIM_EXTENSION="$ext" bash test/remote/remote_search.sh
+            # #21 guard: searching a no-stemmer-language archive must not leak
+            # libzim's "No stemming ..." line to stdout (sqllogictest can't see stdout).
+            # Needs no httpfs, so it runs on every artifact including the canary's.
+            DUCKDB_BIN="$cli" ZIM_EXTENSION="$ext" bash test/no_stdout_pollution.sh
+            # Writer counterpart of the #21 guard above: writing a ZIM must not leak
+            # libzim's writer-side INFO() prints to stdout either.
+            DUCKDB_BIN="$cli" ZIM_EXTENSION="$ext" bash test/no_writer_stdout_pollution.sh
+            tested=$((tested + 1))
+          done
+          if [ "$tested" -eq 0 ]; then
+            echo "::error::no artifact was tested"; find ext-artifacts -type f | head -50; exit 1
+          fi
+          echo "artifacts tested: $tested"
 
   # The parallel read_zim scan reads one shared libzim Archive from many threads
   # (see DESIGN.md). A ThreadSanitizer build of the extension runs the many-entry
