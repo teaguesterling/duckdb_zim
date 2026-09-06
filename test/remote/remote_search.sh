@@ -24,6 +24,36 @@ fixture="test.zim"
 [ -f "$ZIM_EXTENSION" ] || { echo "SKIP: zim extension not found at $ZIM_EXTENSION (build first)"; exit 0; }
 [ -f "$fixture_dir/$fixture" ] || { echo "FAIL: fixture missing: $fixture_dir/$fixture"; exit 1; }
 
+# --- preflight -----------------------------------------------------------------
+# EVERY QUERY BELOW USED TO SWALLOW ITS STDERR, so any failure to even start --
+# an extension that will not load, an httpfs that will not install -- arrived at
+# the assertions as an EMPTY RESULT and was reported as "missing expected hit".
+# That is how an ABI mismatch on CI presented as a silent wrong answer for
+# remote search, which reads as a correctness bug in the extension and is not
+# one. Establish that the tools work BEFORE asserting anything about hits, and
+# distinguish the two failure shapes explicitly.
+
+# 1. The extension must load into THIS shell. A mismatch here is a hard FAIL:
+#    it means the caller paired an extension with a DuckDB it was not built for.
+if ! load_err="$("$DUCKDB_BIN" -unsigned -c "LOAD '$ZIM_EXTENSION';" 2>&1)"; then
+  echo "FAIL: '$ZIM_EXTENSION' does not load into '$DUCKDB_BIN'"
+  echo "$load_err"
+  echo "HINT: an extension can only be loaded by the exact DuckDB it was built against."
+  exit 1
+fi
+
+# 2. httpfs must be obtainable. This is NOT a defect in this extension: httpfs is
+#    an out-of-tree extension published per released DuckDB version, so a shell
+#    built from an unreleased commit (the DuckDB-main canary artifact) has no
+#    httpfs to download and returns 404. There is no http filesystem to test
+#    against, so SKIP loudly rather than report zero hits as a failure.
+if ! httpfs_err="$("$DUCKDB_BIN" -unsigned -c "INSTALL httpfs; LOAD httpfs;" 2>&1)"; then
+  echo "SKIP: httpfs is unavailable for this DuckDB build, so remote search cannot be exercised."
+  echo "$httpfs_err"
+  echo "NOTE: this is an environment limitation, not a result about this extension."
+  exit 0
+fi
+
 # Pick a free port.
 port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 
@@ -41,7 +71,13 @@ done
 url="http://127.0.0.1:$port/$fixture"
 sql="LOAD '$ZIM_EXTENSION'; INSTALL httpfs; LOAD httpfs;
      SELECT path FROM zim_search('$url', 'plants') ORDER BY path;"
-out="$("$DUCKDB_BIN" -unsigned -noheader -list -c "$sql" 2>/dev/null || true)"
+# Errors are captured and surfaced, never discarded: a query that FAILS must not
+# be indistinguishable from one that legitimately returned no rows.
+if ! out="$("$DUCKDB_BIN" -unsigned -noheader -list -c "$sql" 2>&1)"; then
+  echo "FAIL: remote zim_search query errored rather than returning rows:"
+  echo "$out"
+  exit 1
+fi
 
 echo "--- remote zim_search('$url', 'plants') ---"
 echo "$out"
@@ -54,14 +90,22 @@ done
 # A narrower query should still resolve over http (exercises the index, not a full scan).
 sql2="LOAD '$ZIM_EXTENSION'; INSTALL httpfs; LOAD httpfs;
       SELECT count(*) FROM zim_search('$url', 'photosynthesis');"
-n="$("$DUCKDB_BIN" -unsigned -noheader -list -c "$sql2" 2>/dev/null | tail -1 || echo 0)"
+if ! n_out="$("$DUCKDB_BIN" -unsigned -noheader -list -c "$sql2" 2>&1)"; then
+  echo "FAIL: narrow remote query errored rather than returning a count:"
+  echo "$n_out"
+  exit 1
+fi
+n="$(tail -1 <<<"$n_out")"
 if [ "${n:-0}" -lt 1 ]; then echo "FAIL: narrow remote query returned no hits ($n)"; fail=1; fi
 
 # has_fulltext_index reports index *existence* over http (not copyability): a remote
 # archive whose index exceeds the cap must still report true (regression guard for the
 # bug where it returned false for big-index remote archives).
-fts="$("$DUCKDB_BIN" -unsigned -noheader -list \
-  -c "LOAD '$ZIM_EXTENSION'; INSTALL httpfs; LOAD httpfs; SELECT zim_info('$url').has_fulltext_index;" 2>/dev/null | tail -1)"
+if ! fts_out="$("$DUCKDB_BIN" -unsigned -noheader -list \
+  -c "LOAD '$ZIM_EXTENSION'; INSTALL httpfs; LOAD httpfs; SELECT zim_info('$url').has_fulltext_index;" 2>&1)"; then
+  echo "FAIL: remote has_fulltext_index query errored:"; echo "$fts_out"; exit 1
+fi
+fts="$(tail -1 <<<"$fts_out")"
 if [ "$fts" != "true" ]; then echo "FAIL: remote has_fulltext_index='$fts' (expected true)"; fail=1; fi
 
 # Phase B: with the local-copy cap forced to 1 byte, the index exceeds it, so search
