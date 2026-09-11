@@ -1,0 +1,89 @@
+# name: test/sql/zim_get_text_golden.test
+# description: golden output for zim_get_text -- byte-exact content is a downstream contract, not an implementation detail
+# group: [sql]
+
+require zim
+
+# zim_get_text is a passthrough: it decodes the stored bytes for text mimetypes and
+# does not normalise, re-encode, or rewrite them. Downstream consumers store byte
+# offsets into this output, so a one-character change here silently invalidates them
+# -- nothing errors, citations just resolve to the wrong span.
+#
+# These assertions exist to make such a change loud. If one fails, the question is
+# not "update the expected value" but "was this output change intended, and who is
+# holding offsets into the old one?"
+#
+# Existing coverage asserted only a 17-byte CSS file and a NULL for a binary entry;
+# no HTML article's exact text was pinned, which is the case consumers actually use.
+
+# --- ASCII article: exact text, character count, byte count, digest -------------
+
+query I
+SELECT zim_get_text('test/oracle/test.zim', 'A/Photosynthesis');
+----
+<html><body><h1>Photosynthesis</h1><p>Plants convert light.</p><a href='./Chlorophyll'>cl</a></body></html>
+
+query I
+SELECT length(zim_get_text('test/oracle/test.zim', 'A/Photosynthesis'));
+----
+107
+
+query I
+SELECT octet_length(zim_get_text('test/oracle/test.zim', 'A/Photosynthesis')::BLOB);
+----
+107
+
+query I
+SELECT md5(zim_get_text('test/oracle/test.zim', 'A/Photosynthesis'));
+----
+81117be43b7588bc12fc3b2d585b3d2f
+
+query I
+SELECT md5(zim_get_text('test/oracle/test.zim', 'A/Chlorophyll'));
+----
+20abafa13beb659f8b324e8a569f03e2
+
+# --- Redirects resolve to the target, byte-identically --------------------------
+#
+# The scalar resolves through a redirect and returns the target's content. Note this
+# differs from read_zim's mimetype column, which reports the redirect entry as stored
+# (NULL). That divergence is deliberate here only in the sense that it is what the
+# code does; it is not asserted as intended behaviour by this file.
+
+query I
+SELECT md5(zim_get_text('test/oracle/test.zim', 'A/Photosynth'))
+     = md5(zim_get_text('test/oracle/test.zim', 'A/Photosynthesis'));
+----
+true
+
+# --- Multi-byte UTF-8: where a transcoding regression would surface -------------
+#
+# Character count and byte count are pinned separately and deliberately. A change
+# that re-encoded the content would move the byte count while leaving the character
+# count untouched (or the reverse); asserting only one would miss half the failures.
+
+query I
+SELECT zim_get_text('test/oracle/test_zh.zim', 'A/矩阵');
+----
+<html><body><h1>矩阵</h1><p>矩阵是一个按照长方阵列排列的复数或实数集合。</p></body></html>
+
+query I
+SELECT length(zim_get_text('test/oracle/test_zh.zim', 'A/矩阵'));
+----
+66
+
+query I
+SELECT octet_length(encode(zim_get_text('test/oracle/test_zh.zim', 'A/矩阵')));
+----
+114
+
+query I
+SELECT md5(zim_get_text('test/oracle/test_zh.zim', 'A/矩阵'));
+----
+41831dbd94081d62ddddf2af49ed45a3
+
+query I
+SELECT md5(zim_get_text('test/oracle/test_zh.zim', 'A/矩陣'))
+     = md5(zim_get_text('test/oracle/test_zh.zim', 'A/矩阵'));
+----
+true
