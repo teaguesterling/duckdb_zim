@@ -24,7 +24,7 @@ jobs:
   # This job is where that breakage is found, on demand, instead of in a release PR.
   #
   # Informational, NOT a merge blocker: merge-readiness is judged on the stable
-  # v1.5.4 build below, which is what this extension ships. Expected to go red
+  # v1.5.5 build below, which is what this extension ships. Expected to go red
   # whenever upstream drifts; do not pin it.
   #
   # Gated with `if:` and not `continue-on-error:` -- a job that calls a REUSABLE
@@ -80,7 +80,7 @@ jobs:
 
   # Guards the LINKED_LIBS class of WASM bug: the distribution workflow builds and
   # uploads the .wasm but never inspects or loads it, so a side module with unresolved
-  # libzim/zstd/lzma symbols ships green. This downloads the v1.5.4 wasm artifacts and
+  # libzim/zstd/lzma symbols ships green. This downloads the v1.5.5 wasm artifacts and
   # statically checks no dependency symbol is imported-but-undefined (no runtime needed).
   # See test/wasm/. (A live duckdb-wasm load test is deferred until runtime ZIM reading
   # in wasm lands — libzim's local mmap path doesn't work in wasm.)
@@ -96,7 +96,7 @@ jobs:
       - name: Download WASM artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: zim-v1.5.4-extension-wasm_*
+          pattern: zim-v1.5.5-extension-wasm_*
           path: wasm-artifacts
       - name: Check for unresolved libzim/zstd/lzma symbols
         run: bash test/wasm/run_wasm_checks.sh wasm-artifacts
@@ -140,10 +140,10 @@ jobs:
         with:
           pattern: "*linux_amd64*"
           path: ext-artifacts
-      - name: Fetch released DuckDB CLI (v1.5.4)
+      - name: Fetch released DuckDB CLI (v1.5.5)
         run: |
           set -euo pipefail
-          curl -fL -o duckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip
+          curl -fL -o duckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
           unzip -o duckdb.zip -d duckdb-cli
           ./duckdb-cli/duckdb --version
       - name: Run remote search + stdout guards against every artifact
@@ -171,7 +171,7 @@ jobs:
               # duckdb binary matches by construction whatever version that was.
               tar xzf "$ts" -C "$dest" release/duckdb
               cli="$(readlink -f "$dest/release/duckdb")"
-            elif [[ "$name" == *v1.5.4* ]]; then
+            elif [[ "$name" == *v1.5.5* ]]; then
               cli="$PWD/duckdb-cli/duckdb"
             else
               echo "::error::no DuckDB shell available for artifact '$name'; refusing to test it against a mismatched shell"
