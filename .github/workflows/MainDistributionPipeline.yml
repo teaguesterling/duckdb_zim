@@ -17,38 +17,62 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Forward-compat canary: builds this extension's sources against duckdb `main`,
-  # which is the v2.0 line (v2.0-cyanoptera). duckdb/community-extensions builds
-  # every release PR against v2.0 via build_next.yml, with no per-extension opt-out
-  # -- so an extension that stops compiling there has a red check on every release.
-  # This job is where that breakage is found, on demand, instead of in a release PR.
+  # THE NEXT LINE, first-class. duckdb/community-extensions builds every descriptor
+  # that carries ref_next against `v2.0-cyanoptera` (build_next.yml), so a PR is not
+  # green here until it builds and tests there too. This was the canary until
+  # 2026-09-13; Teague's dual-line ruling removed its gate. Note v2.0-cyanoptera is a
+  # BRANCH, not a tag: a red here can arrive on a push none of us made. The case for
+  # gating on it is relevance, not reproducibility -- it is the line the registry
+  # builds, and DuckDB `main` has diverged from it (webbed's `main` canary stayed
+  # green over a ConstantExpression call that cyanoptera deletes).
   #
-  # Informational, NOT a merge blocker: merge-readiness is judged on the stable
-  # v1.5.5 build below, which is what this extension ships. Expected to go red
-  # whenever upstream drifts; do not pin it.
+  # MATRIX WIDTH, zim-specific: reduced_ci_mode defaults to `auto` (three arches on
+  # pull requests, the full matrix on pushes), but exclude_archs below narrows this
+  # job to linux_amd64 on PRs AND pushes. Every extra arch is another from-source
+  # libzim + xapian + icu build under vcpkg_binary_sources 'clear' (about an hour
+  # each), Windows cannot build libzim/xapian at all, and the xapian source host has
+  # timed out more than once. Widen this only once a vcpkg asset cache exists; the
+  # stable job below still covers the full matrix.
   #
-  # Gated with `if:` and not `continue-on-error:` -- a job that calls a REUSABLE
-  # workflow accepts only a fixed set of keys, and adding continue-on-error makes
-  # the whole file fail to parse, scheduling zero jobs. The gate also keeps the
-  # canary off pull_request runs, where a red advisory leg would sit in every PR's
-  # check rollup.
+  # ONCE PER PR, ONCE PER MERGE. A push to a PR branch fires a push run AND a
+  # pull_request run for the same commit, so an ungated job here builds twice per
+  # push (markdown, measured on 126739d). This gate runs it on every pull request,
+  # on merges to main, and on dispatch; the one case it does not cover is a branch
+  # with no PR open, which gets its first next-line build when the PR opens.
   duckdb-next-build:
-    name: Canary — build against DuckDB main (advisory)
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    name: Build extension binaries (duckdb next, v2.0 line)
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       duckdb_version: v2.0-cyanoptera
       ci_tools_version: main
       extension_name: zim
       vcpkg_binary_sources: 'clear'
-      # linux_amd64 only. The canary answers exactly one question -- "do these
-      # sources still compile against the v2.0 API?" -- and that answer is
+      # linux_amd64 only. This job answers one question -- "do these sources
+      # still build and test on the v2.0 line?" -- and that answer is
       # arch-independent, while every extra arch means another from-source build of
       # libzim + xapian + icu (this extension's vcpkg set is expensive; see the
       # 'clear' above). Keeping it to one arch is what makes the port loop minutes
       # rather than an hour. The stable job below still covers the full matrix.
       exclude_archs: 'linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
+  # ADVISORY canary on DuckDB main, the line beyond 2.0. Pushes to main and on
+  # demand only: a push and a pull_request both fire on the same commit and a PR's
+  # rollup includes both, so an unconditional job here would redden every PR for a
+  # line nobody ships. `if:` rather than `continue-on-error:` because a job calling
+  # a REUSABLE workflow accepts only a fixed set of keys.
+  #   gh workflow run MainDistributionPipeline.yml --ref <branch>
+  # zim carries the next job's vcpkg and arch settings here, for the same reasons.
+  duckdb-main-canary:
+    name: Build extension binaries (duckdb main canary)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: main
+      ci_tools_version: main
+      extension_name: zim
+      vcpkg_binary_sources: 'clear'
+      exclude_archs: 'linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
   duckdb-stable-build:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
@@ -126,11 +150,12 @@ jobs:
   # missing search hits.
   remote-search-test:
     name: Remote search integration test
-    # Waits for the canary too, so its artifact is present rather than racing it --
-    # otherwise "which artifacts exist" depends on job timing. always() is required
-    # because the canary is SKIPPED on pull_request and on non-main pushes, and a
-    # skipped dependency would otherwise skip this job with it.
-    needs: [duckdb-stable-build, duckdb-next-build]
+    # Waits for the next-line build and the main canary too, so their artifacts are
+    # present rather than racing them -- otherwise "which artifacts exist" depends on
+    # job timing. always() is required because the canary is SKIPPED on pull_request
+    # and on non-main pushes (and the next job on branches with no PR), and a skipped
+    # dependency would otherwise skip this job with it.
+    needs: [duckdb-stable-build, duckdb-next-build, duckdb-main-canary]
     if: always() && needs.duckdb-stable-build.result == 'success'
     runs-on: ubuntu-latest
     steps:
