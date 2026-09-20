@@ -23,6 +23,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/function/replacement_scan.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -905,7 +906,15 @@ void RegisterReadZim(ExtensionLoader &loader) {
 	TableFunctionSet set("read_zim");
 	set.AddFunction(make_fn(LogicalType::VARCHAR));
 	set.AddFunction(make_fn(LogicalType::LIST(LogicalType::VARCHAR)));
-	loader.RegisterFunction(set);
+	CreateTableFunctionInfo info(std::move(set));
+	info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	FunctionDescription desc;
+	desc.parameter_names = {"file"};
+	desc.description = "Read entries and content from ZIM archive files.";
+	desc.examples = {"SELECT * FROM read_zim('wikipedia.zim')"};
+	desc.categories = {"zim"};
+	info.descriptions.push_back(desc);
+	loader.RegisterFunction(std::move(info));
 
 	// `FROM 'x.zim'` replacement scan (only fires for names ending in .zim).
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());

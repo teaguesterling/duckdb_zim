@@ -26,6 +26,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include "zim_access.hpp"
 #include "zim_archive_pool.hpp"
@@ -314,12 +315,28 @@ void RegisterZimSearch(ExtensionLoader &loader) {
 	TableFunctionSet search("zim_search");
 	search.AddFunction(MakeFn("zim_search", LogicalType::VARCHAR, SearchFunction, SearchBind, SearchInit));
 	search.AddFunction(MakeFn("zim_search", LIST_V, SearchFunction, SearchBind, SearchInit));
-	loader.RegisterFunction(search);
+	CreateTableFunctionInfo search_info(std::move(search));
+	search_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	FunctionDescription search_desc;
+	search_desc.parameter_names = {"file", "query"};
+	search_desc.description = "Perform full-text search across entries in ZIM archives.";
+	search_desc.examples = {"SELECT * FROM zim_search('wikipedia.zim', 'DuckDB')"};
+	search_desc.categories = {"zim", "search"};
+	search_info.descriptions.push_back(search_desc);
+	loader.RegisterFunction(std::move(search_info));
 
 	TableFunctionSet suggest("zim_suggest");
 	suggest.AddFunction(MakeFn("zim_suggest", LogicalType::VARCHAR, SuggestFunction, SuggestBind, SuggestInit));
 	suggest.AddFunction(MakeFn("zim_suggest", LIST_V, SuggestFunction, SuggestBind, SuggestInit));
-	loader.RegisterFunction(suggest);
+	CreateTableFunctionInfo suggest_info(std::move(suggest));
+	suggest_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	FunctionDescription suggest_desc;
+	suggest_desc.parameter_names = {"file", "prefix"};
+	suggest_desc.description = "Get entry title suggestions matching a prefix in ZIM archives.";
+	suggest_desc.examples = {"SELECT * FROM zim_suggest('wikipedia.zim', 'Duck')"};
+	suggest_desc.categories = {"zim", "search"};
+	suggest_info.descriptions.push_back(suggest_desc);
+	loader.RegisterFunction(std::move(suggest_info));
 }
 
 } // namespace duckdb
