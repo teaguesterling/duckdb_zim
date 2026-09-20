@@ -250,8 +250,8 @@ void RegisterZimMetadata(ExtensionLoader &loader) {
 	}
 
 	{
-		ScalarFunction fun("zim_metadata_keys", {LogicalType::VARCHAR},
-		                   LogicalType::LIST(LogicalType::VARCHAR), ZimMetadataKeysScalar);
+		ScalarFunction fun("zim_metadata_keys", {LogicalType::VARCHAR}, LogicalType::LIST(LogicalType::VARCHAR),
+		                   ZimMetadataKeysScalar);
 		fun.SetFallible();
 		CreateScalarFunctionInfo info(std::move(fun));
 		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;

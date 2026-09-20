@@ -289,30 +289,24 @@ static void RegisterFallible(ExtensionLoader &loader, ScalarFunction fun, vector
 
 void RegisterZimScalars(ExtensionLoader &loader) {
 	const auto V = LogicalType::VARCHAR;
-	RegisterFallible(loader, ScalarFunction("zim_get_content", {V, V}, LogicalType::BLOB, GetContent),
-	                 {"file", "path"}, "Retrieve binary content of an entry from a ZIM file.",
+	RegisterFallible(loader, ScalarFunction("zim_get_content", {V, V}, LogicalType::BLOB, GetContent), {"file", "path"},
+	                 "Retrieve binary content of an entry from a ZIM file.",
 	                 {"zim_get_content('wiki.zim', 'A/Duck.html')"});
-	RegisterFallible(loader, ScalarFunction("zim_get_text", {V, V}, V, GetText),
-	                 {"file", "path"}, "Retrieve text content of an entry from a ZIM file.",
-	                 {"zim_get_text('wiki.zim', 'A/Duck.html')"});
-	RegisterFallible(loader, ScalarFunction("zim_has_entry", {V, V}, LogicalType::BOOLEAN, HasEntry),
-	                 {"file", "path"}, "Check if a path exists in a ZIM file.",
-	                 {"zim_has_entry('wiki.zim', 'A/Duck.html')"});
-	RegisterFallible(loader, ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget),
-	                 {"file", "path"}, "Get the redirect target path for an entry in a ZIM file.",
+	RegisterFallible(loader, ScalarFunction("zim_get_text", {V, V}, V, GetText), {"file", "path"},
+	                 "Retrieve text content of an entry from a ZIM file.", {"zim_get_text('wiki.zim', 'A/Duck.html')"});
+	RegisterFallible(loader, ScalarFunction("zim_has_entry", {V, V}, LogicalType::BOOLEAN, HasEntry), {"file", "path"},
+	                 "Check if a path exists in a ZIM file.", {"zim_has_entry('wiki.zim', 'A/Duck.html')"});
+	RegisterFallible(loader, ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget), {"file", "path"},
+	                 "Get the redirect target path for an entry in a ZIM file.",
 	                 {"zim_redirect_target('wiki.zim', 'A/Duck.html')"});
-	RegisterFallible(loader, ScalarFunction("zim_mimetype", {V, V}, V, Mimetype),
-	                 {"file", "path"}, "Get the MIME type of an entry in a ZIM file.",
-	                 {"zim_mimetype('wiki.zim', 'A/Duck.html')"});
-	RegisterFallible(loader, ScalarFunction("zim_main_entry", {V}, V, MainEntry),
-	                 {"file"}, "Get the main entry path of a ZIM file.",
-	                 {"zim_main_entry('wiki.zim')"});
-	RegisterFallible(loader, ScalarFunction("zim_random", {V}, V, Random),
-	                 {"file"}, "Get a random entry path from a ZIM file.",
-	                 {"zim_random('wiki.zim')"});
-	RegisterFallible(loader, ScalarFunction("zim_check", {V}, LogicalType::BOOLEAN, Check),
-	                 {"file"}, "Validate the integrity and checksum of a ZIM file.",
-	                 {"zim_check('wiki.zim')"});
+	RegisterFallible(loader, ScalarFunction("zim_mimetype", {V, V}, V, Mimetype), {"file", "path"},
+	                 "Get the MIME type of an entry in a ZIM file.", {"zim_mimetype('wiki.zim', 'A/Duck.html')"});
+	RegisterFallible(loader, ScalarFunction("zim_main_entry", {V}, V, MainEntry), {"file"},
+	                 "Get the main entry path of a ZIM file.", {"zim_main_entry('wiki.zim')"});
+	RegisterFallible(loader, ScalarFunction("zim_random", {V}, V, Random), {"file"},
+	                 "Get a random entry path from a ZIM file.", {"zim_random('wiki.zim')"});
+	RegisterFallible(loader, ScalarFunction("zim_check", {V}, LogicalType::BOOLEAN, Check), {"file"},
+	                 "Validate the integrity and checksum of a ZIM file.", {"zim_check('wiki.zim')"});
 
 	// zim_illustration(file) defaults to 48px; zim_illustration(file, size) is explicit.
 	// Marked fallible BEFORE AddFunction: a v2.0 FunctionSet yields shared_ptr<const
