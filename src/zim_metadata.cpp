@@ -13,6 +13,8 @@
 #include "duckdb.hpp"
 #include "duckdb_compat.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "utf8proc_wrapper.hpp"
 
@@ -210,10 +212,20 @@ LogicalType ZimInfoType() {
 } // namespace
 
 void RegisterZimMetadata(ExtensionLoader &loader) {
-	TableFunction meta("read_zim_metadata", {LogicalType::VARCHAR}, MetadataFunction, MetadataBind, MetadataInit);
-	meta.named_parameters["include_filepath"] = LogicalType::BOOLEAN;
-	meta.named_parameters["filename"] = LogicalType::BOOLEAN;
-	loader.RegisterFunction(meta);
+	{
+		TableFunction meta("read_zim_metadata", {LogicalType::VARCHAR}, MetadataFunction, MetadataBind, MetadataInit);
+		meta.named_parameters["include_filepath"] = LogicalType::BOOLEAN;
+		meta.named_parameters["filename"] = LogicalType::BOOLEAN;
+		CreateTableFunctionInfo info(std::move(meta));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"file"};
+		desc.description = "Read archive-level metadata from ZIM files.";
+		desc.examples = {"SELECT * FROM read_zim_metadata('wikipedia.zim')"};
+		desc.categories = {"zim", "metadata"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// All four open an archive, so all four throw at execution time on a missing or
 	// corrupt ZIM -- test/sql/zim_errors.test asserts exactly that for zim_info.
@@ -222,17 +234,64 @@ void RegisterZimMetadata(ExtensionLoader &loader) {
 	// time, why it shows up only on an assertions-enabled build, and what the flag
 	// also does on the pinned v1.5 (where it is advisory, and where setting it is both
 	// truthful and strictly more conservative).
-	auto register_fallible = [&loader](ScalarFunction fun) {
+	{
+		ScalarFunction fun("zim_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
+		                   ZimMetadataScalar);
 		fun.SetFallible();
-		loader.RegisterFunction(std::move(fun));
-	};
-	register_fallible(ScalarFunction("zim_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
-	                                 ZimMetadataScalar));
-	register_fallible(ScalarFunction("zim_metadata_keys", {LogicalType::VARCHAR},
-	                                 LogicalType::LIST(LogicalType::VARCHAR), ZimMetadataKeysScalar));
-	register_fallible(ScalarFunction("zim_counter", {LogicalType::VARCHAR},
-	                                 LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT), ZimCounterScalar));
-	register_fallible(ScalarFunction("zim_info", {LogicalType::VARCHAR}, ZimInfoType(), ZimInfoScalar));
+		CreateScalarFunctionInfo info(std::move(fun));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"file", "key"};
+		desc.description = "Get a specific metadata value from a ZIM file.";
+		desc.examples = {"zim_metadata('wikipedia.zim', 'Title')"};
+		desc.categories = {"zim", "metadata"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
+
+	{
+		ScalarFunction fun("zim_metadata_keys", {LogicalType::VARCHAR}, LogicalType::LIST(LogicalType::VARCHAR),
+		                   ZimMetadataKeysScalar);
+		fun.SetFallible();
+		CreateScalarFunctionInfo info(std::move(fun));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"file"};
+		desc.description = "List all metadata keys present in a ZIM file.";
+		desc.examples = {"zim_metadata_keys('wikipedia.zim')"};
+		desc.categories = {"zim", "metadata"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
+
+	{
+		ScalarFunction fun("zim_counter", {LogicalType::VARCHAR},
+		                   LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT), ZimCounterScalar);
+		fun.SetFallible();
+		CreateScalarFunctionInfo info(std::move(fun));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"file"};
+		desc.description = "Get entry type counters from a ZIM file.";
+		desc.examples = {"zim_counter('wikipedia.zim')"};
+		desc.categories = {"zim", "metadata"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
+
+	{
+		ScalarFunction fun("zim_info", {LogicalType::VARCHAR}, ZimInfoType(), ZimInfoScalar);
+		fun.SetFallible();
+		CreateScalarFunctionInfo info(std::move(fun));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+		FunctionDescription desc;
+		desc.parameter_names = {"file"};
+		desc.description = "Get structural and format information about a ZIM file.";
+		desc.examples = {"zim_info('wikipedia.zim')"};
+		desc.categories = {"zim", "metadata"};
+		info.descriptions.push_back(desc);
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 } // namespace duckdb

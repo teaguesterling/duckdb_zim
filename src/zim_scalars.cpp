@@ -11,6 +11,7 @@
 #include "duckdb.hpp"
 #include "duckdb_compat.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "utf8proc_wrapper.hpp"
 
@@ -272,33 +273,74 @@ void Illustration(DataChunk &args, ExpressionState &state, Vector &result) {
 //
 // Routed through one helper so a scalar cannot be added without walking past the
 // reason.
-static void RegisterFallible(ExtensionLoader &loader, ScalarFunction fun) {
+static void RegisterFallible(ExtensionLoader &loader, ScalarFunction fun, vector<string> param_names,
+                             string description, vector<string> examples) {
 	fun.SetFallible();
-	loader.RegisterFunction(std::move(fun));
+	CreateScalarFunctionInfo info(std::move(fun));
+	info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	FunctionDescription desc;
+	desc.parameter_names = std::move(param_names);
+	desc.description = std::move(description);
+	desc.examples = std::move(examples);
+	desc.categories = {"zim"};
+	info.descriptions.push_back(desc);
+	loader.RegisterFunction(std::move(info));
 }
 
 void RegisterZimScalars(ExtensionLoader &loader) {
 	const auto V = LogicalType::VARCHAR;
-	RegisterFallible(loader, ScalarFunction("zim_get_content", {V, V}, LogicalType::BLOB, GetContent));
-	RegisterFallible(loader, ScalarFunction("zim_get_text", {V, V}, V, GetText));
-	RegisterFallible(loader, ScalarFunction("zim_has_entry", {V, V}, LogicalType::BOOLEAN, HasEntry));
-	RegisterFallible(loader, ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget));
-	RegisterFallible(loader, ScalarFunction("zim_mimetype", {V, V}, V, Mimetype));
-	RegisterFallible(loader, ScalarFunction("zim_main_entry", {V}, V, MainEntry));
-	RegisterFallible(loader, ScalarFunction("zim_random", {V}, V, Random));
-	RegisterFallible(loader, ScalarFunction("zim_check", {V}, LogicalType::BOOLEAN, Check));
+	RegisterFallible(loader, ScalarFunction("zim_get_content", {V, V}, LogicalType::BLOB, GetContent), {"file", "path"},
+	                 "Retrieve binary content of an entry from a ZIM file.",
+	                 {"zim_get_content('wiki.zim', 'A/Duck.html')"});
+	RegisterFallible(loader, ScalarFunction("zim_get_text", {V, V}, V, GetText), {"file", "path"},
+	                 "Retrieve text content of an entry from a ZIM file.", {"zim_get_text('wiki.zim', 'A/Duck.html')"});
+	RegisterFallible(loader, ScalarFunction("zim_has_entry", {V, V}, LogicalType::BOOLEAN, HasEntry), {"file", "path"},
+	                 "Check if a path exists in a ZIM file.", {"zim_has_entry('wiki.zim', 'A/Duck.html')"});
+	RegisterFallible(loader, ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget), {"file", "path"},
+	                 "Get the redirect target path for an entry in a ZIM file.",
+	                 {"zim_redirect_target('wiki.zim', 'A/Duck.html')"});
+	RegisterFallible(loader, ScalarFunction("zim_mimetype", {V, V}, V, Mimetype), {"file", "path"},
+	                 "Get the MIME type of an entry in a ZIM file.", {"zim_mimetype('wiki.zim', 'A/Duck.html')"});
+	RegisterFallible(loader, ScalarFunction("zim_main_entry", {V}, V, MainEntry), {"file"},
+	                 "Get the main entry path of a ZIM file.", {"zim_main_entry('wiki.zim')"});
+	RegisterFallible(loader, ScalarFunction("zim_random", {V}, V, Random), {"file"},
+	                 "Get a random entry path from a ZIM file.", {"zim_random('wiki.zim')"});
+	RegisterFallible(loader, ScalarFunction("zim_check", {V}, LogicalType::BOOLEAN, Check), {"file"},
+	                 "Validate the integrity and checksum of a ZIM file.", {"zim_check('wiki.zim')"});
 
 	// zim_illustration(file) defaults to 48px; zim_illustration(file, size) is explicit.
 	// Marked fallible BEFORE AddFunction: a v2.0 FunctionSet yields shared_ptr<const
 	// T>, so a member cannot be configured once it is in the set.
-	ScalarFunctionSet illustration("zim_illustration");
-	ScalarFunction illustration_default({V}, LogicalType::BLOB, Illustration);
-	illustration_default.SetFallible();
-	illustration.AddFunction(std::move(illustration_default));
-	ScalarFunction illustration_sized({V, LogicalType::INTEGER}, LogicalType::BLOB, Illustration);
-	illustration_sized.SetFallible();
-	illustration.AddFunction(std::move(illustration_sized));
-	loader.RegisterFunction(illustration);
+	{
+		ScalarFunctionSet illustration("zim_illustration");
+		ScalarFunction illustration_default({V}, LogicalType::BLOB, Illustration);
+		illustration_default.SetFallible();
+		illustration.AddFunction(std::move(illustration_default));
+		ScalarFunction illustration_sized({V, LogicalType::INTEGER}, LogicalType::BLOB, Illustration);
+		illustration_sized.SetFallible();
+		illustration.AddFunction(std::move(illustration_sized));
+
+		CreateScalarFunctionInfo info(std::move(illustration));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+
+		FunctionDescription desc1;
+		desc1.parameter_types = {V};
+		desc1.parameter_names = {"file"};
+		desc1.description = "Extract the illustration favicon or thumbnail image from a ZIM file.";
+		desc1.examples = {"zim_illustration('wiki.zim')"};
+		desc1.categories = {"zim"};
+		info.descriptions.push_back(desc1);
+
+		FunctionDescription desc2;
+		desc2.parameter_types = {V, LogicalType::INTEGER};
+		desc2.parameter_names = {"file", "size"};
+		desc2.description = "Extract the illustration favicon or thumbnail image of a specific size from a ZIM file.";
+		desc2.examples = {"zim_illustration('wiki.zim', 64)"};
+		desc2.categories = {"zim"};
+		info.descriptions.push_back(desc2);
+
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 } // namespace duckdb
