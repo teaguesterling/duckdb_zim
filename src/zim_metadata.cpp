@@ -214,8 +214,10 @@ LogicalType ZimInfoType() {
 void RegisterZimMetadata(ExtensionLoader &loader) {
 	{
 		TableFunction meta("read_zim_metadata", {LogicalType::VARCHAR}, MetadataFunction, MetadataBind, MetadataInit);
-		meta.named_parameters["include_filepath"] = LogicalType::BOOLEAN;
-		meta.named_parameters["filename"] = LogicalType::BOOLEAN;
+		CompatDeclareNamedParams(meta, {
+		                                   {"include_filepath", LogicalType::BOOLEAN},
+		                                   {"filename", LogicalType::BOOLEAN},
+		                               });
 		CreateTableFunctionInfo info(std::move(meta));
 		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 		FunctionDescription desc;

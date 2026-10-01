@@ -347,4 +347,144 @@ static_assert(!CompatHasFromValue<NoFromValueProbe>::value,
               "CompatHasFromValue must not fire where FromValue is absent (the v1.5 shape)");
 } // namespace compat_detail
 
+// --- Table function named parameters -----------------------------------------
+// v1.5: TableFunction::named_parameters, a flat map keyed by string.
+// v2.0: that member is GONE. Named parameters moved onto FunctionSignature and
+//       are declared as TYPED KWARGS:
+//         func.GetSignature().WithTypedKwargs("options", [](TypedKwargs &k) {
+//             k.Add(Identifier("include_content"), LogicalType::ANY); ... });
+//       (the migration landed with d43fcb8ce1 "Add BoundTableFunction and use
+//       FunctionSignature", 5eb0f76e48 "unify binding", cb4ab4a105; it reached
+//       v2.0-cyanoptera around 2026-09-28)
+//
+// SENTINEL: duckdb/main/capi/capi_function_signature.hpp. Verified to co-vary
+// with the API across the two commits this extension builds against -- ABSENT on
+// v1.5.6, PRESENT on v2.0-cyanoptera. Deliberately NOT these two:
+//   - duckdb/common/identifier.hpp        is present on BOTH lines (backported to
+//                                         v1.5.x), so it never discriminates
+//   - .../identifier_case_mode.hpp        is v2.0-only and so LOOKS valid, but it
+//                                         landed BEFORE TableFunction::GetSignature;
+//                                         selecting on it produced a documented
+//                                         99-error mis-selection in sitting_duck
+// Ported from teaguesterling/sitting_duck's named_parameter_compat.hpp (the
+// reference implementation, verified green on cyanoptera 96063b9e). Names match
+// the fleet convention agreed with duckdb_markdown so cross-repo review reads
+// the same; the header stays local, per that repo's own derivation discipline.
+#if __has_include("duckdb/main/capi/capi_function_signature.hpp")
+#define DUCKDB_HAS_TYPED_KWARGS 1
+#endif
+
+//! One named parameter: the name callers write, and the type it accepts.
+struct CompatNamedParamSpec {
+	const char *name;
+	LogicalType type;
+};
+
+//! The kwargs group v2.0 collects a table function's options under. v1.5 has no
+//! grouping and ignores this.
+static constexpr const char *COMPAT_KWARGS_GROUP = "options";
+
+//! The type TableFunctionBindInput::named_parameters actually hands out.
+//!
+//! SPELL THIS, never named_parameter_map_t directly. v2.0 STILL DEFINES that
+//! name (as identifier_map_t) while the bind input hands out
+//! named_argument_map_t -- so naming it compiles on both lines and silently
+//! means a DIFFERENT TYPE on v2.0. zim's three bind loops iterate with `auto`
+//! and so dodge this, but any signature that receives the map must use the alias.
+#ifdef DUCKDB_HAS_TYPED_KWARGS
+using CompatNamedParamMap = named_argument_map_t;
+#else
+using CompatNamedParamMap = named_parameter_map_t;
+#endif
+
+#ifdef DUCKDB_HAS_TYPED_KWARGS
+
+//! Declare a table function's named parameters. Call ONCE per function, then
+//! CompatExtendNamedParams for any further ones: v2.0 separates creating the
+//! kwargs parameter from adding options to it, and ExtendTypedKwargs THROWS if
+//! the signature has no kwargs parameter yet.
+inline void CompatDeclareNamedParams(TableFunction &func, const vector<CompatNamedParamSpec> &params) {
+	func.GetSignature().WithTypedKwargs(Identifier(COMPAT_KWARGS_GROUP), [&params](TypedKwargs &kwargs) {
+		for (const auto &param : params) {
+			// Identifier(const string &) is EXPLICIT, so a runtime name must be
+			// promoted deliberately rather than passed as a literal.
+			kwargs.Add(Identifier(string(param.name)), param.type);
+		}
+	});
+}
+
+//! Add further named parameters to a function that has already declared some.
+inline void CompatExtendNamedParams(TableFunction &func, const vector<CompatNamedParamSpec> &params) {
+	func.GetSignature().ExtendTypedKwargs([&params](TypedKwargs &kwargs) {
+		for (const auto &param : params) {
+			kwargs.Add(Identifier(string(param.name)), param.type);
+		}
+	});
+}
+
+//! The value bound to `name`, or nullptr when the call omitted it.
+inline const Value *CompatFindNamedParam(const named_argument_map_t &params, const char *name) {
+	// find(), NOT count(): named_argument_map_t has no count().
+	auto entry = params.find(Identifier(string(name)));
+	if (entry == params.end()) {
+		return nullptr;
+	}
+	return &entry->second;
+}
+
+#else
+
+//! Declare a table function's named parameters (v1.5: the flat map).
+inline void CompatDeclareNamedParams(TableFunction &func, const vector<CompatNamedParamSpec> &params) {
+	for (const auto &param : params) {
+		func.named_parameters[param.name] = param.type;
+	}
+}
+
+//! On v1.5 the map does not care when a key arrives, so this is Declare. The
+//! call sites keep the same shape on both lines regardless.
+inline void CompatExtendNamedParams(TableFunction &func, const vector<CompatNamedParamSpec> &params) {
+	CompatDeclareNamedParams(func, params);
+}
+
+//! The value bound to `name`, or nullptr when the call omitted it.
+inline const Value *CompatFindNamedParam(const named_parameter_map_t &params, const char *name) {
+	auto entry = params.find(name);
+	if (entry == params.end()) {
+		return nullptr;
+	}
+	return &entry->second;
+}
+
+#endif
+
+//! The value bound to `name`, throwing when absent -- the shape map::at had, for
+//! call sites that already knew the parameter was present.
+template <class MAP>
+inline const Value &CompatNamedParamAt(const MAP &params, const char *name) {
+	auto value = CompatFindNamedParam(params, name);
+	if (!value) {
+		throw InvalidInputException("named parameter '%s' was not provided", name);
+	}
+	return *value;
+}
+
+//! Whether the call provided `name` at all.
+template <class MAP>
+inline bool CompatHasNamedParam(const MAP &params, const char *name) {
+	return CompatFindNamedParam(params, name) != nullptr;
+}
+
+// NO `{}` CATCH-ALL BRANCH, deliberately. A third fallback that quietly declares
+// nothing would compile against ANY DuckDB and register an empty parameter set:
+// every named parameter silently stops binding, the docs lose their parameters,
+// and nothing goes red. If the sentinel ever stops discriminating, this header
+// must FAIL TO COMPILE rather than succeed at doing nothing -- which is what the
+// two branches above, and only two branches, guarantee.
+//
+// VERIFY BY VALUE, NOT BY BINDING. "the function still binds" passes even when a
+// parameter is declared with the wrong type or dropped. Pick a parameter whose
+// value visibly changes output on BOTH lines -- e.g. zim_search's max_results --
+// and diff the result across the two builds.
+
 } // namespace duckdb
