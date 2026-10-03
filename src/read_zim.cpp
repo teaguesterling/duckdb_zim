@@ -878,18 +878,20 @@ void RegisterReadZim(ExtensionLoader &loader) {
 	auto make_fn = [](const LogicalType &arg_type) {
 		TableFunction f("read_zim", {arg_type}, ReadZimFunction, ReadZimBind, ReadZimInitGlobal, ReadZimInitLocal);
 		// ANY so a BOOLEAN, a VARCHAR mimetype, or a LIST(VARCHAR) all bind.
-		f.named_parameters["include_content"] = LogicalType::ANY;
-		f.named_parameters["content_as_varchar"] = LogicalType::BOOLEAN;
-		f.named_parameters["parallel"] = LogicalType::BOOLEAN;
-		f.named_parameters["include_filepath"] = LogicalType::BOOLEAN;
-		f.named_parameters["filename"] = LogicalType::BOOLEAN;
-		// ANY so a single mimetype or a LIST(VARCHAR) of patterns both bind.
-		f.named_parameters["mimetype"] = LogicalType::ANY;
-		f.named_parameters["path"] = LogicalType::VARCHAR;
-		f.named_parameters["title"] = LogicalType::VARCHAR;
-		f.named_parameters["path_prefix"] = LogicalType::VARCHAR;
-		f.named_parameters["title_prefix"] = LogicalType::VARCHAR;
-		f.named_parameters["listing"] = LogicalType::VARCHAR;
+		CompatDeclareNamedParams(f, {
+		                                {"include_content", LogicalType::ANY},
+		                                {"content_as_varchar", LogicalType::BOOLEAN},
+		                                {"parallel", LogicalType::BOOLEAN},
+		                                {"include_filepath", LogicalType::BOOLEAN},
+		                                {"filename", LogicalType::BOOLEAN},
+		                                // ANY so a single mimetype or a LIST(VARCHAR) of patterns both bind.
+		                                {"mimetype", LogicalType::ANY},
+		                                {"path", LogicalType::VARCHAR},
+		                                {"title", LogicalType::VARCHAR},
+		                                {"path_prefix", LogicalType::VARCHAR},
+		                                {"title_prefix", LogicalType::VARCHAR},
+		                                {"listing", LogicalType::VARCHAR},
+		                            });
 		f.projection_pushdown = true;
 		// Accepting pushdown means OWNING every pushed filter: DuckDB deletes them from
 		// the plan and never re-applies them (issue #29). ReadZimFunction evaluates the

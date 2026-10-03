@@ -300,10 +300,12 @@ TableFunction MakeFn(const string &name, const LogicalType &files_type, table_fu
 	// converts implicitly (Identifier(const char *) is not explicit), which is why
 	// every other function registration in this extension needs nothing.
 	TableFunction f(CompatMakeName(name), {files_type, LogicalType::VARCHAR}, fn, bind, init);
-	f.named_parameters["max_results"] = LogicalType::BIGINT;
-	f.named_parameters["result_offset"] = LogicalType::BIGINT;
-	f.named_parameters["with_snippet"] = LogicalType::BOOLEAN;
-	f.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
+	CompatDeclareNamedParams(f, {
+	                                {"max_results", LogicalType::BIGINT},
+	                                {"result_offset", LogicalType::BIGINT},
+	                                {"with_snippet", LogicalType::BOOLEAN},
+	                                {"ignore_errors", LogicalType::BOOLEAN},
+	                            });
 	return f;
 }
 
