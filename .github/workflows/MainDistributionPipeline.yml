@@ -48,13 +48,37 @@ jobs:
       ci_tools_version: main
       extension_name: zim
       vcpkg_binary_sources: 'clear'
-      # linux_amd64 only. This job answers one question -- "do these sources
-      # still build and test on the v2.0 line?" -- and that answer is
-      # arch-independent, while every extra arch means another from-source build of
-      # libzim + xapian + icu (this extension's vcpkg set is expensive; see the
-      # 'clear' above). Keeping it to one arch is what makes the port loop minutes
-      # rather than an hour. The stable job below still covers the full matrix.
-      exclude_archs: 'linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+      # linux_amd64 + osx_arm64. This job asks "do these sources still build AND
+      # TEST on the v2.0 line?" -- and only the BUILD half of that is
+      # arch-independent. The TEST half is not, and duck_hunt is the proof: its
+      # v2.0 leg was green on linux_amd64 while read_duck_hunt_log threw IO Error
+      # on missing files only under v2.0/macOS-arm64, and the registry's full
+      # matrix was the only thing that caught it -- after the descriptor was cut.
+      # So macOS arm64 is in. Every extra arch is another from-source build of
+      # libzim + xapian + icu (see 'clear' above), so the list stops at two: this
+      # buys the platform axis that mattered, not the whole matrix.
+      # zim has no narrow catch-by-type of its own (all 6 handlers are already
+      # std::exception), so this covers the general class, not a known exposure.
+      # reduced_ci_mode MUST be 'disabled'. The default 'auto' means ENABLED for
+      # pull_request events, and osx_arm64 carries run_in_reduced_ci_mode:false
+      # upstream, so on a PR the osx matrix comes back EMPTY and the arch list
+      # below is a fiction -- on exactly the event this leg exists to gate.
+      # Measured 2026-10-03: PR run logged "Enabled reduced CI mode for
+      # pull_request event when mode is auto" -> osx_matrix={}, while a push run
+      # on the same config produced osx_arm64. Note the live implementation is the
+      # Go binary (cmd/extbuild, internal/distmatrix); scripts/
+      # modify_distribution_matrix.py maps auto->False and is vestigial, so
+      # reading it predicts the opposite of what CI does.
+      reduced_ci_mode: 'disabled'
+      # SIDE EFFECT, deliberate: upstream also wires fail-fast to this input --
+      # `fail-fast: ${{ inputs.reduced_ci_mode != 'disabled' }}` at four places in
+      # _extension_distribution.yml@main -- so 'disabled' ALSO turns fail-fast off
+      # for this leg's matrices. That is wanted here: with fail-fast on, one flaky
+      # arch cancels its siblings and a dependent check fails downstream, so a
+      # single failure presents as several red checks (duck_hunt hit exactly this
+      # on a transient Setup-vcpkg failure). With two arches the cost of not
+      # short-circuiting is negligible.
+      exclude_archs: 'linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   # ADVISORY canary on DuckDB main, the line beyond 2.0. Pushes to main and on
   # demand only: a push and a pull_request both fire on the same commit and a PR's
