@@ -70,6 +70,14 @@ jobs:
       # modify_distribution_matrix.py maps auto->False and is vestigial, so
       # reading it predicts the opposite of what CI does.
       reduced_ci_mode: 'disabled'
+      # SIDE EFFECT, deliberate: upstream also wires fail-fast to this input --
+      # `fail-fast: ${{ inputs.reduced_ci_mode != 'disabled' }}` at four places in
+      # _extension_distribution.yml@main -- so 'disabled' ALSO turns fail-fast off
+      # for this leg's matrices. That is wanted here: with fail-fast on, one flaky
+      # arch cancels its siblings and a dependent check fails downstream, so a
+      # single failure presents as several red checks (duck_hunt hit exactly this
+      # on a transient Setup-vcpkg failure). With two arches the cost of not
+      # short-circuiting is negligible.
       exclude_archs: 'linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   # ADVISORY canary on DuckDB main, the line beyond 2.0. Pushes to main and on
