@@ -6,7 +6,10 @@
 //   zim_has_entry(file, path)      -> BOOLEAN
 //   zim_redirect_target(file, path)-> VARCHAR  (NULL if not a redirect)
 //   zim_main_entry(file)           -> VARCHAR  (redirect-resolved landing path)
-//   zim_mimetype(file, path)       -> VARCHAR
+//   zim_mimetype(file, path[, resolve]) -> VARCHAR
+//        resolve defaults to TRUE: follows a redirect to the target's mimetype.
+//        resolve=FALSE reports the entry as stored, so a redirect is NULL --
+//        which is what read_zim's mimetype column reports. See issue #44.
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
 #include "duckdb_compat.hpp"
@@ -125,12 +128,22 @@ void RedirectTarget(DataChunk &args, ExpressionState &state, Vector &result) {
 
 void Mimetype(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
+	const bool has_resolve = args.ColumnCount() > 2;
 	args.data[0].Flatten(args.size());
 	args.data[1].Flatten(args.size());
+	if (has_resolve) {
+		args.data[2].Flatten(args.size());
+	}
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto archive = Open(state, args.data[0], i);
 		auto path = FlatVector::GetData<string_t>(args.data[1])[i].GetString();
-		auto mime = archive->GetMimetype(path);
+		// A NULL resolve reads as the default, matching how zim_illustration treats
+		// a NULL size -- the 2-arg behaviour stays the one you get without asking.
+		bool resolve = true;
+		if (has_resolve && FlatVector::Validity(args.data[2]).RowIsValid(i)) {
+			resolve = FlatVector::GetData<bool>(args.data[2])[i];
+		}
+		auto mime = archive->GetMimetype(path, resolve);
 		if (mime.has_value()) {
 			result.SetValue(i, Value(*mime));
 		} else {
@@ -299,8 +312,41 @@ void RegisterZimScalars(ExtensionLoader &loader) {
 	RegisterFallible(loader, ScalarFunction("zim_redirect_target", {V, V}, V, RedirectTarget), {"file", "path"},
 	                 "Get the redirect target path for an entry in a ZIM file.",
 	                 {"zim_redirect_target('wiki.zim', 'A/Duck.html')"});
-	RegisterFallible(loader, ScalarFunction("zim_mimetype", {V, V}, V, Mimetype), {"file", "path"},
-	                 "Get the MIME type of an entry in a ZIM file.", {"zim_mimetype('wiki.zim', 'A/Duck.html')"});
+	// zim_mimetype(file, path) resolves through redirects; the 3-arg form makes the
+	// as-stored reading requestable (issue #44). Fallible is set BEFORE AddFunction
+	// for the same v2.0 reason as zim_illustration below: a FunctionSet yields
+	// shared_ptr<const T>, so a member cannot be configured once it is in the set.
+	{
+		ScalarFunctionSet mimetype("zim_mimetype");
+		ScalarFunction mimetype_default({V, V}, V, Mimetype);
+		mimetype_default.SetFallible();
+		mimetype.AddFunction(std::move(mimetype_default));
+		ScalarFunction mimetype_resolve({V, V, LogicalType::BOOLEAN}, V, Mimetype);
+		mimetype_resolve.SetFallible();
+		mimetype.AddFunction(std::move(mimetype_resolve));
+
+		CreateScalarFunctionInfo info(std::move(mimetype));
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+
+		FunctionDescription desc1;
+		desc1.parameter_types = {V, V};
+		desc1.parameter_names = {"file", "path"};
+		desc1.description = "Get the MIME type of an entry in a ZIM file, following redirects to the target.";
+		desc1.examples = {"zim_mimetype('wiki.zim', 'A/Duck.html')"};
+		desc1.categories = {"zim"};
+		info.descriptions.push_back(desc1);
+
+		FunctionDescription desc2;
+		desc2.parameter_types = {V, V, LogicalType::BOOLEAN};
+		desc2.parameter_names = {"file", "path", "resolve"};
+		desc2.description = "Get the MIME type of an entry in a ZIM file; resolve=false reports it as stored, "
+		                    "so a redirect is NULL (matching read_zim's mimetype column).";
+		desc2.examples = {"zim_mimetype('wiki.zim', 'A/Duck.html', false)"};
+		desc2.categories = {"zim"};
+		info.descriptions.push_back(desc2);
+
+		loader.RegisterFunction(std::move(info));
+	}
 	RegisterFallible(loader, ScalarFunction("zim_main_entry", {V}, V, MainEntry), {"file"},
 	                 "Get the main entry path of a ZIM file.", {"zim_main_entry('wiki.zim')"});
 	RegisterFallible(loader, ScalarFunction("zim_random", {V}, V, Random), {"file"},

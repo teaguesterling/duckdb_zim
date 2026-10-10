@@ -366,13 +366,24 @@ std::optional<ZimContentReader> ZimArchive::OpenContent(const std::string &path,
 	return ZimContentReader(std::unique_ptr<ZimContentReader::Impl>(new ZimContentReader::Impl(std::move(item), size)));
 }
 
-std::optional<std::string> ZimArchive::GetMimetype(const std::string &path) const {
+std::optional<std::string> ZimArchive::GetMimetype(const std::string &path, bool resolve) const {
 	auto p = NormalizeContentPath(path);
 	if (!archive_->hasEntryByPath(p)) {
 		return std::nullopt;
 	}
 	zim::Entry entry = archive_->getEntryByPath(p);
 	if (entry.isRedirect()) {
+		// A redirect dirent carries no mimetype of its own. Which answer is right
+		// depends on what the caller is asking (issue #44):
+		//   resolve=true  -> the TARGET's mimetype. The scalar family's convention;
+		//                    zim_get_content and zim_main_entry resolve too.
+		//   resolve=false -> as stored, i.e. nothing. This is what read_zim's
+		//                    mimetype column reports (NULL, with is_redirect
+		//                    disambiguating), so the two surfaces can be made to
+		//                    agree on demand instead of silently disagreeing.
+		if (!resolve) {
+			return std::nullopt;
+		}
 		return entry.getRedirectEntry().getItem(false).getMimetype();
 	}
 	return entry.getItem(false).getMimetype();

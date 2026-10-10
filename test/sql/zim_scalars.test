@@ -30,6 +30,65 @@ SELECT zim_mimetype('test/oracle/test.zim', 'style.css');
 ----
 text/css
 
+# --- #44: mimetype vs redirects ---------------------------------------------
+# The scalar RESOLVES through a redirect -- the family convention, since
+# zim_get_content and zim_main_entry resolve too. read_zim's mimetype column
+# reports the entry AS STORED and NULLs it, with is_redirect disambiguating.
+# Before #44 only the resolving reading was reachable, so the two surfaces gave
+# opposite answers for one path and neither was requestable. Both are pinned here.
+
+# default (2-arg) resolves to the TARGET's mimetype
+query I
+SELECT zim_mimetype('test/oracle/test.zim', 'A/Photosynth');
+----
+text/html
+
+# resolve := false is as-stored: a redirect carries no mimetype of its own
+query I
+SELECT zim_mimetype('test/oracle/test.zim', 'A/Photosynth', false) IS NULL;
+----
+true
+
+# ... and that reading now agrees with read_zim's column for the same entry
+query I
+SELECT zim_mimetype('test/oracle/test.zim', 'A/Photosynth', false)
+       IS NOT DISTINCT FROM (SELECT mimetype FROM read_zim('test/oracle/test.zim', path := 'A/Photosynth'));
+----
+true
+
+# the named-argument spelling works and is what the docs use
+query I
+SELECT zim_mimetype('test/oracle/test.zim', 'A/Photosynth', resolve := false) IS NULL;
+----
+true
+
+# resolve := true is just the explicit spelling of the default
+query I
+SELECT zim_mimetype('test/oracle/test.zim', 'A/Photosynth', true);
+----
+text/html
+
+# a non-redirect is unaffected by the flag
+query TT
+SELECT zim_mimetype('test/oracle/test.zim', 'style.css'),
+       zim_mimetype('test/oracle/test.zim', 'style.css', false);
+----
+text/css	text/css
+
+# an absent entry is NULL under BOTH readings -- zim_has_entry is what tells the
+# two kinds of NULL apart (absent vs redirect carrying no mimetype of its own)
+query TT
+SELECT zim_mimetype('test/oracle/test.zim', 'A/NoSuchEntry') IS NULL,
+       zim_mimetype('test/oracle/test.zim', 'A/NoSuchEntry', false) IS NULL;
+----
+true	true
+
+query TT
+SELECT zim_has_entry('test/oracle/test.zim', 'A/Photosynth'),
+       zim_has_entry('test/oracle/test.zim', 'A/NoSuchEntry');
+----
+true	false
+
 # redirect target; NULL for non-redirects
 query I
 SELECT zim_redirect_target('test/oracle/test.zim', 'A/Photosynth');
