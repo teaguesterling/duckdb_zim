@@ -127,6 +127,65 @@ FROM read_zim('wikimed.zim', mimetype := 'text/html',
 PRAGMA create_fts_index('corpus', 'path', 'title', 'body');
 ```
 
+## Semantic search with a vector sidecar
+
+ZIM carries its lexical index *inside* the archive (`X/fulltext/xapian`), but you cannot add
+an index of your own there: libzim's `Creator` exposes only `configIndexing(true, lang)`, and
+`getPath()` strips the namespace letter, so an `X/`-namespace blob is neither writable through
+the public API nor nameable on the way back out.
+
+A **sidecar** avoids that entirely and needs nothing from this extension. Keep embeddings in a
+file next to the archive, keyed on the archive's own `path`, and let DuckDB do the vector work:
+
+```sql
+-- build once: <archive>.vec.parquet, keyed on path
+COPY (
+  SELECT path, embed(body) AS embedding      -- your embedding function
+  FROM read_zim('corpus.zim', mimetype := 'text/html',
+                include_content := true, content_as_varchar := true)
+) TO 'corpus.zim.vec.parquet' (FORMAT parquet);
+```
+
+```sql
+-- query: nearest neighbours, joined back for title/mimetype/content
+SELECT v.path, z.title,
+       array_cosine_similarity(v.embedding::FLOAT[768], $q::FLOAT[768]) AS sim
+FROM read_parquet('corpus.zim.vec.parquet') v
+JOIN read_zim('corpus.zim') z ON z.path = v.path
+ORDER BY sim DESC LIMIT 10;
+```
+
+**Cast the embedding on read.** Parquet does not preserve DuckDB's fixed-size `ARRAY` type: a
+`FLOAT[768]` column comes back as `FLOAT[]`, and `array_cosine_similarity` has no overload for
+a mixed `FLOAT[]` / `FLOAT[768]` pair, so it fails to bind without the `::FLOAT[768]`.
+
+**Hybrid ranking** falls out, because both sides are just relations — Xapian for lexical,
+the sidecar for semantic, combined however you like (scores are per-archive, so normalize
+before mixing):
+
+```sql
+SELECT s.path, s.score AS lexical,
+       array_cosine_similarity(v.embedding::FLOAT[768], $q::FLOAT[768]) AS semantic
+FROM zim_search('corpus.zim', 'photosynthesis') s
+LEFT JOIN read_parquet('corpus.zim.vec.parquet') v ON v.path = s.path;
+```
+
+**Globs and remote archives**: derive each sidecar from the archive it belongs to rather than
+hardcoding one path — `include_filepath := true` adds the `file_path` column, so
+`file_path || '.vec.parquet'` names the right sidecar per archive across a glob or an S3 prefix.
+
+**Why a sidecar rather than embedding the index in the archive.** Both are possible — a vector
+index *can* be written into a ZIM as an ordinary content item (`compress := false` keeps the
+dense bytes uncompressed, `front_article := false` keeps it out of article listings, and a
+declaring mimetype makes it discoverable via `zim_counter()` without reading it). But the
+sidecar wins on three counts: the archive stays a valid stock ZIM that Kiwix can read; you can
+re-embed with a better model without rewriting gigabytes; and DuckDB already supplies the
+vector primitives, so nothing here needs to link a vector library. Embedding it inside is the
+right call only when the archive must travel as a single self-contained file — and then it
+should follow the pattern Xapian already uses over remote storage: one contiguous uncompressed
+blob, copied out through the byte-range reader to a temp file and opened from there, capped by
+a setting (`zim_remote_search_max_local_index` is the precedent).
+
 ## Corpus-wide link graph
 
 `html_extract_links(content)` gives hrefs; internal links are entry paths, so normalize and
