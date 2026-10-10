@@ -155,6 +155,25 @@ JOIN read_zim('corpus.zim') z ON z.path = v.path
 ORDER BY sim DESC LIMIT 10;
 ```
 
+**Assert the row count when you build it.** The `COPY (SELECT path, embed(body) …)` form
+above zips paths to vectors positionally, which is only safe if the embedder returns exactly
+one vector per input. Not all do. A batch embedder that silently drops blank or
+whitespace-only inputs returns N-1 vectors for N rows, and positional zipping then
+**misaligns every entry after the drop** — producing an index that is consistent, queryable
+and wrong, with no error anywhere. Measured on one local embedder (`tiiny embed --file`,
+Qwen3-Embedding-0.6B): a blank line mid-batch, a whitespace-only line, or a trailing blank
+line each yield 3 lines -> 2 vectors. Compare the returned count against the input count and
+refuse on mismatch, or correlate by `path` explicitly instead of by position.
+
+**Do not use vector equality to check a rebuild.** Embedders are not necessarily bit-exact:
+the same model on the same device, same text, same batch, measured sporadic per-call
+deviations of <= ~2.5e-3 on ~1-2% of inputs, with the affected rows varying between calls. So
+"re-embed and compare" needs a **pre-registered floor** (take the maximum repeat distance over
+a sample, multiply by a stated factor, fix it before looking at the value you care about), not
+an equality test. This is not a real obstacle to the check that matters: a genuine misalignment
+reads as order 1 against a ~1e-3 noise floor, three orders of margin. And for content dedup,
+hash the **text**, never the vector — text hashing is exact and vector comparison never is.
+
 **Cast the embedding on read.** Parquet does not preserve DuckDB's fixed-size `ARRAY` type: a
 `FLOAT[768]` column comes back as `FLOAT[]`, and `array_cosine_similarity` has no overload for
 a mixed `FLOAT[]` / `FLOAT[768]` pair, so it fails to bind without the `::FLOAT[768]`.
