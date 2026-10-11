@@ -155,19 +155,41 @@ JOIN read_zim('corpus.zim') z ON z.path = v.path
 ORDER BY sim DESC LIMIT 10;
 ```
 
-**Know whether your vectors are normalized, and pick the metric accordingly.** Measured on a
-local Qwen3-Embedding-0.6B: **1024 dimensions**, and the vectors are **not** pre-normalized —
-L2 norms of 80.8, 95.6 and 97.4 for three different inputs. That is fine for
-`array_cosine_similarity`, which divides by the norms and is magnitude-invariant, but it
-silently breaks inner-product search:
+**Store unit vectors plus their scale factor.** Embedders do not necessarily hand you
+normalized vectors — measured on a local Qwen3-Embedding-0.6B: **1024 dimensions**, L2 norms of
+80.8, 95.6 and 97.4 for three different inputs, so not normalized and not a fixed scale either.
+That matters because the metrics disagree on magnitude:
 
 ```sql
 array_cosine_similarity([3,0,0], [1,0,0]) = 1.0    -- magnitude-invariant
 array_inner_product(    [3,0,0], [1,0,0]) = 3.0    -- ranks partly by magnitude
 ```
 
-So: use cosine, or normalize before storing if you intend to use an inner-product metric
-(DuckDB's `vss` HNSW offers `ip`, which assumes unit vectors).
+Normalizing at build time and keeping the original magnitude in its own column settles it
+without losing anything. The norm comes free from the array functions, since `|v| = sqrt(v·v)`:
+
+```sql
+COPY (
+  SELECT path,
+         sqrt(array_inner_product(e, e))::FLOAT AS norm,
+         list_transform(e::FLOAT[], lambda x: x / sqrt(array_inner_product(e, e)))::FLOAT[1024]
+           AS embedding
+  FROM (SELECT path, embed(body)::FLOAT[1024] AS e FROM read_zim(…))
+) TO 'corpus.zim.vec.parquet' (FORMAT parquet);
+```
+
+Three things that buys, all verified:
+
+- **Either metric is now correct.** On unit vectors `array_inner_product` equals
+  `array_cosine_similarity` exactly, and `ip` is the cheaper of the two (no division per
+  comparison). It also makes `vss`'s HNSW `ip` metric safe to use, which assumes unit vectors.
+- **Nothing is lost.** `list_transform(embedding::FLOAT[], lambda x: x * norm)` returns the
+  original vector exactly, so the sidecar is a lossless store, not a lossy one.
+- **The norm is useful on its own** — it carries magnitude information the unit vector throws
+  away, which is sometimes a usable signal (and a cheap sanity check: a norm far from the
+  corpus distribution usually means a degenerate or empty input).
+
+Use the `lambda x:` form rather than the old `->` arrow, which DuckDB now warns is deprecated.
 
 **Assert the row count when you build it.** The `COPY (SELECT path, embed(body) …)` form
 above zips paths to vectors positionally, which is only safe if the embedder returns exactly
@@ -221,6 +243,18 @@ right call only when the archive must travel as a single self-contained file —
 should follow the pattern Xapian already uses over remote storage: one contiguous uncompressed
 blob, copied out through the byte-range reader to a temp file and opened from there, capped by
 a setting (`zim_remote_search_max_local_index` is the precedent).
+
+**If you expect to move in-archive later, design the sidecar as the blob you would embed.**
+Keep it one self-contained file, uncompressed, with the dimension and model identity recorded
+inside it rather than in the filename. Then the migration is "write these same bytes as an
+entry" on the way in, and "extract to a temp file, open from there" on the way out — the Xapian
+path again. Nothing about the query layer changes, because `read_parquet` wants a path either
+way. Note that upstream offers no sanctioned mechanism here: the ZIM index format is
+deliberately undocumented (openzim/overview#6 — the maintainer declines to specify it in order
+to "allow the ZIM format to support other kinds of fulltext indexes"), and libzim2's plan hides
+namespaces further behind `addMetadata`/`addRedirect`/`addEntry`. So an in-archive index is a
+private convention, not an interoperable one — which is a reason to keep the sidecar form
+usable on its own, not merely a staging step.
 
 ## Corpus-wide link graph
 
