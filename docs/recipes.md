@@ -127,6 +127,135 @@ FROM read_zim('wikimed.zim', mimetype := 'text/html',
 PRAGMA create_fts_index('corpus', 'path', 'title', 'body');
 ```
 
+## Semantic search with a vector sidecar
+
+ZIM carries its lexical index *inside* the archive (`X/fulltext/xapian`), but you cannot add
+an index of your own there: libzim's `Creator` exposes only `configIndexing(true, lang)`, and
+`getPath()` strips the namespace letter, so an `X/`-namespace blob is neither writable through
+the public API nor nameable on the way back out.
+
+A **sidecar** avoids that entirely and needs nothing from this extension. Keep embeddings in a
+file next to the archive, keyed on the archive's own `path`, and let DuckDB do the vector work:
+
+```sql
+-- build once: <archive>.vec.parquet, keyed on path
+COPY (
+  SELECT path, embed(body) AS embedding      -- your embedding function
+  FROM read_zim('corpus.zim', mimetype := 'text/html',
+                include_content := true, content_as_varchar := true)
+) TO 'corpus.zim.vec.parquet' (FORMAT parquet);
+```
+
+```sql
+-- query: nearest neighbours, joined back for title/mimetype/content
+SELECT v.path, z.title,
+       array_cosine_similarity(v.embedding::FLOAT[1024], $q::FLOAT[1024]) AS sim
+FROM read_parquet('corpus.zim.vec.parquet') v
+JOIN read_zim('corpus.zim') z ON z.path = v.path
+ORDER BY sim DESC LIMIT 10;
+```
+
+**Store unit vectors plus their scale factor.** Embedders do not necessarily hand you
+normalized vectors — measured on a local Qwen3-Embedding-0.6B: **1024 dimensions**, L2 norms of
+80.8, 95.6 and 97.4 for three different inputs, so not normalized and not a fixed scale either.
+That matters because the metrics disagree on magnitude:
+
+```sql
+array_cosine_similarity([3,0,0], [1,0,0]) = 1.0    -- magnitude-invariant
+array_inner_product(    [3,0,0], [1,0,0]) = 3.0    -- ranks partly by magnitude
+```
+
+Normalizing at build time and keeping the original magnitude in its own column settles it
+without losing anything. The norm comes free from the array functions, since `|v| = sqrt(v·v)`:
+
+```sql
+COPY (
+  SELECT path,
+         sqrt(array_inner_product(e, e))::FLOAT AS norm,
+         list_transform(e::FLOAT[], lambda x: x / sqrt(array_inner_product(e, e)))::FLOAT[1024]
+           AS embedding
+  FROM (SELECT path, embed(body)::FLOAT[1024] AS e FROM read_zim(…))
+) TO 'corpus.zim.vec.parquet' (FORMAT parquet);
+```
+
+Three things that buys, all verified:
+
+- **Either metric is now correct.** On unit vectors `array_inner_product` equals
+  `array_cosine_similarity` exactly, and `ip` is the cheaper of the two (no division per
+  comparison). It also makes `vss`'s HNSW `ip` metric safe to use, which assumes unit vectors.
+- **Nothing is lost.** `list_transform(embedding::FLOAT[], lambda x: x * norm)` returns the
+  original vector exactly, so the sidecar is a lossless store, not a lossy one.
+- **The norm is useful on its own** — it carries magnitude information the unit vector throws
+  away, which is sometimes a usable signal (and a cheap sanity check: a norm far from the
+  corpus distribution usually means a degenerate or empty input).
+
+Use the `lambda x:` form rather than the old `->` arrow, which DuckDB now warns is deprecated.
+
+**Assert the row count when you build it.** The `COPY (SELECT path, embed(body) …)` form
+above zips paths to vectors positionally, which is only safe if the embedder returns exactly
+one vector per input. Not all do. A batch embedder that silently drops blank or
+whitespace-only inputs returns N-1 vectors for N rows, and positional zipping then
+**misaligns every entry after the drop** — producing an index that is consistent, queryable
+and wrong, with no error anywhere. Measured on one local embedder (`tiiny embed --file`,
+Qwen3-Embedding-0.6B): a blank line mid-batch, a whitespace-only line, or a trailing blank
+line each yield 3 lines -> 2 vectors. The hazard is **path-specific**: the same device's HTTP
+`/v1/embeddings` array endpoint returned 3 vectors for `["a","","c"]`, each carrying an explicit
+`index`. Prefer an API that returns a per-input index and correlate on that, so a drop becomes
+impossible to misread; otherwise compare the returned count against the input count and refuse
+on mismatch, or correlate by `path` rather than by position.
+
+**Do not use vector equality to check a rebuild.** Embedders are not necessarily bit-exact:
+the same model on the same device, same text, same batch, measured sporadic per-call
+deviations of <= ~2.5e-3 on ~1-2% of inputs, with the affected rows varying between calls. So
+"re-embed and compare" needs a **pre-registered floor** (take the maximum repeat distance over
+a sample, multiply by a stated factor, fix it before looking at the value you care about), not
+an equality test. This is not a real obstacle to the check that matters: a genuine misalignment
+reads as order 1 against a ~1e-3 noise floor, three orders of margin. And for content dedup,
+hash the **text**, never the vector — text hashing is exact and vector comparison never is.
+
+**Cast the embedding on read.** Parquet does not preserve DuckDB's fixed-size `ARRAY` type: a
+`FLOAT[1024]` column comes back as `FLOAT[]`, and `array_cosine_similarity` has no overload for
+a mixed `FLOAT[]` / `FLOAT[1024]` pair, so it fails to bind without the `::FLOAT[1024]`.
+
+**Hybrid ranking** falls out, because both sides are just relations — Xapian for lexical,
+the sidecar for semantic, combined however you like (scores are per-archive, so normalize
+before mixing):
+
+```sql
+SELECT s.path, s.score AS lexical,
+       array_cosine_similarity(v.embedding::FLOAT[1024], $q::FLOAT[1024]) AS semantic
+FROM zim_search('corpus.zim', 'photosynthesis') s
+LEFT JOIN read_parquet('corpus.zim.vec.parquet') v ON v.path = s.path;
+```
+
+**Globs and remote archives**: derive each sidecar from the archive it belongs to rather than
+hardcoding one path — `include_filepath := true` adds the `file_path` column, so
+`file_path || '.vec.parquet'` names the right sidecar per archive across a glob or an S3 prefix.
+
+**Why a sidecar rather than embedding the index in the archive.** Both are possible — a vector
+index *can* be written into a ZIM as an ordinary content item (`compress := false` keeps the
+dense bytes uncompressed, `front_article := false` keeps it out of article listings, and a
+declaring mimetype makes it discoverable via `zim_counter()` without reading it). But the
+sidecar wins on three counts: the archive stays a valid stock ZIM that Kiwix can read; you can
+re-embed with a better model without rewriting gigabytes; and DuckDB already supplies the
+vector primitives, so nothing here needs to link a vector library. Embedding it inside is the
+right call only when the archive must travel as a single self-contained file — and then it
+should follow the pattern Xapian already uses over remote storage: one contiguous uncompressed
+blob, copied out through the byte-range reader to a temp file and opened from there, capped by
+a setting (`zim_remote_search_max_local_index` is the precedent).
+
+**If you expect to move in-archive later, design the sidecar as the blob you would embed.**
+Keep it one self-contained file, uncompressed, with the dimension and model identity recorded
+inside it rather than in the filename. Then the migration is "write these same bytes as an
+entry" on the way in, and "extract to a temp file, open from there" on the way out — the Xapian
+path again. Nothing about the query layer changes, because `read_parquet` wants a path either
+way. Note that upstream offers no sanctioned mechanism here: the ZIM index format is
+deliberately undocumented (openzim/overview#6 — the maintainer declines to specify it in order
+to "allow the ZIM format to support other kinds of fulltext indexes"), and libzim2's plan hides
+namespaces further behind `addMetadata`/`addRedirect`/`addEntry`. So an in-archive index is a
+private convention, not an interoperable one — which is a reason to keep the sidecar form
+usable on its own, not merely a staging step.
+
 ## Corpus-wide link graph
 
 `html_extract_links(content)` gives hrefs; internal links are entry paths, so normalize and
