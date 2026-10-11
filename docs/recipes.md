@@ -149,11 +149,25 @@ COPY (
 ```sql
 -- query: nearest neighbours, joined back for title/mimetype/content
 SELECT v.path, z.title,
-       array_cosine_similarity(v.embedding::FLOAT[768], $q::FLOAT[768]) AS sim
+       array_cosine_similarity(v.embedding::FLOAT[1024], $q::FLOAT[1024]) AS sim
 FROM read_parquet('corpus.zim.vec.parquet') v
 JOIN read_zim('corpus.zim') z ON z.path = v.path
 ORDER BY sim DESC LIMIT 10;
 ```
+
+**Know whether your vectors are normalized, and pick the metric accordingly.** Measured on a
+local Qwen3-Embedding-0.6B: **1024 dimensions**, and the vectors are **not** pre-normalized —
+L2 norms of 80.8, 95.6 and 97.4 for three different inputs. That is fine for
+`array_cosine_similarity`, which divides by the norms and is magnitude-invariant, but it
+silently breaks inner-product search:
+
+```sql
+array_cosine_similarity([3,0,0], [1,0,0]) = 1.0    -- magnitude-invariant
+array_inner_product(    [3,0,0], [1,0,0]) = 3.0    -- ranks partly by magnitude
+```
+
+So: use cosine, or normalize before storing if you intend to use an inner-product metric
+(DuckDB's `vss` HNSW offers `ip`, which assumes unit vectors).
 
 **Assert the row count when you build it.** The `COPY (SELECT path, embed(body) …)` form
 above zips paths to vectors positionally, which is only safe if the embedder returns exactly
@@ -162,8 +176,11 @@ whitespace-only inputs returns N-1 vectors for N rows, and positional zipping th
 **misaligns every entry after the drop** — producing an index that is consistent, queryable
 and wrong, with no error anywhere. Measured on one local embedder (`tiiny embed --file`,
 Qwen3-Embedding-0.6B): a blank line mid-batch, a whitespace-only line, or a trailing blank
-line each yield 3 lines -> 2 vectors. Compare the returned count against the input count and
-refuse on mismatch, or correlate by `path` explicitly instead of by position.
+line each yield 3 lines -> 2 vectors. The hazard is **path-specific**: the same device's HTTP
+`/v1/embeddings` array endpoint returned 3 vectors for `["a","","c"]`, each carrying an explicit
+`index`. Prefer an API that returns a per-input index and correlate on that, so a drop becomes
+impossible to misread; otherwise compare the returned count against the input count and refuse
+on mismatch, or correlate by `path` rather than by position.
 
 **Do not use vector equality to check a rebuild.** Embedders are not necessarily bit-exact:
 the same model on the same device, same text, same batch, measured sporadic per-call
@@ -175,8 +192,8 @@ reads as order 1 against a ~1e-3 noise floor, three orders of margin. And for co
 hash the **text**, never the vector — text hashing is exact and vector comparison never is.
 
 **Cast the embedding on read.** Parquet does not preserve DuckDB's fixed-size `ARRAY` type: a
-`FLOAT[768]` column comes back as `FLOAT[]`, and `array_cosine_similarity` has no overload for
-a mixed `FLOAT[]` / `FLOAT[768]` pair, so it fails to bind without the `::FLOAT[768]`.
+`FLOAT[1024]` column comes back as `FLOAT[]`, and `array_cosine_similarity` has no overload for
+a mixed `FLOAT[]` / `FLOAT[1024]` pair, so it fails to bind without the `::FLOAT[1024]`.
 
 **Hybrid ranking** falls out, because both sides are just relations — Xapian for lexical,
 the sidecar for semantic, combined however you like (scores are per-archive, so normalize
@@ -184,7 +201,7 @@ before mixing):
 
 ```sql
 SELECT s.path, s.score AS lexical,
-       array_cosine_similarity(v.embedding::FLOAT[768], $q::FLOAT[768]) AS semantic
+       array_cosine_similarity(v.embedding::FLOAT[1024], $q::FLOAT[1024]) AS semantic
 FROM zim_search('corpus.zim', 'photosynthesis') s
 LEFT JOIN read_parquet('corpus.zim.vec.parquet') v ON v.path = s.path;
 ```
