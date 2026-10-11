@@ -8,6 +8,12 @@ One row per content entry. `files` is a path, a glob, or a `LIST(VARCHAR)`.
 
 Returns: `path VARCHAR, title VARCHAR, mimetype VARCHAR, is_redirect BOOLEAN, redirect_path VARCHAR, size UBIGINT, content (BLOB|VARCHAR) [, file_path VARCHAR]`.
 
+Entries are reported **as stored**: a redirect carries no mimetype or size of its own, so
+`mimetype` and `size` are `NULL` on those rows and `is_redirect` / `redirect_path` tell you why.
+The scalar `zim_mimetype(file, path)` instead *follows* redirects and reports the target's
+mimetype, so the two deliberately differ for one entry; `zim_mimetype(file, path, false)` asks
+for this as-stored reading when you need the two to agree.
+
 | Parameter | Type | Meaning |
 |---|---|---|
 | `include_content` | BOOLEAN \| VARCHAR \| LIST | `true`/`false`, or a mimetype / list of patterns (with `image/*`, `*/*`) to load content only for matching entries |
@@ -59,7 +65,7 @@ build (prefix fallback without Xapian). Federated like `zim_search`.
 | `zim_get_text(file, path)` | VARCHAR | text mimetypes only; `NULL` for binary (never mangled) |
 | `zim_has_entry(file, path)` | BOOLEAN | |
 | `zim_redirect_target(file, path)` | VARCHAR | `NULL` if not a redirect |
-| `zim_mimetype(file, path)` | VARCHAR | |
+| `zim_mimetype(file, path [, resolve])` | VARCHAR | follows redirects by default and reports the **target's** mimetype; `resolve := false` reports the entry **as stored**, so a redirect is `NULL` — which is what `read_zim`'s `mimetype` column gives. `NULL` also means absent: pair with `zim_has_entry` to tell the two apart |
 | `zim_main_entry(file)` | VARCHAR | redirect-resolved landing path |
 | `zim_metadata(file, key)` | VARCHAR | single metadata value; `NULL` if absent or binary |
 | `zim_metadata_keys(file)` | LIST(VARCHAR) | |

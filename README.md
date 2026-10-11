@@ -191,7 +191,9 @@ zim_get_content(file, path)     -- BLOB, follows redirects
 zim_get_text(file, path)        -- VARCHAR for text mimetypes; NULL for binary (never mangled)
 zim_has_entry(file, path)       -- BOOLEAN
 zim_redirect_target(file, path) -- VARCHAR, NULL if not a redirect
-zim_mimetype(file, path)        -- VARCHAR
+zim_mimetype(file, path)        -- VARCHAR, follows redirects (the target's mimetype)
+zim_mimetype(file, path, false) -- VARCHAR, as stored: NULL for a redirect, matching
+                                --   read_zim's mimetype column
 zim_main_entry(file)            -- VARCHAR, redirect-resolved landing path
 zim_random(file)                -- VARCHAR, a random entry's path
 zim_check(file)                 -- BOOLEAN, openable + internally consistent; false (not an

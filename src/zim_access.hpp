@@ -214,7 +214,10 @@ public:
 	// would just relocate the unbounded allocation into DuckDB. Individual
 	// ReadAt calls need no cap -- they are bounded by the caller's own buffer.
 	std::optional<ZimContentReader> OpenContent(const std::string &path, uint64_t max_content_bytes = 0) const;
-	std::optional<std::string> GetMimetype(const std::string &path) const;
+	// resolve=true (default) follows a redirect and reports the TARGET's mimetype --
+	// the scalar family's convention. resolve=false reports the entry AS STORED, so a
+	// redirect yields nullopt, matching read_zim's mimetype column. Issue #44.
+	std::optional<std::string> GetMimetype(const std::string &path, bool resolve = true) const;
 	std::optional<std::string> GetRedirectTarget(const std::string &path) const;
 	std::string MainEntryPath() const; // redirect-resolved; "" if none
 
