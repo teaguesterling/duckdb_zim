@@ -196,9 +196,9 @@ above zips paths to vectors positionally, which is only safe if the embedder ret
 one vector per input. Not all do. A batch embedder that silently drops blank or
 whitespace-only inputs returns N-1 vectors for N rows, and positional zipping then
 **misaligns every entry after the drop** — producing an index that is consistent, queryable
-and wrong, with no error anywhere. Measured on one local embedder (`tiiny embed --file`,
-Qwen3-Embedding-0.6B): a blank line mid-batch, a whitespace-only line, or a trailing blank
-line each yield 3 lines -> 2 vectors. The hazard is **path-specific**: the same device's HTTP
+and wrong, with no error anywhere. Observed on one local embedder (Qwen3-Embedding-0.6B) via a
+file-batch path: a blank line mid-batch, a whitespace-only line, or a trailing blank line each
+yielded 3 lines -> 2 vectors. The hazard is **path-specific**: the same device's HTTP
 `/v1/embeddings` array endpoint returned 3 vectors for `["a","","c"]`, each carrying an explicit
 `index`. Prefer an API that returns a per-input index and correlate on that, so a drop becomes
 impossible to misread; otherwise compare the returned count against the input count and refuse
@@ -212,6 +212,13 @@ a sample, multiply by a stated factor, fix it before looking at the value you ca
 an equality test. This is not a real obstacle to the check that matters: a genuine misalignment
 reads as order 1 against a ~1e-3 noise floor, three orders of margin. And for content dedup,
 hash the **text**, never the vector — text hashing is exact and vector comparison never is.
+
+**The dimension is usually a choice, not a property — record which one you used.** Qwen3-class
+embedders support Matryoshka truncation, and the local CLI exposes it directly
+(`tiiny run embed -d/--dimensions`), so 1024 was the *default* on the device measured here, not
+a fixed characteristic. A sidecar whose vectors are 768-d because someone passed `-d 768` is
+indistinguishable from a 1024-d one until a query fails to bind, so store the dimension and the
+model identity alongside the vectors rather than inferring either.
 
 **Cast the embedding on read.** Parquet does not preserve DuckDB's fixed-size `ARRAY` type: a
 `FLOAT[1024]` column comes back as `FLOAT[]`, and `array_cosine_similarity` has no overload for
