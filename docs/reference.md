@@ -65,7 +65,7 @@ build (prefix fallback without Xapian). Federated like `zim_search`.
 | `zim_get_text(file, path)` | VARCHAR | text mimetypes only; `NULL` for binary (never mangled) |
 | `zim_has_entry(file, path)` | BOOLEAN | |
 | `zim_redirect_target(file, path)` | VARCHAR | `NULL` if not a redirect |
-| `zim_mimetype(file, path [, resolve])` | VARCHAR | follows redirects by default and reports the **target's** mimetype; `resolve := false` reports the entry **as stored**, so a redirect is `NULL` — which is what `read_zim`'s `mimetype` column gives. `NULL` also means absent: pair with `zim_has_entry` to tell the two apart |
+| `zim_mimetype(file, path [, resolve])` | VARCHAR | follows redirects by default and reports the **target's** mimetype; `resolve` = `false` (passed positionally) reports the entry **as stored**, so a redirect is `NULL` — which is what `read_zim`'s `mimetype` column gives. `NULL` also means absent: pair with `zim_has_entry` to tell the two apart |
 | `zim_main_entry(file)` | VARCHAR | redirect-resolved landing path |
 | `zim_metadata(file, key)` | VARCHAR | single metadata value; `NULL` if absent or binary |
 | `zim_metadata_keys(file)` | LIST(VARCHAR) | |

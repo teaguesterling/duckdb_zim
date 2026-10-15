@@ -43,7 +43,7 @@ SELECT zim_mimetype('test/oracle/test.zim', 'A/Photosynth');
 ----
 text/html
 
-# resolve := false is as-stored: a redirect carries no mimetype of its own
+# resolve = false is as-stored: a redirect carries no mimetype of its own
 query I
 SELECT zim_mimetype('test/oracle/test.zim', 'A/Photosynth', false) IS NULL;
 ----
@@ -56,13 +56,17 @@ SELECT zim_mimetype('test/oracle/test.zim', 'A/Photosynth', false)
 ----
 true
 
-# the named-argument spelling works and is what the docs use
-query I
-SELECT zim_mimetype('test/oracle/test.zim', 'A/Photosynth', resolve := false) IS NULL;
-----
-true
+# NOTE: pass `resolve` POSITIONALLY, not as `resolve := false`. On DuckDB v2.0 a
+# scalar function built from a type list gets POSITIONAL_ONLY parameters named
+# col0/col1/..., so the named spelling does not bind:
+#   Binder Error: No function matches ... 'zim_mimetype(..., "resolve" := BOOLEAN)'
+#   Candidates:  zim_mimetype(col0 VARCHAR, col1 VARCHAR, col2 BOOLEAN, /)
+# The trailing `/` is the positional-only marker. v1.5.6 accepted the named form,
+# which is why this test originally asserted it; that assertion is removed rather
+# than made version-conditional, because the positional form binds on BOTH lines
+# and is the only spelling we can support everywhere. See issue #58.
 
-# resolve := true is just the explicit spelling of the default
+# resolve = true is just the explicit spelling of the default
 query I
 SELECT zim_mimetype('test/oracle/test.zim', 'A/Photosynth', true);
 ----
