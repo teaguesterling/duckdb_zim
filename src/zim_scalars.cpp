@@ -313,7 +313,15 @@ void RegisterZimScalars(ExtensionLoader &loader) {
 	                 "Get the redirect target path for an entry in a ZIM file.",
 	                 {"zim_redirect_target('wiki.zim', 'A/Duck.html')"});
 	// zim_mimetype(file, path) resolves through redirects; the 3-arg form makes the
-	// as-stored reading requestable (issue #44). Fallible is set BEFORE AddFunction
+	// as-stored reading requestable (issue #44). `resolve` is POSITIONAL-ONLY: on
+	// v2.0 a ScalarFunction built from a type list gets POSITIONAL_ONLY parameters
+	// auto-named col0/col1/..., so `resolve := false` does not bind there (it did on
+	// v1.5.6). Making it bindable by name would mean constructing a FunctionSignature
+	// with named STANDARD parameters, which is v2.0-only API and so needs a shim --
+	// not worth it for one optional flag that nothing has shipped against. If that
+	// changes, the v2.0 precedent is scalar struct_pack / write_log, which do declare
+	// kwargs. See issue #58.
+	// Fallible is set BEFORE AddFunction
 	// for the same v2.0 reason as zim_illustration below: a FunctionSet yields
 	// shared_ptr<const T>, so a member cannot be configured once it is in the set.
 	{
