@@ -41,7 +41,21 @@ jobs:
   # with no PR open, which gets its first next-line build when the PR opens.
   duckdb-next-build:
     name: Build extension binaries (duckdb next, v2.0 line)
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    # UNGATED, like duckdb-stable-build below. This leg used to run only on
+    # workflow_dispatch and pushes to main (#54, to cut PR noise while v1.5 was
+    # what shipped). That is now backwards: the registry's default build target
+    # has moved to the 2.0 line, so the v2.0 leg is the one whose red matters and
+    # the v1.5 leg is the trailing one -- yet v1.5 gated PRs and v2.0 did not.
+    #
+    # The cost of that asymmetry was measured: the #58 binder error (scalar
+    # parameters became positional-only on v2.0) sat on main from 2026-10-11 to
+    # 2026-10-15 without any PR showing red, because the only leg that could see
+    # it did not run on PRs. It was found by a fleet-wide sweep, not by this repo.
+    #
+    # Cost of removing the gate, also measured (run 38773440203): linux_amd64
+    # 16m19s, osx_arm64 9m37s, ~40min wall-clock including macOS runner queueing
+    # and the upstream `macos: needs: [linux]` sequencing. That is the price of a
+    # PR gate on the line we are about to ship.
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       duckdb_version: v2.0-cyanoptera
