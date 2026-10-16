@@ -80,23 +80,22 @@ jobs:
       # short-circuiting is negligible.
       exclude_archs: 'linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
-  # ADVISORY canary on DuckDB main, the line beyond 2.0. Pushes to main and on
-  # demand only: a push and a pull_request both fire on the same commit and a PR's
-  # rollup includes both, so an unconditional job here would redden every PR for a
-  # line nobody ships. `if:` rather than `continue-on-error:` because a job calling
-  # a REUSABLE workflow accepts only a fixed set of keys.
-  #   gh workflow run MainDistributionPipeline.yml --ref <branch>
-  # zim carries the next job's vcpkg and arch settings here, for the same reasons.
-  duckdb-main-canary:
-    name: Build extension binaries (duckdb main canary)
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
-    with:
-      duckdb_version: main
-      ci_tools_version: main
-      extension_name: zim
-      vcpkg_binary_sources: 'clear'
-      exclude_archs: 'linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+  # The DuckDB `main` canary is GONE, removed 2026-10-16. It could not report
+  # anything: an extension built with `duckdb_version: main` records the version
+  # string `main`, while the DuckDB binary from that same build reports `vmain`,
+  # so the artifact cannot load into its own shell --
+  #   Invalid Input Error: Failed to load '...zim.duckdb_extension', The file was
+  #   built specifically for DuckDB version 'main' and can only be loaded with
+  #   that version of DuckDB. (this version of DuckDB is 'vmain')
+  # In the canary job itself that surfaced as every test file SKIPPING on
+  # `require zim` while the step still reported success -- 0 passed, 21 skipped,
+  # green. So it was advisory in name and decorative in fact. It also broke
+  # remote-search-test, which loads each downloaded artifact for real and failed
+  # honestly on the one the canary produced.
+  # Not a zim defect and not fixable here: the `v` prefix is applied on one side
+  # of that comparison and not the other, upstream. `v2.0-cyanoptera` is
+  # unaffected because it already starts with `v`, so the next-line leg above
+  # remains the forward-looking signal.
   duckdb-stable-build:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
@@ -174,12 +173,12 @@ jobs:
   # missing search hits.
   remote-search-test:
     name: Remote search integration test
-    # Waits for the next-line build and the main canary too, so their artifacts are
-    # present rather than racing them -- otherwise "which artifacts exist" depends on
-    # job timing. always() is required because the canary is SKIPPED on pull_request
-    # and on non-main pushes (and the next job on branches with no PR), and a skipped
-    # dependency would otherwise skip this job with it.
-    needs: [duckdb-stable-build, duckdb-next-build, duckdb-main-canary]
+    # Waits for the next-line build too, so its artifact is present rather than
+    # racing it -- otherwise "which artifacts exist" depends on job timing.
+    # always() is still required: the next-line job is SKIPPED on pull_request and
+    # on non-main pushes, and a skipped dependency would otherwise skip this job
+    # with it.
+    needs: [duckdb-stable-build, duckdb-next-build]
     if: always() && needs.duckdb-stable-build.result == 'success'
     runs-on: ubuntu-latest
     steps:
@@ -235,7 +234,7 @@ jobs:
             DUCKDB_BIN="$cli" ZIM_EXTENSION="$ext" bash test/remote/remote_search.sh
             # #21 guard: searching a no-stemmer-language archive must not leak
             # libzim's "No stemming ..." line to stdout (sqllogictest can't see stdout).
-            # Needs no httpfs, so it runs on every artifact including the canary's.
+            # Needs no httpfs, so it runs on every artifact.
             DUCKDB_BIN="$cli" ZIM_EXTENSION="$ext" bash test/no_stdout_pollution.sh
             # Writer counterpart of the #21 guard above: writing a ZIM must not leak
             # libzim's writer-side INFO() prints to stdout either.
