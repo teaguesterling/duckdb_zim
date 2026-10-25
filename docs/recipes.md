@@ -196,9 +196,12 @@ above zips paths to vectors positionally, which is only safe if the embedder ret
 one vector per input. Not all do. A batch embedder that silently drops blank or
 whitespace-only inputs returns N-1 vectors for N rows, and positional zipping then
 **misaligns every entry after the drop** — producing an index that is consistent, queryable
-and wrong, with no error anywhere. Measured on one local embedder (`tiiny embed --file`,
-Qwen3-Embedding-0.6B): a blank line mid-batch, a whitespace-only line, or a trailing blank
-line each yield 3 lines -> 2 vectors. The hazard is **path-specific**: the same device's HTTP
+and wrong, with no error anywhere. Observed on one local embedder
+(Qwen3-Embedding-0.6B) through a file-batch CLI path: a blank line mid-batch, a
+whitespace-only line, or a trailing blank line each yield 3 lines -> 2 vectors. **The exact
+invocation is not recorded**, so treat this as an observed hazard rather than a reproducible
+recipe — the command string first written down for it does not exist on that device. The
+hazard is also **path-specific**: the same device's HTTP
 `/v1/embeddings` array endpoint returned 3 vectors for `["a","","c"]`, each carrying an explicit
 `index`. Prefer an API that returns a per-input index and correlate on that, so a drop becomes
 impossible to misread; otherwise compare the returned count against the input count and refuse
