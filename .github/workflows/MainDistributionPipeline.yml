@@ -26,13 +26,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # THE NEXT LINE, first-class. duckdb/community-extensions builds every descriptor
-  # that carries ref_next against `v2.0-cyanoptera` (build_next.yml), so a PR is not
-  # green here until it builds and tests there too. This was the canary until
-  # 2026-09-13; Teague's dual-line ruling removed its gate. Note v2.0-cyanoptera is a
-  # BRANCH, not a tag: a red here can arrive on a push none of us made. The case for
-  # gating on it is relevance, not reproducibility -- it is the line the registry
-  # builds, and DuckDB `main` has diverged from it (webbed's `main` canary stayed
+  # THE SHIPPING LINE, first-class. duckdb/community-extensions builds every
+  # descriptor against the v2.0.0 TAG with ci-tools `v2.0-cyanoptera` -- build.yml
+  # carries DUCKDB_LATEST_STABLE 'v2.0.0', DUCKDB_VERSION 'v2.0.0' and
+  # _extension_distribution.yml@v2.0-cyanoptera -- so this leg mirrors the exact
+  # configuration users receive. This was the canary until 2026-09-13; Teague's
+  # dual-line ruling removed its gate.
+  #
+  # IT USED TO TRACK TWO BRANCHES, and that was the defect. Until 2026-10-25 this
+  # leg passed `duckdb_version: v2.0-cyanoptera` + `ci_tools_version: main`, to
+  # mirror build_next.yml. Measured 2026-10-25: build_next.yml carries `if: false`
+  # (commit 2413d2b8, "disable build_next", 2026-10-15), so the registry had
+  # stopped building ref_next ten days before this leg went red over it. Pinning
+  # neither input cost a red on a DOCS-ONLY pull request (#65): 18 passed, 3 failed
+  # with `require zim: FAILED` -- a LOAD failure, reported "in 0s", on an engine
+  # 466 commits past the v2.0.0 tag. The same tree is 21/21 on v1.5.6 (two arches,
+  # 589 assertions) and 21/21 on v2.0.0, so that red was never zim's code. Its root
+  # cause on the cyanoptera tip was never isolated, and may return when v2.0.1 is
+  # cut from that branch.
+  #
+  # PINNING THE ENGINE ALSO PINS THE TEST HARNESS. `scripts/ci/run_tests.py` ships
+  # in the duckdb submodule, not in extension-ci-tools -- duckdb_extension.Makefile
+  # has `TEST_RUNNER_SCRIPT ?= ${DUCKDB_SRCDIR}/scripts/ci/run_tests.py` -- and the
+  # +120/-3 rewrite of that runner lies entirely between v2.0.0 and the cyanoptera
+  # tip. So one version bump moves the measurement and the thing measured together.
+  # DuckDB `main` has diverged from this line as well (webbed's `main` canary stayed
   # green over a ConstantExpression call that cyanoptera deletes).
   #
   # MATRIX WIDTH, zim-specific: reduced_ci_mode defaults to `auto` (three arches on
@@ -65,10 +83,10 @@ jobs:
     # 16m19s, osx_arm64 9m37s, ~40min wall-clock including macOS runner queueing
     # and the upstream `macos: needs: [linux]` sequencing. That is the price of a
     # PR gate on the line we are about to ship.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v2.0-cyanoptera
-      ci_tools_version: main
+      duckdb_version: v2.0.0
+      ci_tools_version: v2.0-cyanoptera
       extension_name: zim
       vcpkg_binary_sources: 'clear'
       # linux_amd64 + osx_arm64. This job asks "do these sources still build AND
@@ -111,6 +129,12 @@ jobs:
       # present -> exit 0 "16 passed, 2 skipped"; hidden -> exit 2 "0 passed, 18 failed".
       # Needs a ci_tools_version that HAS `T` (main / v2.0-cyanoptera); on
       # v1.5-variegata the variable is silently ignored -- hence `make test-require`.
+      # This leg moved from `main` to `v2.0-cyanoptera` on 2026-10-25, so that
+      # requirement was re-measured rather than assumed: duckdb_extension.Makefile
+      # at ref v2.0-cyanoptera has `T ?=` at line 204 and TEST_RUNNER_SCRIPT at 198,
+      # byte-identical line numbers to `main`; at ref v1.5-variegata both are absent.
+      # If this leg ever reports "0 skipped" with no `require zim` line in its log,
+      # suspect that `T` stopped arriving before suspecting the extension.
       test_config: '{"test_env_variables": {"T": "--test-flags \"--require zim\" \"test/*\""}}'
   # The DuckDB `main` canary is GONE, removed 2026-10-16. It could not report
   # anything: an extension built with `duckdb_version: main` records the version
@@ -125,9 +149,10 @@ jobs:
   # remote-search-test, which loads each downloaded artifact for real and failed
   # honestly on the one the canary produced.
   # Not a zim defect and not fixable here: the `v` prefix is applied on one side
-  # of that comparison and not the other, upstream. `v2.0-cyanoptera` is
-  # unaffected because it already starts with `v`, so the next-line leg above
-  # remains the forward-looking signal.
+  # of that comparison and not the other, upstream. `v2.0.0` is unaffected because
+  # it already starts with `v`, so the v2.0 leg above remains the signal that
+  # matters. (`v2.0-cyanoptera`, which that leg used until 2026-10-25, was
+  # unaffected for the same reason.)
   duckdb-stable-build:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
@@ -354,7 +379,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DUCKDB_VERSION: v1.5.6
-      DUCKDB_NEXT: v2.0-cyanoptera
+      DUCKDB_NEXT: v2.0.0
     steps:
       - uses: actions/checkout@v4
       - name: Compare the submodule pin with the tag's commit
