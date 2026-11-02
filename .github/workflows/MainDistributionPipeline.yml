@@ -66,6 +66,84 @@ jobs:
   # push (markdown, measured on 126739d). This gate runs it on every pull request,
   # on merges to main, and on dispatch; the one case it does not cover is a branch
   # with no PR open, which gets its first next-line build when the PR opens.
+  duckdb-next-ref:
+    name: Next-line build — resolve DuckDB v2.0
+    # Gated to run once, not twice, per PR: a push to a PR branch fires both a
+    # push run and a pull_request run for the same commit, so an ungated job
+    # would build it twice. Runs on PRs, on push to main, and on dispatch.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      # WALK BACK FROM THE TIP to the newest commit that duckdb-staging actually
+      # built. Resolving the tip alone is what this job used to do, and it is red
+      # whenever staging lags -- measured 2026-10-26: of the 8 newest cyanoptera
+      # commits, only 2 had a staged build, and the tip was not one of them:
+      #
+      #   af2d380a19  404      <- tip
+      #   99b013ad36  404
+      #   c4d7b8bd7e  200  v2.0.1-alpha50398
+      #   defed5fd79  404
+      #   3ea22a8bc3  404
+      #   bb5bdadda4  200  v2.0.1-alpha50125
+      #
+      # So the premise "the tip has a staged build" is false most of the time. The
+      # walk keeps what the resolver was for -- no manual bump, and a version that
+      # matches the prebuilt libduckdb the build will download -- while taking the
+      # newest commit that can actually be built. It still fails loudly when NO
+      # commit in range is staged, which is a real staging outage rather than lag.
+      # Teague ruled the SHAPE (walk back to the newest staged commit). The CAP is
+      # fleet-ci-plan-a's (plinking_duck #74), and unlike the two invented values before it (25, then the
+      # coordinator's 50) this one is measured.
+      #
+      # Staging does not keep a trailing window of recent builds; it builds SOME
+      # commits and skips runs of others. Probing the newest 60 commits found only
+      # 2 staged, with a run of 54 CONSECUTIVE unstaged commits spanning just 0.8
+      # days -- while a staged build 3.1 days old was still being served. Age does
+      # not explain it, so a burst of commits can get one build for the whole burst.
+      #
+      # That makes the run length the thing the cap must clear, and 50 does not
+      # clear it: on 2026-10-23 around 10:13, when 420d03f67 was the tip, a walk of
+      # depth 50 would have found nothing and failed. 150 gives roughly 3x the
+      # worst run measured. It costs nothing in the normal case, because the loop
+      # breaks at the first staged commit -- today the 3rd probe.
+      - id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEPTH=150
+          tip=$(git ls-remote https://github.com/duckdb/duckdb.git refs/heads/v2.0-cyanoptera | cut -f1)
+          [ -n "$tip" ] || { echo "::error::could not resolve duckdb v2.0-cyanoptera"; exit 1; }
+
+          tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+          git clone --quiet --filter=blob:none --no-checkout --depth "$DEPTH" \
+              --branch v2.0-cyanoptera https://github.com/duckdb/duckdb.git "$tmp/duckdb"
+
+          commit=""; version=""; behind=0
+          for sha in $(git -C "$tmp/duckdb" log --format=%H -n "$DEPTH"); do
+            v=$(curl -sSfL "https://duckdb-staging.duckdb.org/${sha:0:10}/latest_alpha_version.txt" 2>/dev/null | tr -d '[:space:]') || { behind=$((behind+1)); continue; }
+            if [[ "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|dev)[0-9]+)?$ ]]; then
+              commit="$sha"; version="$v"; break
+            fi
+            behind=$((behind+1))
+          done
+
+          if [ -z "$commit" ]; then
+            echo "::error::no staged DuckDB build for v2.0-cyanoptera in its last $DEPTH commits (tip $tip)"
+            exit 1
+          fi
+
+          echo "v2.0-cyanoptera tip is $tip"
+          echo "resolved $commit, version $version ($behind commit(s) behind the tip)"
+          if [ "$behind" -gt 0 ]; then
+            echo "::notice::the v2.0-cyanoptera tip ($tip) has no staged build; using $commit ($version), $behind commit(s) back"
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+
   duckdb-next-build:
     name: Build extension binaries (duckdb next, v2.0 line)
     # UNGATED, like duckdb-stable-build below. This leg used to run only on
@@ -83,10 +161,18 @@ jobs:
     # 16m19s, osx_arm64 9m37s, ~40min wall-clock including macOS runner queueing
     # and the upstream `macos: needs: [linux]` sequencing. That is the price of a
     # PR gate on the line we are about to ship.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
+    #
+    # IT NO LONGER PINS v2.0.0. Now that the shipping leg below ships v2.0.0, a
+    # next leg carrying the same version would duplicate it exactly and add no
+    # signal. duckdb-next-ref resolves the newest STAGED v2.0-cyanoptera commit
+    # per run and this leg builds that pair -- the "promote plus resolve" recipe
+    # (Teague, 2026-10-25).
+    needs: duckdb-next-ref
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: v2.0.0
-      ci_tools_version: v2.0-cyanoptera
+      duckdb_version: ${{ needs.duckdb-next-ref.outputs.version }}
+      duckdb_commit: ${{ needs.duckdb-next-ref.outputs.commit }}
+      ci_tools_version: main
       extension_name: zim
       vcpkg_binary_sources: 'clear'
       # linux_amd64 + osx_arm64. This job asks "do these sources still build AND
@@ -155,10 +241,10 @@ jobs:
   # unaffected for the same reason.)
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v1.5.6
-      ci_tools_version: v1.5-variegata
+      duckdb_version: v2.0.0
+      ci_tools_version: v2.0-cyanoptera
       extension_name: zim
       # Disable the shared DuckDB binary cache: it hands back an icu (or host-tool)
       # artifact built with an incompatible toolchain, which poisons the icu build under
@@ -173,10 +259,10 @@ jobs:
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v1.5.6
-      ci_tools_version: v1.5-variegata
+      duckdb_version: v2.0.0
+      ci_tools_version: v2.0-cyanoptera
       extension_name: zim
       # format only: the tidy check configures CMake without vcpkg, so this extension's
       # required libzim (pkg-config) isn't found and tidy can't even configure.
@@ -200,7 +286,7 @@ jobs:
       - name: Download WASM artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: zim-v1.5.6-extension-wasm_*
+          pattern: zim-v2.0.0-extension-wasm_*
           path: wasm-artifacts
       - name: Check for unresolved libzim/zstd/lzma symbols
         run: bash test/wasm/run_wasm_checks.sh wasm-artifacts
@@ -245,11 +331,19 @@ jobs:
         with:
           pattern: "*linux_amd64*"
           path: ext-artifacts
-      - name: Fetch released DuckDB CLI (v1.5.6)
+      - name: Fetch released DuckDB CLI (v2.0.0)
         run: |
           set -euo pipefail
-          curl -fL -o duckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-amd64.zip
-          unzip -o duckdb.zip -d duckdb-cli
+          # NOTE THE ASSET RENAME, not just the version. Up to v1.5.6 this was
+          # duckdb_cli-linux-amd64.zip (underscore, zip). From v2.0.0 it is
+          # duckdb-cli-linux-amd64.tar.gz (hyphen, tarball) holding a single
+          # `duckdb` at the archive root. Measured 2026-11-01: the old .zip URL
+          # 404s at v2.0.0, so bumping only the version would have broken this
+          # step on every run.
+          curl -fL -o duckdb.tar.gz https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz
+          mkdir -p duckdb-cli
+          tar -xzf duckdb.tar.gz -C duckdb-cli
+          chmod +x duckdb-cli/duckdb
           ./duckdb-cli/duckdb --version
       - name: Run remote search + stdout guards against every artifact
         run: |
@@ -276,7 +370,12 @@ jobs:
               # duckdb binary matches by construction whatever version that was.
               tar xzf "$ts" -C "$dest" release/duckdb
               cli="$(readlink -f "$dest/release/duckdb")"
-            elif [[ "$name" == *v1.5.6* ]]; then
+            elif [[ "$name" == *v2.0.0* ]]; then
+              # The SHIPPING leg's artifact, which the released v2.0.0 CLI
+              # fetched above can load. The next leg's artifact is named from a
+              # resolved alpha version, so it never matches here and must come
+              # with its own test-support bundle (the branch above) -- which is
+              # how it already worked while this leg was pinned to v2.0.0.
               cli="$PWD/duckdb-cli/duckdb"
             else
               echo "::error::no DuckDB shell available for artifact '$name'; refusing to test it against a mismatched shell"
@@ -378,8 +477,12 @@ jobs:
     # except to resolve a tag in the repo we already depend on.
     runs-on: ubuntu-latest
     env:
-      DUCKDB_VERSION: v1.5.6
-      DUCKDB_NEXT: v2.0.0
+      DUCKDB_VERSION: v2.0.0
+      # NO DUCKDB_NEXT CONSTANT. The next leg is resolved per run by
+      # duckdb-next-ref, so there is no literal next version to assert. The
+      # assertion below checks the WIRING instead, which is the thing that can
+      # actually rot: a leg can be deleted or unhooked from the resolver and
+      # nothing else would notice.
     steps:
       - uses: actions/checkout@v4
       - name: Compare the submodule pin with the tag's commit
@@ -398,4 +501,5 @@ jobs:
           # Both legs must still exist. This is the one assertion worth keeping from
           # the old scan: a leg can be deleted or renamed and nothing else notices.
           grep -q "duckdb_version: ${DUCKDB_VERSION}$" "$wf" || { echo "::error::no build job in this workflow ships duckdb_version: ${DUCKDB_VERSION}"; exit 1; }
-          grep -q "duckdb_version: ${DUCKDB_NEXT}$" "$wf" || { echo "::error::no build job in this workflow builds the next line duckdb_version: ${DUCKDB_NEXT}"; exit 1; }
+          grep -q 'duckdb_version: ${{ needs.duckdb-next-ref.outputs.version }}$' "$wf" || { echo "::error::no build job consumes duckdb-next-ref's resolved version; the next leg has been unhooked from its resolver"; exit 1; }
+          grep -q '^  duckdb-next-ref:$' "$wf" || { echo "::error::the duckdb-next-ref resolver job is gone"; exit 1; }
