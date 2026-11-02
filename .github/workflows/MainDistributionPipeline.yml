@@ -501,5 +501,11 @@ jobs:
           # Both legs must still exist. This is the one assertion worth keeping from
           # the old scan: a leg can be deleted or renamed and nothing else notices.
           grep -q "duckdb_version: ${DUCKDB_VERSION}$" "$wf" || { echo "::error::no build job in this workflow ships duckdb_version: ${DUCKDB_VERSION}"; exit 1; }
-          grep -q 'duckdb_version: ${{ needs.duckdb-next-ref.outputs.version }}$' "$wf" || { echo "::error::no build job consumes duckdb-next-ref's resolved version; the next leg has been unhooked from its resolver"; exit 1; }
+          # DO NOT put an Actions expression in this run: block -- not even inside a
+          # comment. Actions expands expressions in `run:` BEFORE bash sees them,
+          # and this job has no `needs: duckdb-next-ref`, so one evaluated to empty
+          # and the pattern collapsed to `duckdb_version: $`, matching nothing and
+          # failing the assertion on a correctly wired workflow. Match the
+          # expression's TEXT instead, as the grep below does.
+          grep -qE 'duckdb_version: .*needs[.]duckdb-next-ref[.]outputs[.]version' "$wf" || { echo "::error::no build job consumes duckdb-next-ref's resolved version; the next leg has been unhooked from its resolver"; exit 1; }
           grep -q '^  duckdb-next-ref:$' "$wf" || { echo "::error::the duckdb-next-ref resolver job is gone"; exit 1; }
