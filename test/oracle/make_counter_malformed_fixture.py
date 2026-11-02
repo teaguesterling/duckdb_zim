@@ -48,9 +48,7 @@ def main(out="test/oracle/test_counter_malformed.zim"):
         c.add_metadata("Language", "eng")
 
     raw = open(out, "rb").read()
-    original = (
-        Archive(out).get_metadata("Counter").decode()
-    )  # e.g. "text/css=1;text/html=2"
+    original = Archive(out).get_metadata("Counter").decode()  # e.g. "text/css=1;text/html=2"
     orig_b = original.encode()
     L = len(orig_b)
 
@@ -58,17 +56,13 @@ def main(out="test/oracle/test_counter_malformed.zim"):
     # one with a non-numeric value, padded with empty (skipped) segments.
     base = b"kept/x=42;noeq;bad/y=z"
     if len(base) > L:
-        raise SystemExit(
-            f"original Counter '{original}' ({L}B) too short for the malformed payload ({len(base)}B)"
-        )
+        raise SystemExit(f"original Counter '{original}' ({L}B) too short for the malformed payload ({len(base)}B)")
     malformed = base + b";" * (L - len(base))
     assert len(malformed) == L
 
     idx = raw.find(orig_b)
     if idx < 0:
-        raise SystemExit(
-            f"Counter string '{original}' not found verbatim (was the archive compressed?)"
-        )
+        raise SystemExit(f"Counter string '{original}' not found verbatim (was the archive compressed?)")
     patched = raw[:idx] + malformed + raw[idx + L :]
     open(out, "wb").write(patched)
 

@@ -41,13 +41,7 @@ class HtmlItem(Item):
 def main(out="test/oracle/test_parallel.zim"):
     with Creator(out).config_indexing(False, "eng") as c:
         for i in range(N):
-            c.add_item(
-                HtmlItem(
-                    f"A/{i:06d}",
-                    f"art{i:06d}",
-                    f"<html><body><p>article {i}</p></body></html>",
-                )
-            )
+            c.add_item(HtmlItem(f"A/{i:06d}", f"art{i:06d}", f"<html><body><p>article {i}</p></body></html>"))
         c.set_mainpath("A/000000")
         c.add_metadata("Title", "parallel scan fixture")
         c.add_metadata("Language", "eng")

@@ -47,20 +47,10 @@ def main(out="test/oracle/test.zim"):
                 "<html><body><h1>Chlorophyll</h1><p>Green pigment in plants.</p></body></html>",
             )
         )
-        c.add_item(
-            HtmlItem(
-                "A/Calcium", "Calcium", "<html><body><h1>Calcium</h1></body></html>"
-            )
-        )
-        c.add_item(
-            HtmlItem(
-                "I/logo.png", "logo", b"\x89PNG\r\n\x1a\n fakepng", mime="image/png"
-            )
-        )
+        c.add_item(HtmlItem("A/Calcium", "Calcium", "<html><body><h1>Calcium</h1></body></html>"))
+        c.add_item(HtmlItem("I/logo.png", "logo", b"\x89PNG\r\n\x1a\n fakepng", mime="image/png"))
         c.add_item(HtmlItem("style.css", "style", "body{color:green}", mime="text/css"))
-        c.add_redirection(
-            "A/Photosynth", "Photosynth (redirect)", "A/Photosynthesis", {}
-        )
+        c.add_redirection("A/Photosynth", "Photosynth (redirect)", "A/Photosynthesis", {})
         c.set_mainpath("A/Photosynthesis")
         c.add_metadata("Title", "Test Botany ZIM")
         c.add_metadata("Language", "eng")

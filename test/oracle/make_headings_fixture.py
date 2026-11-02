@@ -72,9 +72,7 @@ def main(out="test/oracle/test_headings.zim"):
         c.add_metadata("Language", "eng")
         c.add_metadata("Creator", "oracle")
         c.add_metadata("Date", "2026-09-11")
-        c.add_metadata(
-            "Description", "nested headings + a text entry that is not valid UTF-8"
-        )
+        c.add_metadata("Description", "nested headings + a text entry that is not valid UTF-8")
     print("wrote", out)
 
 
