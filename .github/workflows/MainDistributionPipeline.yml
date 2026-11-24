@@ -162,7 +162,7 @@ jobs:
     # and the upstream `macos: needs: [linux]` sequencing. That is the price of a
     # PR gate on the line we are about to ship.
     #
-    # IT NO LONGER PINS v2.0.0. Now that the shipping leg below ships v2.0.0, a
+    # IT NO LONGER PINS v2.0.0. Now that the shipping leg below ships v2.0.1, a
     # next leg carrying the same version would duplicate it exactly and add no
     # signal. duckdb-next-ref resolves the newest STAGED v2.0-cyanoptera commit
     # per run and this leg builds that pair -- the "promote plus resolve" recipe
@@ -243,7 +243,7 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v2.0.0
+      duckdb_version: v2.0.1
       ci_tools_version: v2.0-cyanoptera
       extension_name: zim
       # Disable the shared DuckDB binary cache: it hands back an icu (or host-tool)
@@ -261,7 +261,7 @@ jobs:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v2.0.0
+      duckdb_version: v2.0.1
       ci_tools_version: v2.0-cyanoptera
       extension_name: zim
       # format only: the tidy check configures CMake without vcpkg, so this extension's
@@ -286,7 +286,7 @@ jobs:
       - name: Download WASM artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: zim-v2.0.0-extension-wasm_*
+          pattern: zim-v2.0.1-extension-wasm_*
           path: wasm-artifacts
       - name: Check for unresolved libzim/zstd/lzma symbols
         run: bash test/wasm/run_wasm_checks.sh wasm-artifacts
@@ -331,7 +331,7 @@ jobs:
         with:
           pattern: "*linux_amd64*"
           path: ext-artifacts
-      - name: Fetch released DuckDB CLI (v2.0.0)
+      - name: Fetch released DuckDB CLI (v2.0.1)
         run: |
           set -euo pipefail
           # NOTE THE ASSET RENAME, not just the version. Up to v1.5.6 this was
@@ -340,7 +340,7 @@ jobs:
           # `duckdb` at the archive root. Measured 2026-11-01: the old .zip URL
           # 404s at v2.0.0, so bumping only the version would have broken this
           # step on every run.
-          curl -fL -o duckdb.tar.gz https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz
+          curl -fL -o duckdb.tar.gz https://github.com/duckdb/duckdb/releases/download/v2.0.1/duckdb-cli-linux-amd64.tar.gz
           mkdir -p duckdb-cli
           tar -xzf duckdb.tar.gz -C duckdb-cli
           chmod +x duckdb-cli/duckdb
@@ -370,8 +370,8 @@ jobs:
               # duckdb binary matches by construction whatever version that was.
               tar xzf "$ts" -C "$dest" release/duckdb
               cli="$(readlink -f "$dest/release/duckdb")"
-            elif [[ "$name" == *v2.0.0* ]]; then
-              # The SHIPPING leg's artifact, which the released v2.0.0 CLI
+            elif [[ "$name" == *v2.0.1* ]]; then
+              # The SHIPPING leg's artifact, which the released v2.0.1 CLI
               # fetched above can load. The next leg's artifact is named from a
               # resolved alpha version, so it never matches here and must come
               # with its own test-support bundle (the branch above) -- which is
@@ -477,7 +477,7 @@ jobs:
     # except to resolve a tag in the repo we already depend on.
     runs-on: ubuntu-latest
     env:
-      DUCKDB_VERSION: v2.0.0
+      DUCKDB_VERSION: v2.0.1
       # NO DUCKDB_NEXT CONSTANT. The next leg is resolved per run by
       # duckdb-next-ref, so there is no literal next version to assert. The
       # assertion below checks the WIRING instead, which is the thing that can
